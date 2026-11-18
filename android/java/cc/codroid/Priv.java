@@ -144,7 +144,13 @@ final class Priv {
         o.put("sui", sui);
         long naUntil = noAskUntil();
         o.put("noask", naUntil > 0);
-        if (naUntil > 0) o.put("noaskUntil", naUntil);
+        o.put("noaskSelf", noAskSelf());
+        o.put("noaskScreen", noAskScreen());
+        o.put("noaskPermanent", naUntil == Long.MAX_VALUE);
+        o.put("noaskHours", noAskHours());
+        o.put("confirmationPending", asking());
+        o.put("screenGuardActive", MainActivity.guarding());
+        if (naUntil > 0 && naUntil != Long.MAX_VALUE) o.put("noaskUntil", naUntil);
         o.put("running", run);
         o.put("granted", ok);
         if (run) {
@@ -153,6 +159,7 @@ final class Priv {
         }
         o.put("keepalive", Consent.on(ctx, Consent.KEEPALIVE));
         o.put("lastPermission", lastPermission);
+        o.put("consent", Consent.status(ctx));
         ShizukuSetup.get(ctx).put(o);
         SharedPreferences bg = ctx.getSharedPreferences("bg", Context.MODE_PRIVATE);
         o.put("frozen", new JSONObject().put("at", bg.getLong("frozenAt", 0)).put("ms", bg.getLong("frozenMs", 0))
@@ -338,6 +345,10 @@ final class Priv {
             OutputStream out = sock.getOutputStream();
             JSONObject req = new JSONObject(readLine(in));
             String op = req.optString("op");
+            if(FullBackupController.maintenance()){
+                s.getOutputStream().write(new JSONObject().put("ok",false).put("message","完整备份维护期间暂停设备和特权操作").toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                return;
+            }
             JSONObject resp;
             switch (op) {
                 case "exec": {
@@ -351,6 +362,28 @@ final class Priv {
                     return;
                 }
                 case "status": resp = status(); break;
+                case "consent_set": {
+                    boolean strong = req.optBoolean("strong", false);
+                    if (strong && !Consent.persistable(ctx)) {
+                        resp = new JSONObject().put("ok", false).put("message", "需先设置安全锁屏才能启用验证保存；普通保存可正常使用");
+                        break;
+                    }
+                    int pid = 0; try { pid = sock.getPeerCredentials().getPid(); } catch (IOException ignored) {}
+                    if (strong != Consent.strong(ctx) && !confirm(strong
+                        ? "启用保存时验证身份：已打开的敏感开关将重新验证并签名。未通过验证的设置只在本次运行有效。"
+                        : "关闭保存时验证身份：开关经原生确认后直接持久保存。同一应用权限运行的工具脚本也可能修改这些存档。",
+                        caller(pid), "consent_mode")) {
+                        resp = new JSONObject().put("ok", false).put("message", "没有确认，保存方式未改变");
+                        break;
+                    }
+                    try {
+                        if (strong != Consent.strong(ctx)) Consent.setStrong(ctx, strong);
+                        resp = status().put("ok", true);
+                    } catch (Exception e) {
+                        resp = new JSONObject().put("ok", false).put("message", e.getMessage());
+                    }
+                    break;
+                }
                 case "request":
                     if (!running()) resp = new JSONObject().put("ok", false).put("message", Tr.t("Shizuku 没在运行"));
                     else if (granted()) resp = new JSONObject().put("ok", true).put("message", Tr.t("已授权"));
@@ -377,22 +410,78 @@ final class Priv {
                 case "noask": {
                     // 特权命令免确认（总开关）：打开要过原生对话框里的免责说明，脚本发请求没用；关掉随时可以
                     boolean on = req.optBoolean("enable", false);
-                    // 时长可选，最长一周（11-08 用户定）；只认固定几档，别的一律按 24 小时。选的时长写进原生说明里，由用户在这里确认
-                    long ttl = noAskTtl(req.optInt("hours", 24));
-                    long hrs = ttl / 3600000L;
-                    String until = hrs % 24 == 0 ? Tr.f("{0} 天后自动关闭，恢复逐条确认。", hrs / 24) : Tr.f("{0} 小时后自动关闭，恢复逐条确认。", hrs);
+                    int hours = NoAskPolicy.normalize(req.optInt("hours", 24));
+                    boolean wasOn = noAsk();
+                    String previous = Consent.get(ctx, Consent.NOASK);
+                    boolean change = on && (!wasOn || noAskHours() != hours);
+                    String warning=NoAskPolicy.warning(change,hours);
+                    String until = hours == NoAskPolicy.PERMANENT ? "永久有效，不会自动恢复逐条确认。"
+                        : hours % 24 == 0 ? Tr.f("{0} 天后自动关闭，恢复逐条确认。", hours / 24) : Tr.f("{0} 小时后自动关闭，恢复逐条确认。", hours);
                     int pid = 0; try { pid = sock.getPeerCredentials().getPid(); } catch (IOException ignored) {}
-                    if (on && !noAsk() && !confirm(Tr.t("特权命令不再逐条确认（风险自负）") + "\n\n"
+                    if ("noask".equals(warning) && !confirm(Tr.t("特权命令不再逐条确认（风险自负）") + "\n\n"
                             + Tr.t("打开后，Claude、终端和本机其他程序发来的特权命令都不再弹框问你，直接以 Shizuku（shell）身份执行，cccodroid 在后台时也一样。这类命令能装卸应用、改权限和系统设置。") + "\n\n"
                             + Tr.t("命令写错、模型判断失误、或者混进来的脚本，都可能造成数据丢失、应用异常甚至需要恢复出厂设置。打开即表示你了解并自行承担这些风险，cccodroid 及其作者不对由此造成的损失负责。") + "\n\n"
-                            + Tr.t("涉及 cccodroid 自身、Shizuku / Sui 的命令会尽量拦下来再问你，但拦不住所有写法（比如藏在脚本文件里的）。随时可以在设置里关掉。") + "\n\n"
+                            + Tr.t("涉及 cccodroid 自身、Shizuku / Sui 的命令默认保留额外确认；可通过下面的独立开关关闭这层确认。主开关关闭或到期后，额外授权一起撤销。") + "\n\n"
                             + until, caller(pid), "noask")) {
-                        resp = new JSONObject().put("ok", false).put("message", Tr.t("没有确认，仍然逐条询问"));
+                        resp = new JSONObject().put("ok", false).put("message", "已取消，保留原来的开关和时长");
                         break;
                     }
-                    if (on) { if (!noAsk()) Consent.grant(ctx, Consent.NOASK, String.valueOf(System.currentTimeMillis() + ttl)); } else Consent.revoke(ctx, Consent.NOASK);
+                    if ("noask_permanent".equals(warning) && !confirm("永久关闭特权命令确认（极高风险）\n\n"
+                        + "永久免确认不会自动到期。与 App 使用同一权限的脚本可能修改设置，并利用特权通道以 shell 身份运行命令。恶意或错误的脚本可能安装卸载应用、改系统权限、泄露数据或破坏运行环境。\n\n"
+                        + "如果还开启了“涉及自身的命令也免确认”，脚本也可能停止或破坏 CCCDroid、Shizuku / Sui。请仅在确有长期需求且信任所运行脚本时开启，并随时留意设置变化。\n\n"
+                        + "请仔细阅读；确认按钮将在 10 秒后启用。取消会保留更改前的设置。",
+                        caller(pid), "noask_permanent")) {
+                        resp = new JSONObject().put("ok", false).put("message", "已取消永久免确认，保留原来的设置");
+                        break;
+                    }
+                    if (change && !java.util.Objects.equals(previous, Consent.get(ctx, Consent.NOASK))) {
+                        resp = new JSONObject().put("ok", false).put("message", "确认期间原授权已变化，请重新选择");
+                        break;
+                    }
+                    if (change) {
+                        Consent.revoke(ctx, Consent.NOASK_SELF);
+                        Consent.grant(ctx, Consent.NOASK, NoAskPolicy.value(hours, System.currentTimeMillis()));
+                    } else if (!on) { Consent.revoke(ctx, Consent.NOASK); Consent.revoke(ctx, Consent.NOASK_SELF); }
                     Log.w(TAG, "特权命令免确认 " + (on ? "打开" : "关闭"));
                     resp = new JSONObject().put("ok", true).put("noask", on);
+                    break;
+                }
+                case "noask_screen": {
+                    boolean on = req.optBoolean("enable", false);
+                    if (on && !screenNoAskAvailable()) { resp = new JSONObject().put("ok", false).put("message", "请先开启设备工具，并将无障碍设为用时自动开或常开"); break; }
+                    int pid = 0; try { pid = sock.getPeerCredentials().getPid(); } catch (IOException ignored) {}
+                    if (on && !noAskScreen() && !confirm("屏幕工具免确认（高风险）\n\n开启后，已启用的读屏、点按、输入和截图不再额外询问，包括无法识别会话来源的调用。同 UID 脚本可能读取屏幕或操作其他应用。\n\n此授权独立于特权命令免确认，保持有效直到手动关闭；关闭设备工具或无障碍模式也会撤销。它不会授予设备工具或系统无障碍权限，核心工具请求仍按所选权限模式处理。", caller(pid), "noask_screen")) {
+                        resp = new JSONObject().put("ok", false).put("message", "未开启屏幕工具免确认"); break;
+                    }
+                    if (on && !screenNoAskAvailable()) { resp = new JSONObject().put("ok", false).put("message", "设备工具或无障碍模式已关闭，请重试"); break; }
+                    if (on) { if (!noAskScreen()) Consent.grant(ctx, Consent.NOASK_SCREEN, "1"); }
+                    else Consent.revoke(ctx, Consent.NOASK_SCREEN);
+                    resp = status().put("ok", true); break;
+                }
+                case "noask_self": {
+                    boolean on = req.optBoolean("enable", false);
+                    long until = noAskUntil();
+                    if (on && until == 0) {
+                        resp = new JSONObject().put("ok", false).put("message", "请先开启特权命令不再逐条确认");
+                        break;
+                    }
+                    int pid = 0; try { pid = sock.getPeerCredentials().getPid(); } catch (IOException ignored) {}
+                    if (on && !noAskSelf() && !confirm("涉及自身的特权命令也免确认（高风险）\n\n"
+                        + "开启后，涉及 CCCDroid 自身、Shizuku / Sui 的特权命令也会直接执行，包括停止、卸载应用、修改权限或破坏运行环境；变量、脚本等无法明确判断的命令也不再额外询问。\n\n"
+                        + "仅在主免确认开关有效期间生效，关闭主开关或到期会撤销此授权。请确认你愿意承担这些风险。",
+                        caller(pid), "noask_self")) {
+                        resp = new JSONObject().put("ok", false).put("message", "没有确认，仍保留涉及自身的额外确认");
+                        break;
+                    }
+                    // The master may expire while the risk dialog is open.
+                    long current = noAskUntil();
+                    if (on && current != until) {
+                        resp = new JSONObject().put("ok", false).put("message", "主免确认授权已变化，请重新开启");
+                        break;
+                    }
+                    if (on) { if (!noAskSelf()) Consent.grant(ctx, Consent.NOASK_SELF, String.valueOf(until)); }
+                    else Consent.revoke(ctx, Consent.NOASK_SELF);
+                    resp = status().put("ok", true);
                     break;
                 }
                 case "to_front": resp = new JSONObject().put("ok", true).put("via", toFront(ctx, req.optString("text"))); break;
@@ -417,6 +506,7 @@ final class Priv {
                 }
                 case "shz_pair": ShizukuSetup.get(ctx).onCode(req.optString("code")); resp = status(); break;
                 case "shz_repair": ShizukuSetup.get(ctx).repair(); resp = status(); break;
+                case "shz_split_settings": resp = MainActivity.requestSplitPairing(); break;
                 case "shz_autostart": {
                     // 打开 = 以后开机时不问就打开无线调试：和保活一样，要原生确认并签名存档；关掉随时可以
                     boolean on = req.optBoolean("enable", true);
@@ -559,7 +649,7 @@ final class Priv {
                 default: resp = new JSONObject().put("ok", false).put("message", Tr.t("未知操作 ") + op);
             }
             // 改状态的应用内操作也留痕（10-31 四轮复核：以前只有 exec 进特权命令记录）
-            if (op.startsWith("upd_") && !op.equals("upd_status") || op.startsWith("shz_") || op.equals("keepalive") || op.equals("dev_set") || op.equals("noask") || op.equals("apk_install")) {
+            if (op.startsWith("upd_") && !op.equals("upd_status") || op.startsWith("shz_") || op.equals("keepalive") || op.equals("dev_set") || op.equals("noask") || op.equals("apk_install") || op.equals("consent_set") || op.equals("noask_self") || op.equals("noask_screen")) {
                 int pid = 0; try { pid = sock.getPeerCredentials().getPid(); } catch (IOException ignored) {}
                 JSONObject r0 = new JSONObject(req.toString());
                 r0.remove("code");    // 配对码不进记录
@@ -624,7 +714,7 @@ final class Priv {
     /** 允许过屏幕类设备工具的会话口令（只在内存里） */
     private static final java.util.Set<String> DEV_SESS = java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
     private static boolean devSessOk(String sess, String who, String tool) {
-        if (sess != null && DEV_SESS.contains(sess)) return true;
+        if (noAskScreen() || sess != null && DEV_SESS.contains(sess)) return true;
         if (!ask(Tr.t("设备工具：读屏和点按") + " (" + tool + ")\n\n"
                 + (sess != null ? Tr.t("允许后，这个会话后面的读屏、点按、输入、截图不再问。") : Tr.t("认不出是哪个会话发起的，这次允许只管这一次。")),
                 who, "dev:screen", false)) return false;
@@ -633,21 +723,40 @@ final class Priv {
     }
     /** 存在 Consent 里（锁屏签名），不再是谁都能改的 prefs（11-03 审查 H-2） */
     /** 免确认是限时的：同意时存的是到期时刻（和同意一起签名，改不了），到点自动关。旧版存的 "1" 当作已到期 */
-    static final long NOASK_MAX = 7L * 24 * 3600 * 1000;
-    static final int[] NOASK_HOURS = { 1, 4, 24, 72, 168 };
+    static final long NOASK_MAX = NoAskPolicy.MAX;
+    static final int[] NOASK_HOURS = NoAskPolicy.HOURS;
     static long noAskTtl(int hours) {
-        for (int h : NOASK_HOURS) if (h == hours) return h * 3600L * 1000;
-        return 24L * 3600 * 1000;
+        int h = NoAskPolicy.normalize(hours);
+        return h == NoAskPolicy.PERMANENT ? Long.MAX_VALUE : h * 3600000L;
     }
+    static int noAskHours() { return NoAskPolicy.hours(Consent.get(ctx, Consent.NOASK), System.currentTimeMillis()); }
     static boolean noAsk() { return noAskUntil() > 0; }
     static long noAskUntil() {
         String v = Consent.get(ctx, Consent.NOASK);
         if (v == null) return 0;
-        long t, now = System.currentTimeMillis();
-        try { t = Long.parseLong(v); } catch (NumberFormatException e) { t = 0; }
-        if (t <= now || t > now + NOASK_MAX + 60000) { Consent.revoke(ctx, Consent.NOASK); Log.w(TAG, "特权命令免确认到期，已关闭"); return 0; }
+        long t = NoAskPolicy.until(v, System.currentTimeMillis());
+        if (t == 0) { Consent.revoke(ctx, Consent.NOASK); Consent.revoke(ctx, Consent.NOASK_SELF); Log.w(TAG, "特权命令免确认到期，已关闭"); return 0; }
         return t;
     }
+    static boolean noAskSelf() { return noAskChild(Consent.NOASK_SELF); }
+    static boolean screenNoAskAvailable() { return DeviceTools.on(ctx) && !"off".equals(DeviceTools.a11yMode(ctx)); }
+    static boolean noAskScreen() {
+        String value = Consent.get(ctx, Consent.NOASK_SCREEN);
+        if (value == null) return false;
+        // New grants are independent; retain the deadline of existing grants without broadening it.
+        boolean valid = screenNoAskAvailable() && ("1".equals(value)
+            || String.valueOf(Long.MAX_VALUE).equals(value) || NoAskPolicy.until(value, System.currentTimeMillis()) > 0);
+        if (!valid) Consent.revoke(ctx, Consent.NOASK_SCREEN);
+        return valid;
+    }
+    private static boolean noAskChild(String key) {
+        long until = noAskUntil();
+        String value = Consent.get(ctx, key);
+        boolean enabled = until > 0 && String.valueOf(until).equals(value);
+        if (!enabled && value != null) Consent.revoke(ctx, key);
+        return enabled;
+    }
+
     /** 动到本应用、Shizuku / Sui 自己的命令：开了免确认也照样问。规则见 PrivRules.touchesSelf */
     static boolean touchesSelf(String text) { return PrivRules.touchesSelf(text, ctx.getPackageName()); }
 
@@ -756,7 +865,7 @@ final class Priv {
                 .putExtra("cmd", show).putExtra("who", who).putExtra("trust", trustable).putExtra("sess", sess != null)
                 // 设置页的免责框：按来路认（exec 的 key 是 JSON 数组开头，撞不上），不看正文 —— 正文是命令原文，能伪造成免责说明的样子（审查 0601 高-2）
                 // 装 APK（apk_install）同理按来路认：标题和说明换成「安装应用」，别说成以 Shizuku 身份跑命令
-                .putExtra("kind", !trustable && "noask".equals(key) ? "noask" : !trustable && key.startsWith("apk:") ? "apk" : "")
+                .putExtra("kind", !trustable && "dev:screen".equals(key) ? "screen" : !trustable && "noask_permanent".equals(key) ? "noask_permanent" : !trustable && ("noask".equals(key) || "noask_self".equals(key) || "noask_screen".equals(key)) ? "noask" : !trustable && key.startsWith("apk:") ? "apk" : "")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             done.await(60, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception e) { Log.w(TAG, "问不了用户", e); }
@@ -806,12 +915,15 @@ final class Priv {
             for (int i = 0; it.hasNext(); i++) { String k = it.next(); envp[i] = k + "=" + e.getString(k); }
         }
         String text = (argv.length >= 3 && "-c".equals(argv[1]) ? argv[2] : String.join(" ", argv)) + (e != null ? "\n\n[env] " + e : "");
+        boolean readOnlySelfQuery = PrivRules.readOnlySelfQuery(argv, envp != null, req.optString("cwd", "/"));
         boolean risky = PrivRules.risky(argv, envp != null, req.optString("cwd", "/")) && !(envp == null && shotArmed(argv, req.optString("shot", null)))
-            || PrivRules.namesSelf(text, ctx.getPackageName());   // 免问的 am force-stop 等点了本应用 / Shizuku 的名：也要问（审查 0601c）
+            || PrivRules.namesSelf(text, ctx.getPackageName()) && !readOnlySelfQuery; // 只读查询提及包名不算修改自身；force-stop 等仍需确认
         // 免确认：设置里打开了总开关，或这个会话已经点过「本会话都允许」。动到本应用自己、Shizuku / Sui 的命令照样问
         String sess = risky && "claude".equals(who) ? sessToken(peerPid) : null;
         boolean self = risky && touchesSelf(text);
-        String pass = !risky || self ? null : noAsk() ? "免确认" : sess != null && SESS_OK.contains(sess) ? "本会话已允许" : null;
+        boolean selfAllowed = self && noAskSelf();
+        if (self && !selfAllowed) who += PrivRules.namesSelf(text, ctx.getPackageName()) ? "·自身保护确认" : "·不透明命令确认";
+        String pass = !risky || (self && !selfAllowed) ? null : noAsk() ? (selfAllowed ? "自身指令免确认" : "免确认") : !self && sess != null && SESS_OK.contains(sess) ? "本会话已允许" : null;
         if (pass != null) who = who + "·" + pass;
         else if (risky && !ask(text, who, a + "\0" + req.optString("cwd", "/") + "\0" + e, trustable(argv, req.optString("cwd", "/"), e), self ? null : sess)) {
             audit(t0, who, req, 126, 0);

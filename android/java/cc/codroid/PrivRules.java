@@ -78,6 +78,42 @@ final class PrivRules {
         } catch (RuntimeException e) { return true; }
     }
 
+    /**
+     * A known single read-only status query may name this app without modifying it.
+     * Keep compound shells, custom executables, environment overrides and private queries
+     * subject to the existing protection. risky() is a prerequisite, not sufficient:
+     * its allowlist also contains force-stop and other state-changing commands.
+     */
+    static boolean readOnlySelfQuery(String[] argv, boolean env, String cwd) {
+        if (risky(argv, env, cwd)) return false;
+        List<String> command;
+        if (("/system/bin/sh".equals(argv[0]) || "sh".equals(argv[0]))
+                && argv.length == 3 && "-c".equals(argv[1])) {
+            List<List<String>> commands = parse(argv[2], new ArrayList<>());
+            if (commands == null || commands.size() != 1) return false;
+            command = commands.get(0);
+        } else {
+            command = new ArrayList<>(Arrays.asList(argv));
+            if (command.get(0).startsWith("/system/bin/"))
+                command.set(0, command.get(0).substring("/system/bin/".length()));
+        }
+        List<String> c = new ArrayList<>();
+        for (String word : command) c.add(word.startsWith(QMARK) ? word.substring(1) : word);
+        String name = c.get(0);
+        // Exact query forms only: do not classify arbitrary service-specific dump arguments as read-only.
+        if ("dumpsys".equals(name)) return c.size() == 3
+            && ("package".equals(c.get(1)) || "meminfo".equals(c.get(1))) && packageWord(c.get(2));
+        if ("pm".equals(name)) return c.size() == 3 && "path".equals(c.get(1)) && packageWord(c.get(2))
+            || c.size() == 4 && "list".equals(c.get(1)) && "packages".equals(c.get(2)) && packageWord(c.get(3));
+        if ("cmd".equals(name)) return c.size() == 4 && "package".equals(c.get(1))
+            && "path".equals(c.get(2)) && packageWord(c.get(3));
+        return "appops".equals(name) && c.size() == 3 && "get".equals(c.get(1)) && packageWord(c.get(2));
+    }
+
+    private static boolean packageWord(String value) {
+        return value.matches("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+");
+    }
+
     // ── 分词：只认最朴素的 shell 写法，认不清就返回 null ──
     // 命令名位置的词另记为「带引号」（以 \0 开头标记），好拒绝 'pm' 这类拆字
     private static final String QMARK = "\0";

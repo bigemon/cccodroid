@@ -130,8 +130,7 @@ if (/[?&](t|k)=/.test(location.search) || /[#&]k=/.test(location.hash)) history.
       closeAll(kind === "modal" ? null : "menu");
       if (!el.isConnected) document.body.appendChild(el);
       const again = !!find(el);
-      const from = document.activeElement;
-      stack.push({ el, kind, anchor: o.anchor || null, onClose: o.onClose, place: o.place, keep: !!o.keep, cover: !!o.cover, w0: innerWidth, from });
+      stack.push({ el, kind, anchor: o.anchor || null, onClose: o.onClose, place: o.place, keep: !!o.keep, cover: !!o.cover, canDismiss: o.canDismiss, w0: innerWidth });
       sync();
       if (kind === "modal" && !again) requestAnimationFrame(() => { if (find(el) && top() === el) focusInto(el); });
       if (!again) MO.enterOv(el, o.anchor);
@@ -140,7 +139,7 @@ if (/[?&](t|k)=/.test(location.search) || /[#&]k=/.test(location.hash)) history.
     // 锚点上开着的菜单（同一个按钮再点 = 收起）
     const at = (anchor) => { const it = anchor && live().find((x) => x.anchor === anchor); return it ? it.el : null; };
     const top = () => { const s = live(); return s.length ? s[s.length - 1].el : null; };
-    function back() { const el = top(); if (!el) return false; close(el); return true; }
+    function back() { const el = top(); if (!el) return false; if(find(el)?.canDismiss?.()===false)return true; close(el); return true; }
     // 点外面：从上往下关菜单，碰到点中的那层就停（菜单开在弹层里时，点弹层只关菜单）
     addEventListener("pointerdown", (e) => {
       for (const it of live().slice().reverse()) {
@@ -425,6 +424,8 @@ if (/[?&](t|k)=/.test(location.search) || /[#&]k=/.test(location.hash)) history.
 
   const state = {
     model: "—",
+    // 新会话用哪个后端（P6-B1）：已有会话以服务端索引为准，这里只管新建
+    backend: (() => { try { return localStorage.getItem("cc.backend") === "codex" ? "codex" : "claude"; } catch { return "claude"; } })(),
     permissionMode: "",
     caps: null,
     sessions: [],
@@ -433,6 +434,8 @@ if (/[?&](t|k)=/.test(location.search) || /[#&]k=/.test(location.hash)) history.
     providers: [],
     ctxUsed: 0,
     ctxTotal: 0,        // 真实值从 /api/models 拿，不写死
+    ctxPct: null,       // Codex：后端按 TUI 公式算好的估算百分比；Claude 不用（自己除）
+    rerouteLive: false, // 本轮的 model/rerouted 是否已经发生（区分「本轮」与「上一轮记录」）
     compactAt: 0,       // 自动压缩窗口；设了就把它当上下文条的满刻度
     popup: { mode: null, items: [], sel: 0, range: null },
     lastUserText: "",

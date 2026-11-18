@@ -18,7 +18,7 @@ import { clampAutoCompact } from "./stream.mjs";
 // 以前直接展开 SETTINGS，GET 和保存回执会把它们原样送回界面（FIND-052）。
 const VIEW_KEYS = ["model", "permissionMode", "guard", "addDirs", "outputStyle", "effort", "allowedTools", "disallowedTools",
   "autoCompactWindow", "provider", "memGuard", "autoClean", "maxParallel", "staticCompat", "idleCompaction", "workIsland",
-  "localMode", "titleModel", "hiddenProviders", "permNotice", "permMigrated"];
+  "codex", "localMode", "titleModel", "hiddenProviders", "permNotice", "permMigrated"];
 const settingsView = () => Object.fromEntries(VIEW_KEYS.filter((k) => k in SETTINGS).map((k) => [k, SETTINGS[k]]));
 
 // ── 路由：/api/settings ──
@@ -95,6 +95,17 @@ export async function routeSettings(req, res, u, p) {
       if (Array.isArray(b.hiddenProviders)) SETTINGS.hiddenProviders = strList(b.hiddenProviders, 64, 64).filter((id) => id !== PROVIDER.id);
       if (Array.isArray(b.allowedTools)) SETTINGS.allowedTools = strList(b.allowedTools, 200, 512, 8192);
       if (Array.isArray(b.disallowedTools)) SETTINGS.disallowedTools = strList(b.disallowedTools, 200, 512, 8192);
+      // Codex 程序/数据路径：输入具体程序时退出托管；托管启用只走更新入口。
+      if (b.codex && typeof b.codex === "object") {
+        const c = b.codex;
+        SETTINGS.codex = {
+          ...(SETTINGS.codex || {}),
+          ...(typeof c.bin === "string" && c.bin.trim() ? {useManagedRuntime:false} : {}),
+          bin: typeof c.bin === "string" && c.bin.trim() ? c.bin.trim() : null,
+          home: typeof c.home === "string" && c.home.trim() ? c.home.trim() : null,
+          sslCertFile: typeof c.sslCertFile === "string" && c.sslCertFile.trim() ? c.sslCertFile.trim() : null,
+        };
+      }
       if (b.memGuard && typeof b.memGuard === "object") {
         const g = SETTINGS.memGuard || {};
         SETTINGS.memGuard = {

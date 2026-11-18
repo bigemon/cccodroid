@@ -12,6 +12,10 @@ import { PEEK_CACHE, findSessionFile, listSessions, peekSession } from "./sessio
 import { trashSession } from "./sessionops.mjs";
 import { termEnv } from "./terminal.mjs";
 import { killTree } from "./claude.mjs";
+import { validCodexMode } from "./codex/permissions.mjs";
+import { getCodexSession } from "./codex/store.mjs";
+import { moveCodexProject } from "./codex/project-move.mjs";
+import { readProjectInstructions, writeProjectInstructions } from "./project-instructions.mjs";
 import { runOfSession } from "./runs.mjs";
 import { checkSession, resealAfterEdit } from "./integrity.mjs";
 import { rewriteLines } from "./bigfile.mjs";
@@ -60,9 +64,10 @@ export function clearFollowingModels() {
   if (n && !save()) log("⚠️ 项目清单没保存上（换接口时清旧模型名）");
   return n;
 }
-export function projectDefaults(p) {
+export function projectDefaults(p, backend = "claude") {
   if (!p) return {};
   const v = (x) => (SAME.includes(x || "") ? undefined : x);
+  if(backend==="codex")return {model:v(p.codex?.model),effort:v(p.codex?.effort),perm:v(p.codex?.perm)};
   return { model: v(p.model), effort: v(p.effort), perm: v(p.perm), provider: v(p.provider) };   // provider：项目里的会话默认用哪家（模型名是给这家的）
 }
 
@@ -125,8 +130,13 @@ function gitClone(url, dest) {
   });
 }
 
-/** 把一个会话挪进 / 挪出项目：jsonl 和旁边的同名目录搬到新 cwd 对应的目录，记录里的 cwd 改写，--resume 才找得到 */
+/** 移入/移出项目：Codex 仅更新工作目录；Claude 搬移 jsonl 和同名目录并改写 cwd。 */
 export function moveSession(sid, projectId) {
+  if(getCodexSession(sid,{includeTrashed:true})){
+    const p=projectId?projectById(projectId):null;
+    if(projectId&&!p)throw new Error(tz("项目不存在"));
+    return moveCodexProject(sid,p?p.path:CFG.workspace);
+  }
   const found = findSessionFile(sid);
   if (!found) throw new Error(tz("找不到这个会话"));
   // 正在生成的会话不能搬：claude 还开着原文件往里追加，搬完删掉原文件，这一轮的记录就没了（审查 H5；删除那边早有这道检查）
@@ -194,8 +204,8 @@ export async function routeProjects(req, res, u, p) {
   const mv = p.match(/^\/api\/sessions\/([^/]+)\/move$/);
   if (mv && req.method === "POST") {
     const b = await body();
-    try { return sendJson(res, 200, moveSession(decodeURIComponent(mv[1]), b.projectId || null)); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
+    try { return sendJson(res, 200, await moveSession(decodeURIComponent(mv[1]), b.projectId || null)); }
+    catch (e) { return sendJson(res, e.status || 400, { error: e.message }); }
   }
 
   if (p === "/api/projects" && req.method === "GET") {
@@ -257,6 +267,20 @@ export async function routeProjects(req, res, u, p) {
   }
   if (!sub && req.method === "PATCH") {
     const b = await body();
+    let codex;
+    if("codex"in b){
+      if(!b.codex||typeof b.codex!=="object"||Array.isArray(b.codex))return sendJson(res,400,{message:"Codex 项目设置无效。"});
+      codex={...(proj.codex||{})};
+      for(const k of ["model","effort","perm"]){
+        if(!(k in b.codex))continue;
+        if(typeof b.codex[k]!=="string"||b.codex[k].length>200)return sendJson(res,400,{message:"Codex 项目设置无效。"});
+        const value=b.codex[k].trim()==="follow"?"":b.codex[k].trim();
+        if(k==="perm"&&value&&!validCodexMode(value))return sendJson(res,400,{message:"Codex 权限模式无效。"});
+        if(k==="effort"&&value&&!["none","minimal","low","medium","high","xhigh","max"].includes(value))return sendJson(res,400,{message:"Codex 思考强度无效。"});
+        codex[k]=value==="follow"?"":value;
+      }
+    }
+    if(codex)proj.codex=codex;
     if (typeof b.name === "string" && b.name.trim()) proj.name = b.name.trim().slice(0, 60);
     if (typeof b.color === "string" && /^#[0-9a-f]{6}$/i.test(b.color)) proj.color = b.color;
     for (const k of ["model", "effort", "perm", "provider"]) if (typeof b[k] === "string") proj[k] = b[k].trim().slice(0, 80);
@@ -289,34 +313,14 @@ export async function routeProjects(req, res, u, p) {
     log(`📁 删除项目「${proj.name}」${withDir ? "（连目录）" : ""}`);
     return sendJson(res, 200, { ok: true });
   }
-  // 指令 = 项目目录里的 CLAUDE.md。读写都不跟软链：克隆来的仓库可以把它做成指向密钥文件 / 设置文件的软链，
-  // 读出来就进了界面，保存就把那个文件盖掉（审查 v0513b 低-13）
-  if (sub === "/instr") {
-    const f = path.join(proj.path, "CLAUDE.md");
-    const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
-    let lst = null; try { lst = fs.lstatSync(f); } catch {}
-    if (lst && !lst.isFile()) return sendJson(res, 409, { message: tz("这个项目的 CLAUDE.md 不是普通文件（可能是软链接），不在这里读写") });
-    if (req.method === "GET") {
-      // 只有「文件不存在」才算空：没权限、读错了要报出来，前端据此只读，免得一保存把原文盖掉（审查 #52 E06）
-      if (lst && lst.size > 4 << 20) return sendJson(res, 413, { message: tz("CLAUDE.md 太大了（超过 4 MB）") });
-      let fd;
-      try { fd = fs.openSync(f, fs.constants.O_RDONLY | NOFOLLOW); return sendJson(res, 200, { text: fs.readFileSync(fd, "utf8"), exists: true }); }
-      catch (e) { return e.code === "ENOENT" ? sendJson(res, 200, { text: "", exists: false }) : sendJson(res, 500, { message: e.code || e.message }); }
-      finally { if (fd != null) fs.closeSync(fd); }
-    }
-    if (req.method === "PUT") {
-      const b = await body();
-      const text = String(b.text || "");
-      if (!text.trim()) {
-        try { fs.rmSync(f, { force: true }); } catch (e) { return sendJson(res, 500, { message: e.code || e.message }); }
-      } else {
-        // 先写同目录临时文件、fsync 再换名（files.mjs 的 writeNoFollow，也不跟软链）：以前 O_TRUNC 先把原文截成 0，
-        // 写到一半满盘 / 被杀就只剩空文件或半截（0.6.9 审计 P1-7）
-        try { writeNoFollow(f, text.endsWith("\n") ? text : text + "\n"); }
-        catch (e) { return sendJson(res, e.code === "ELOOP" ? 409 : 500, { message: e.code || e.message }); }
-      }
-      return sendJson(res, 200, { ok: true });
-    }
+  // 按核心编辑实际指令文件。Codex 默认选择同目录有效的 override/base。
+  if(sub==="/instr" && ["GET","PUT"].includes(req.method)){
+    const backend=u.searchParams.get("backend")||"claude";
+    try{
+      if(req.method==="GET")return sendJson(res,200,readProjectInstructions(proj.path,backend));
+      const b=await body();
+      return sendJson(res,200,writeProjectInstructions(proj.path,{backend,text:b.text??"",name:b.name,revision:b.revision}));
+    }catch(err){return sendJson(res,err.status||500,{message:err.status?err.message:err.code||"项目指令读取或保存失败。"});}
   }
   return NEXT;
 }

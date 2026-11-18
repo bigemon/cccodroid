@@ -75,7 +75,7 @@
     if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = 0; }
     scrollDown();
   }
-  function updateCtx(used, total) {
+  function updateClaudeCtx(used, total) {
     if (used != null) state.ctxUsed = used;
     if (total) state.ctxTotal = total;
     const line = state.compactAt && state.ctxTotal ? Math.min(state.compactAt, state.ctxTotal) : state.compactAt || 0;
@@ -100,10 +100,47 @@
     if (pct >= 100) ctxBar.classList.add("danger");
     else if (pct >= 85) ctxBar.classList.add("warn");
     ctxFill.style.width = pct + "%";
-    ctxBar.style.setProperty("--p", pct + "%");   // 快满时字按这条分界线分两色（style.css #ctxbar.warn #ctxtxt）
+    ctxBar.style.setProperty("--p", pct + "%");   // 保持进度刻度与填充宽度同步
     $("ctxctx").textContent = line > 0
       ? t("上下文 {used} / 压缩线 {line} · {pct}%", { used: fmtTok(state.ctxUsed), line: fmtTok(line), pct })
       : t("上下文 {used} / {total} · {pct}%", { used: fmtTok(state.ctxUsed), total: fmtTok(state.ctxTotal), pct });
+    saveUiState();
+  }
+  const isCodexView = () => typeof currentBackend === "function" && currentBackend() === "codex";
+  /** 刻度以【自动压缩窗口】为准；没设才退回模型窗口。
+   *  pctIn：后端算好的百分比（Codex 用 TUI 公式，含 12k 基线）；给了就直接用，不再自己除。 */
+  function updateCtx(used, total, pctIn) {
+    if (!isCodexView()) { state.ctxPct = null; return updateClaudeCtx(used, total); }
+    if (used != null) state.ctxUsed = used;
+    if (total) state.ctxTotal = total;
+    if (pctIn != null) state.ctxPct = pctIn;
+    else if (!isCodexView()) state.ctxPct = null;
+    // 压缩线是 Claude 的概念；Codex 的压缩由它自己管，套过来会算错
+    const line = isCodexView() ? 0 : (state.compactAt || 0);
+    const scale = line > 0 ? line : (state.ctxTotal || 0);
+    if (!scale && pctIn == null) return;
+    const pct = pctIn != null
+      ? Math.max(0, Math.min(100, Math.round(pctIn)))
+      : Math.min(100, Math.round((state.ctxUsed / scale) * 100));
+    ctxBar.classList.remove("hidden", "warn", "danger", "na");
+    if (pct >= 100) ctxBar.classList.add("danger");
+    else if (pct >= 85) ctxBar.classList.add("warn");
+    ctxFill.style.width = pct + "%";
+    ctxBar.style.setProperty("--p", pct + "%");
+    const est = isCodexView() && pctIn != null ? t("（估算）") : "";
+    $("ctxctx").textContent = line > 0
+      ? t("上下文 {used} / 压缩线 {line} · {pct}%", { used: fmtTok(state.ctxUsed), line: fmtTok(line), pct })
+      : t("上下文 {used} / {total} · {pct}%", { used: fmtTok(state.ctxUsed), total: fmtTok(state.ctxTotal), pct }) + est;
+    saveUiState();
+  }
+  /** Codex 还没拿到窗口 / 用量：明确显示「未知」，不留上一轮的数 */
+  function ctxUnknown() {
+    state.ctxUsed = 0;
+    state.ctxPct = null;
+    ctxBar.classList.remove("hidden", "warn", "danger");
+    ctxBar.classList.add("na");
+    ctxFill.style.width = "0%";
+    $("ctxctx").textContent = t("上下文：等待本轮数据");
     saveUiState();
   }
   /** 从 /context 的输出里抠出真实占用（形如 "**Tokens:** 17.9k / 200k (9%)"） */
@@ -146,16 +183,22 @@
   function resetView(sessionId, keepPendingModel = false) {
     const prevSid = view.sessionId;
     view.sessionId = sessionId || null;
-    // 换了会话：上一个会话的上下文用量不能挂在这个会话名下，先归零，等历史 / 事件流报这个会话自己的（#89）
-    view.ctxAt = 0;
-    if (view.sessionId !== prevSid) { replayCtx = null; view.cwd = null; updateCtx(0, state.ctxTotal); }
-    // 同一个未发送的新会话重连：hello 不能冲掉刚选的接口；显式打开 / 新建仍清空。
+    view.backend = null;
+    state.sessEff = null;
+    state.sessModel = null;
+    state.rerouteLive = false;
     if (view.sessionId || !keepPendingModel) state.pendingModel = null;
+    view.ctxAt = 0;
+    if (view.sessionId !== prevSid) { replayCtx = null; view.cwd = null; }
+    if (isCodexView()) {
+      ctxUnknown();                            // Codex 的上下文由本轮事件决定，别留上一个会话的数
+    }
+    paintBackend();
+    paintSessionStatus();
+    qbLoad(false).catch(() => {});
     refreshSessModel();                      // 模型标签换成这个会话自己的（打开、启动、重连都经过这里）
     view.gen++;
-    WROTE.clear();                           // 写过的文件只认本会话的
-    // 已答完的确认卡随旧视图一起放掉：只有还在文档里的卡才拿来挡重放，留着只会越攒越多（#95 01-007）；没答的留着，那一轮可能还在等
-    for (const [id, it] of PERMS) if (it.done) PERMS.delete(id);
+    view.historyEpoch = null;
     view.cursor = null;
     view.next = null;
     view.loading = false;
@@ -173,12 +216,12 @@
     const hid = stripHidden()[view.sessionId] || {};
     view.goalHide = hid.g || 0;
     view.tasks = null;
+    view.codexPlan = null;view.codexAgents=[];view.codexAgentsAt=0;view.codexCommands=[];
+    view.codexPlanAt = 0;
     view.tasksHide = hid.t || "";
     renderRunStrip();
-    // 新会话的首屏留着：点「新对话」时已经画过一次，重连回来（hello）又会走到这里——清掉重画就是空一帧再整块冒出来，
-    // 关了动效时看着就是一闪。还是新会话、首屏也还在，就把那块原样接回去（showWelcome 认它）
-    const wel = !view.sessionId && histEl.childElementCount === 1 ? histEl.querySelector(":scope > .msg.welcome") : null;
-    welKeep = wel || null;
+    document.getElementById("codex-history-notice")?.remove();
+    document.getElementById("codex-backup-notice")?.remove();
     histEl.innerHTML = "";
     // typeof 守卫：bridge-config-ui 的测试单独切 resetView 出来跑，那里没有 histLoading
     if (view.sessionId && typeof histLoading === "function") histLoading();
@@ -265,7 +308,8 @@
     view.userNav = true;   // 空白新对话上点「新对话」也要记：启动窗口里正等着接回上次会话（FIND-003）
     // 已经在空白新对话上又点「新对话」（侧栏 / 顶栏 ＋）：现场不动，只收起整页、聚焦输入框。
     // 以前每点一次都重置视图、重连事件流，顶栏在「新会话」「已连接」之间来回闪（#40）。带 note 的（/clear 等）照旧重开
-    if (!note && blankNew()) { closePage(); inputEl.focus(); return false; }
+    // 本地命令仍在等响应时也算在途操作；点新对话必须推进视图代次，撤销旧响应。
+    if (!note && blankNew() && !codexCommandBusy) { closePage(); inputEl.focus(); return false; }
     openSession(null);
     updateCtx(0, state.ctxTotal);
     setStatus(note || t("新会话"), "ok");
@@ -319,6 +363,7 @@
     view.loading = true;
     const gen = view.gen;
     const q = new URLSearchParams({ limit: "60", after: String(after) });
+    if(view.historyEpoch)q.set("historyEpoch",view.historyEpoch);
     const ex = windowExclude();
     if (ex) q.set("exclude", String(ex));
     let r;
@@ -342,6 +387,7 @@
     const gen = view.gen;
     olderEl.textContent = t("加载中…");
     const q = new URLSearchParams({ limit: initial ? "40" : "60" });
+    if(!initial&&view.historyEpoch)q.set("historyEpoch",view.historyEpoch);
     const anchor = initial ? view.anchor : "", resume = initial ? view.resume : null, before = view.cursor;
     if (initial) { view.anchor = ""; view.resume = null; }
     // 锚点 / 续读的意图记在视图外面：请求在途时整轮重连会 resetView，清掉的这些得能再发一遍，
@@ -351,7 +397,6 @@
     // 锚点：章节是压缩消息 uuid（字符串）；书签 / 上次读到是 { uuid, off, para, quiet }
     const aObj = anchor && typeof anchor === "object" ? anchor : null;
     if (anchor) { q.set("anchor", aObj ? aObj.uuid : anchor); if (aObj && aObj.off > 0) q.set("off", String(aObj.off)); }
-    if (initial) loadMarks();
     // 重连续不上（resume=false）时接着原来那一段读：以前 initial 分支吃掉了 after，读回的是最新一页（审查 #48 S08-02 / #49 P2-5）
     // 首屏要目标进度和任务清单：resetView 刚把它们清掉，重连续读那一页不带的话进度条和清单就没了（#178-1）
     if (resume != null) { q.set("after", String(resume)); q.set("meta", "1"); }
@@ -394,15 +439,43 @@
     }
     if (gen !== view.gen) return;
     view.loading = false;
-    if (initial) { view.histOk = true; view.pendNav = null; }
+    if (initial) {
+      view.histOk = true; view.pendNav = null;
+      // The history response already knows the backend; model metadata may arrive later.
+      view.backend = r.backend === "codex" ? "codex" : "claude";
+      loadMarks();
+    }
     view.cursor = r.cursor;
-    if (initial) view.next = fwd && r.next < r.size ? r.next : null;
+    if (initial) {
+      view.next = fwd && r.next < r.size ? r.next : null;
+      view.historyEpoch = r.historyEpoch || null;
+      document.getElementById("codex-history-notice")?.remove();
+      document.getElementById("codex-backup-notice")?.remove();
+      if(r.backend==="codex"&&r.recordBackup){
+        const notice=document.createElement("div");notice.id="codex-backup-notice";notice.className="tiny";
+        notice.textContent=t("已导入的记录可供查看；续聊需要当前设备保留原始 Codex 会话数据。");
+        olderEl.after(notice);
+      }
+      if(r.backend==="codex" && (r.historyComplete===false||r.historyRecoveryRequired) && !r.liveRunId) {
+        const notice=document.createElement("div");notice.id="codex-history-notice";notice.className="tiny";
+        notice.append(document.createTextNode(t(r.historyRecoveryRequired?"历史删除尚未同步，请先恢复界面历史再继续。":"早期历史可能不完整，可从核心恢复。")));
+        const button=document.createElement("button");button.textContent=t(r.historyRecoveryRequired?"恢复界面历史":"恢复历史");notice.appendChild(button);
+        button.onclick=async()=>{
+          if(!confirm(t("从核心恢复会话历史？原界面记录会先备份，工作区文件不会改变。")))return;
+          button.disabled=true;
+          try{
+            await api("/api/session/"+encodeURIComponent(id)+"/recover-history",{method:"POST",headers:{"content-type":"application/json"},body:"{}"});
+            if(gen===view.gen){toast(t("历史已恢复"));openSession(id);}
+          }catch(err){if(gen===view.gen){toast(err.message,true);button.disabled=false;}}
+        };
+        olderEl.after(notice);
+      }
+    }
     view.title = r.title || "";
-    if (r.cwd) view.cwd = r.cwd;   // 旧会话不在最近 150 条里时，项目 chip 靠它认（0.6.9 审计 196-显示.3）
-    // 请求在途时事件流已经送来更新的目标 / 清单：历史里的是旧快照，不许盖回去（审查 #50 S2-07）
-    const fresh = view.liveAt < sent;
-    if (initial && fresh && "goal" in r) { view.goal = r.goal || null; renderRunStrip(); }
-    if (initial && fresh && "tasks" in r) { view.tasks = r.tasks || null; renderRunStrip(); }
+    if (initial && "goal" in r) { view.goal = r.goal || null; renderRunStrip(); }
+    if(initial&&r.backend==="codex")view.codexCommands=r.commands||[];
+    if(initial&&r.backend==="codex"&&(r.subagentsAt||0)>=(view.codexAgentsAt||0)){view.codexAgents=r.subagents||[];view.codexAgentsAt=r.subagentsAt||0;renderRunStrip();}
+    if (initial && "tasks" in r && (r.backend !== "codex" || (r.planAt || 0) >= (view.codexPlanAt || 0))) { view.tasks = r.tasks || null; view.codexPlan = r.plan || null; view.codexPlanAt = r.planAt || 0; renderRunStrip(); }
     const page = renderItems(r.items || []);
     page.dataset.from = r.cursor;
     page.dataset.to = fwd ? r.next : initial ? r.size : before;
@@ -563,6 +636,14 @@
 
   /** 接上模型没有（登录了，或填了 Key）；网关连不上返回 null */
   async function setupReady() {
+    if(currentBackend()==="codex"){
+      try{
+        const s=await api("/api/codex/status",{timeout:10000});
+        if(!s.available)return false;
+        const a=await api("/api/codex/account",{timeout:10000});
+        return a.state==="error"?null:a.state==="logged_in";
+      }catch{return null;}
+    }
     let s = null;
     try { s = await api("/api/status", { timeout: 10000 }); } catch { return null; }
     let ready = !!(s.keyMode === "key" || s.otherKey);
@@ -584,10 +665,23 @@
     r.classList.toggle("wel-setup", on);
     if (!on && r.classList.contains("wel")) { autoGrow(); MO.play($("composer"), "mo-in-rise", 900); }
   }
+  async function refreshCodexSetupGuide(box){
+    const button=box?.querySelector('[data-p="codex"]');if(!button)return;
+    const request={};button._runtimeCheck=request;button.disabled=true;
+    try{
+      const status=await api("/api/codex/status",{timeout:10000});
+      if(!box.isConnected||button._runtimeCheck!==request)return;
+      if(typeof status.available!=="boolean")throw Error(t("无法确认 Codex 安装状态"));
+      button.textContent=t(status.available?"登录 Codex":"安装环境");
+      const hint=box.querySelector("[data-codex-guide-hint]");if(hint)hint.textContent=t(status.available?"Codex 环境已就绪，请登录 ChatGPT 账户。":"先安装 Codex 运行环境，再登录 ChatGPT 账户。");
+      button.disabled=false;
+    }catch{if(box.isConnected&&button._runtimeCheck===request){button.textContent=t("重试");button.disabled=false;}}
+  }
   /** 设置里填了 Key、浏览器里登录完回来（refreshStatus / 回到前台时调）：接上了就收起卡片、放出输入框 */
   async function recheckSetup() {
     if (!document.documentElement.classList.contains("wel-setup")) return;
-    if (!(await setupReady())) return;
+    const ready=await setupReady();
+    if(!ready){if(ready===false)refreshCodexSetupGuide(histEl.querySelector(":scope > .msg.welcome .setup-guide"));return;}
     const box = histEl.querySelector(":scope > .msg.welcome .setup-guide");
     if (box) { box.classList.add("hidden"); box.textContent = ""; }
     setupMode(false);
@@ -599,9 +693,12 @@
     const ready = await setupReady();
     if (ready === null) return;
     if (ready || !box.isConnected) { setupMode(false); return; }
-    if (box.childElementCount) { box.classList.remove("hidden"); setupMode(true); return; }   // 接回去的首屏：卡片已经画过、监听也挂过
-    box.innerHTML = `<p><strong>${esc(t("开始之前，先接上模型（两条路选一条）："))}</strong></p>
+    if (box.childElementCount) { box.classList.remove("hidden"); setupMode(true); await refreshCodexSetupGuide(box); return; }   // 接回去的首屏：卡片已经画过、监听也挂过
+    box.innerHTML = `<p><strong>${esc(t("开始之前，选择一种方式接上模型："))}</strong></p>
       <div class="setup-paths">
+        <div class="setup-path"><b>Codex · ChatGPT</b>
+          <div class="tiny" data-codex-guide-hint>${esc(t("正在检查 Codex 安装状态…"))}</div>
+          <button class="btn sm" data-p="codex" disabled>${esc(t("读取中…"))}</button></div>
         <div class="setup-path"><b>${esc(t("用 Claude 账户登录"))}</b>
           <div class="tiny">${esc(t("有 Claude Pro / Max 订阅，或 Anthropic Console 账户：在浏览器里授权一次就好，不用填 Key。"))}</div>
           <button class="btn sm" data-p="login">${esc(t("去登录"))}</button></div>
@@ -609,13 +706,27 @@
           <div class="tiny">${esc(t("用 Anthropic 的 Key，或 DeepSeek、智谱 GLM、通义千问、Kimi 等兼容接口的 Key，按用量付费。"))}</div>
           <button class="btn sm" data-p="key">${esc(t("去选接口、填 Key"))}</button></div>
       </div>
-      <div class="tiny">${esc(t("两条路都在 ☰ → 设置 → 接口，以后随时能换。"))}</div>`;
+      <div class="tiny">${esc(t("账号在 ☰ → 设置 → 接口与型号 管理；Codex 环境与频道在“更新”页管理。"))}</div>
+      <div class="row-actions"><button type="button" class="btn sm ghost" data-p="backup">${esc(t("导入完整备份"))}</button></div>`;
     box.classList.remove("hidden");
     setupMode(true);
-    box.addEventListener("click", (e) => {
-      const p = e.target.dataset && e.target.dataset.p;
+    box.addEventListener("click", async (e) => {
+      const p = e.target.closest("[data-p]")?.dataset.p;
       if (!p) return;
-      openDrawer("settings");
+      if(p==="backup"){startFullBackup("import");return;}
+      let codexState=null;
+      if(p==="codex")try{codexState=await api("/api/codex/status");}catch(error){toast(error.message,true);return;}
+      await openSettings("provider");
+      showSettingsCore(p==="codex"?"codex":"claude");
+      if(!view.sessionId){
+        const previous=currentBackend();state.backend=p==="codex"?"codex":"claude";view.backend=state.backend;
+        try{localStorage.setItem("cc.backend",state.backend);}catch{}
+        paintBackend();if(previous!==state.backend)resetModelForBackend();
+      }
+      if(p==="codex"){
+        if(!codexState.available)await openCodexEnvironment();
+        return;
+      }
       const sel = $("set-provider");
       if (p === "login" && [...sel.options].some((o) => o.value === "anthropic")) {
         sel.value = "anthropic";
@@ -624,6 +735,7 @@
       setTimeout(() => sel.scrollIntoView({ block: "center" }), 50);
       if (p === "key") sel.focus();
     });
+    await refreshCodexSetupGuide(box);
   }
 
   // ── 事件总线 ──────────────────────────────────────────────────────
@@ -781,6 +893,8 @@
     if (view.runIds.has(ev.runId)) return true;
     if (ev.cid && view.cids.has(ev.cid)) return true;
     if (view.sessionId && ev.sessionId === view.sessionId) return true;
+    // 新会话的 run_start 早于核心分配会话号。重放时用当前快照认领，才能重建待答卡。
+    if (view.sessionId && srv.runs.some(r=>r.id===ev.runId && r.sessionId===view.sessionId)) return true;
     if (ev.follow && view.runIds.has(ev.follow)) return true;
     return false;
   }
@@ -794,8 +908,17 @@
     if (ev.type === "error") recordFailNote(ev);
     switch (ev.type) {
       case "hello": return onHello(ev);
+      case "browser_open":
+        if(belongs(ev)&&document.visibilityState==="visible"&&hasBrowser()){try{const u=new URL(ev.url);if(["http:","https:"].includes(u.protocol))openWeb(u.href);}catch{}}return;
+      case "codex_commands":
+        if(view.sessionId===ev.sessionId){view.codexCommands=ev.commands||[];refreshManagedCommands(view.codexCommands);renderRunStrip();}return;
+      case "subagents":
+      case "subagent":
+        if(belongs(ev)&&(ev.agentsAt||0)>=(view.codexAgentsAt||0)){view.codexAgents=ev.agents||[];view.codexAgentsAt=ev.agentsAt||0;renderRunStrip();}
+        if(ev.type==="subagents")return;
+        break;
       case "tasks":
-        if (view.sessionId && ev.sessionId === view.sessionId) { view.tasks = ev.tasks || null; view.liveAt = Date.now(); renderRunStrip(); }
+        if (belongs(ev)) { view.tasks = ev.tasks || null; view.codexPlan = ev.plan || null; view.codexPlanAt = ev.at || Date.now(); renderRunStrip(); }
         break;
       case "goal":
         if (view.sessionId && ev.sessionId === view.sessionId) { view.goal = ev.goal || null; view.liveAt = Date.now(); renderRunStrip(); }
@@ -823,7 +946,8 @@
         if (ev.cid) view.cidRuns.set(ev.cid, ev.runId);
         view.lastRunId = ev.runId;
         if (runViews.has(ev.runId)) return;
-        if (ev.auto !== "idle") { renderUser(ev.text, liveEl); tagRun(liveEl.lastElementChild, ev.runId); }
+        let userEl=null;
+        if (ev.auto !== "idle") { userEl=renderUser(ev.text, liveEl).parentElement; tagRun(userEl, ev.runId); }
         const av = AssistantView(liveEl, true);
         tagRun(av.msgEl, ev.runId);
         if (ev.text.trim().startsWith("/")) av.msgEl.classList.add("sys");
@@ -831,7 +955,7 @@
         const timer = RunTimer(ev.startedAt);
         timer.attach(av);
         av.phase({ phase: "prep" });     // 网关起进程前的准备；起了进程换「启动中」，claude 就绪换「连接中」（F6）
-        runViews.set(ev.runId, { av, startedAt: ev.startedAt, timer, out: 0 });
+        runViews.set(ev.runId, { av, userEl, startedAt: ev.startedAt, timer, out: 0 });
         statLive(ev.runId);
         // 只有本窗口刚发的消息才强制回到底部；别的会话 / 别的窗口开始的轮次别把正在翻历史的人拽走（0.6.9 审计 196-聊天.4）
         scrollDown(!busReplay && !!ev.cid && view.cids.has(ev.cid));
@@ -844,7 +968,7 @@
         if (ev.cid) { view.cids.add(ev.cid); view.cidRuns.set(ev.cid, ev.runId); }
         rv.av.finish();
         if (rv.av.empty) rv.av.remove();
-        renderUser(ev.text, liveEl); tagRun(liveEl.lastElementChild, ev.runId);
+        renderUser(ev.text, liveEl, ev.uuid); tagRun(liveEl.lastElementChild, ev.runId);
         rv.av = AssistantView(liveEl, true); tagRun(rv.av.msgEl, ev.runId);
         if (ev.text.trim().startsWith("/")) rv.av.msgEl.classList.add("sys");   // 后台任务在跑时插进去的命令，样式同单跑的命令
         rv.avDone = false;
@@ -875,9 +999,14 @@
       }
       case "init": {
         if (!view.runIds.has(ev.runId)) return;
-        // 本页已经属于 A，这个 run 却 init 成 B：它是聚合认回来的另一条草稿，从这里摘出去（0.6.9 #191-1）
-        if (view.sessionId && ev.sessionId && ev.sessionId !== view.sessionId) return detachRun(ev.runId);
-        if (!view.sessionId && ev.sessionId) { view.sessionId = ev.sessionId; draftAdopt(ev.sessionId); adoptPendingModel(); saveUiState(); }
+        if (!view.sessionId && ev.sessionId) { view.sessionId = ev.sessionId; adoptPendingModel(); saveUiState(); }
+        // 新一轮开始：上一轮的改道状态作废，标签先回到用户选择的模型
+        if (isCodexView()) {
+          state.rerouteLive = false;
+          if (state.sessEff && state.sessEff.effectiveModel) state.sessEff = { ...state.sessEff, effectiveModel: null };
+        }
+        const userEl=runViews.get(ev.runId)?.userEl;
+        if(isCodexView()&&userEl&&ev.userUuid){userEl.dataset.uuid=ev.userUuid;paintMarks(userEl);}
         if (ev.model) { state.model = ev.model; paintModel(ev.model); }
         if (ev.permissionMode) setPermChip(ev.permissionMode);
         return;
@@ -885,8 +1014,16 @@
       case "run_end": refreshQuota(); return onRunEnd(ev);
       case "quota": case "billing": return refreshQuota();
       case "perm_mode":
+        if (ev.backend === "codex") {
+          if (!ev.sessionId) state.settings.codex = { ...(state.settings.codex || {}), permissionMode: ev.mode };
+          if (codexPermView() && ev.sessionId === view.sessionId) {
+            state.sessEff = { ...(state.sessEff || {}), backend: "codex", permissionMode: ev.mode, permissionSessionId: ev.sessionId };
+            setPermChip(ev.mode);
+          }
+          return;
+        }
         state.settings.permissionMode = ev.mode;
-        setPermChip(ev.mode);
+        if (!codexPermView()) setPermChip(ev.mode);
         if ($("set-perm")) $("set-perm").value = ev.mode;
         // 网关把在跑的每一轮都当场切到了这个模式（gw/queue.mjs setPermMode）：手里的快照跟着改，
         // 等着的计划卡按新模式重排按钮，别让旧按钮把刚切的模式改回去（#175-2）
@@ -899,10 +1036,24 @@
     const rv = runViews.get(ev.runId);
     if (!rv) return;
     const av = rv.av;
-    if (!av) return;   // 收尾后只留了 startedAt 的空壳（FIND-042）：晚到的增量不再画
+    if (!av) return;
+    if (ev.codexItem) { av.codexItem(ev); return; }
     switch (ev.type) {
-      case "usage":          if (ev.contextTokens) liveCtx(ev.contextTokens, state.ctxTotal); break;
-      case "run_tokens":     rv.out = +ev.out || 0; if (statRun === ev.runId) statPaint(); break;
+      case "usage":
+        // 顶层 contextTokens 来自流式转发；usage 里是原始 last/total/窗口和 pct 估算
+        if (ev.contextTokens != null || ev.contextWindow != null) {
+          updateCtx(ev.contextTokens != null ? ev.contextTokens : state.ctxUsed,
+            ev.contextWindow || state.ctxTotal, ev.usage && ev.usage.pct_used);
+        }
+        break;
+      case "subagent": {
+        const owners=rv.agentOwners||(rv.agentOwners=new Map());
+        const owner=owners.get(ev.agent.id)||av;owners.set(ev.agent.id,owner);
+        owner.subagent(ev.agent);scrollDown();break;
+      }
+      case "diff": av.inspection("diff",ev.diff); scrollDown(); break;
+      case "review": av.inspection("review",ev.review); scrollDown(); break;
+      case "command":        av.command(ev.command); scrollDown(); break;
       case "delta":          av.delta(ev.text); break;
       case "assistant_text": av.text(ev.text); break;
       case "thinking_delta": av.thinkDelta(ev.text); break;
@@ -924,15 +1075,24 @@
         if (ev.parent && !TOOL_CARDS.get(ev.parent)) break;   // 同上：父卡不在，结果也不攒进待贴表
         toolResult(ev.id, ev.ok, ev.text); av.toolDone(ev.id); scrollDown(); break;
       case "phase":          av.phase(ev); break;
-      // 压缩中的状态会连来好几条：同一次压缩只留一行，压完原地换成结果（#67）
       case "compacting":     av.phase(null); av.noteK("cmp" + cmpGen, t("正在压缩上下文…")); scrollDown(); break;
-      case "note":           av.noteK(ev.key, ev.text); scrollDown(); break;
-      case "hook_ctx":       av.hookCtx(ev.event, ev.text); scrollDown(); break;
+      case "note":
+        av.noteK(ev.key, ev.text);
+        // 模型改道：记下「本轮实际」，标签补一片 → 实际模型（用户的选择不改）
+        if (ev.key === "model-rerouted" && ev.to) {
+          state.sessEff = { ...(state.sessEff || {}), effectiveModel: ev.to };
+          state.rerouteLive = true;
+          paintModel(state.chipModel || chipName());
+        }
+        scrollDown();
+        break;
+      case "hook_ctx": av.hookCtx(ev.event, ev.text); scrollDown(); break;
       case "compacted":
         av.noteK("cmp" + cmpGen++, ev.pre != null && ev.post != null
           ? t("上下文已压缩：{pre} → {post} tokens", { pre: ev.pre.toLocaleString(), post: ev.post.toLocaleString() })
           : t("上下文已压缩"), true);
-        if (ev.post != null) liveCtx(ev.post, state.ctxTotal);
+        if (ev.post != null) updateCtx(ev.post, ev.window || state.ctxTotal, ev.pct);
+        else if (isCodexView()) ctxUnknown();
         scrollDown(); break;
       case "error":          av.error(ev.message + (ev.detail ? "\n\n" + ev.detail : "")); break;
     }
@@ -1062,7 +1222,8 @@
     // 记到这一轮自己的会话头上：正在看的可能是刚认领的另一条草稿（FIND-008）
     if (statRun === ev.runId) { statStop(); statEl.textContent = statLast[ev.sessionId || view.sessionId] || ""; }
     if (ev.sessionId && !view.sessionId && view.runIds.has(ev.runId)) { view.sessionId = ev.sessionId; draftAdopt(ev.sessionId); adoptPendingModel(); saveUiState(); }
-    if (ev.usage?.context_tokens) liveCtx(ev.usage.context_tokens, ev.usage.context_window || state.ctxTotal);
+    if (ev.usage?.context_tokens != null) { if (isCodexView()) updateCtx(ev.usage.context_tokens, ev.usage.context_window || state.ctxTotal, ev.usage.pct_used); else liveCtx(ev.usage.context_tokens, ev.usage.context_window || state.ctxTotal); }
+    if (isCodexView()) { state.rerouteLive = false; refreshSessModel(); }
 
     if (ev.localCommand && ev.resultText) {
       av.finish();
@@ -1146,6 +1307,7 @@
     showTamper(s.tamper, true);
     showRecoverWarn(s.recoverWarns);
     srv.runs = s.runs || (s.run ? [s.run] : []);
+    paintBackend();
     srv.intr = intrList(s.interrupted);
     srv.queueAll = s.queue || [];
     if (s.maxParallel) srv.max = s.maxParallel;

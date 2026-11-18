@@ -9,7 +9,7 @@ import { NEXT } from "../gw/http.mjs";
 
 const { QUEUE, RUN_LANE, enqueue, routeQueue } = await import("../gw/queue.mjs");
 const { execIntent } = await import("../gw/run.mjs");
-const { RUNS, maxParallel } = await import("../gw/runs.mjs");
+const { RUNS, SESSIONS, maxParallel } = await import("../gw/runs.mjs");
 const srv = http.createServer(async (req, res) => { const u = new URL(req.url, "http://x"); if ((await routeQueue(req, res, u, u.pathname)) === NEXT) res.writeHead(404).end(); });
 await new Promise((ok) => srv.listen(0, "127.0.0.1", ok));
 const fake = [];
@@ -20,6 +20,7 @@ test("定时任务 / 无人值守条目 ⚡ 插队：不注入别人的轮次，
   let k = 0;
   while (RUNS.size < maxParallel()) { const id = "a0610p-busy" + (++k); fake.push(id); RUNS.set(id, { id, text: "", startedAt: Date.now(), log: [], idle: false, ended: false, lane: "x:" + id }); }
   const sid = crypto.randomUUID();
+  SESSIONS.set(sid, Date.now());
   const intent = execIntent({ sessionId: sid });
   let injected = 0;
   const runId = "a0610p-run";

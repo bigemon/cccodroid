@@ -12,7 +12,7 @@ import { NEXT } from "../gw/http.mjs";
 
 const { QUEUE, RUN_LANE, RUN_SESSIONS, enqueue, saveRunMark, sidForItem, routeQueue } = await import("../gw/queue.mjs");
 const { pickProvider, execIntent } = await import("../gw/run.mjs");
-const { RUNS, maxParallel } = await import("../gw/runs.mjs");
+const { RUNS, SESSIONS, maxParallel } = await import("../gw/runs.mjs");
 const { setSessModel, clearSessModel } = await import("../gw/sessmodel.mjs");
 const srv = http.createServer(async (req, res) => { const u = new URL(req.url, "http://x"); if ((await routeQueue(req, res, u, u.pathname)) === NEXT) res.writeHead(404).end(); });
 await new Promise((ok) => srv.listen(0, "127.0.0.1", ok));
@@ -39,6 +39,7 @@ const dropQ = (it) => { const i = QUEUE.indexOf(it); if (i >= 0) QUEUE.splice(i,
 test("撤销 follow 链中间的排队项：后面的消息仍续首条跑出来的会话（#120-1）", () => {
   fill();
   const S = crypto.randomUUID();
+  SESSIONS.set(S, Date.now());
   const rA = "v062q-rA";
   RUNS.set(rA, { id: rA, text: "", startedAt: Date.now(), log: [], sessionId: S, idle: false, ended: false, lane: "n:" + rA });
   RUN_LANE.set(rA, "n:" + rA);
@@ -69,6 +70,7 @@ test("撤销 follow 链中间的排队项：后面的消息仍续首条跑出来
 test("空闲进程复用前核对执行配置：换了模型就不再自动塞进旧进程（#120-2）", () => {
   fill();
   const sid = crypto.randomUUID();
+  SESSIONS.set(sid, Date.now());
   // 用 claude- 开头的名字：原生接口会把别家的名字滤掉，那样换没换模型看起来都一样
   setSessModel(sid, { model: "claude-v062-a" });
   const intent = execIntent({ sessionId: sid });
@@ -102,6 +104,7 @@ test("空闲进程复用前核对执行配置：换了模型就不再自动塞�
 test("没记下执行配置的轮次不自动复用（#120-2）", () => {
   fill();
   const sid = crypto.randomUUID();
+  SESSIONS.set(sid, Date.now());
   let injected = 0;
   const runId = "v062q-old";
   RUNS.set(runId, {
@@ -124,6 +127,7 @@ test("没记下执行配置的轮次不自动复用（#120-2）", () => {
 test("显式插话也核对执行配置：换了模型就不再塞进旧进程（#120-2）", () => {
   fill();
   const sid = crypto.randomUUID();
+  SESSIONS.set(sid, Date.now());
   setSessModel(sid, { model: "claude-v062-c" });
   const intent = execIntent({ sessionId: sid });
   let injected = 0;
@@ -155,6 +159,7 @@ test("显式插话也核对执行配置：换了模型就不再塞进旧进程�
 test("配置变化后 ⚡ 会结束空闲轮次，而不是永久卡住（#139 回归）", async () => {
   fill();
   const sid = crypto.randomUUID();
+  SESSIONS.set(sid, Date.now());
   setSessModel(sid, { model: "claude-v062-e" });
   const intent = execIntent({ sessionId: sid });
   let injected = 0;

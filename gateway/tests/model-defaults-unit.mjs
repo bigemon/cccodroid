@@ -1,0 +1,13 @@
+import assert from "node:assert/strict";import {validDefaults,selectDefaultValues,resolveModelDefaults as resolve} from "../gw/codex/model-defaults.mjs";
+const models=[{id:"a",isDefault:true,effort:{supported_levels:["low","high"],default_level:"high"}},{id:"b",isDefault:false,effort:{supported_levels:["low"],default_level:"low"}},{id:"hidden",hidden:true,isDefault:false,effort:{supported_levels:["high"],default_level:"high"}}];let n=0;const check=(name,fn)=>{fn();console.log("ok "+(++n)+" "+name);},defaults={model:null,effort:null};
+check("默认标记保持为空，实际解析到推荐及模型默认强度",()=>{const r=resolve(defaults,models);assert.deepEqual(r.normalized,defaults);assert.equal(r.model,"a");assert.equal(r.effort,"high");});
+check("用户有效型号和强度优先",()=>{const r=resolve({model:"b",effort:"low"},models);assert.equal(r.model,"b");assert(!r.modelReset&&!r.effortReset);});
+check("消失的型号回推荐，兼容强度保留",()=>{const r=resolve({model:"gone",effort:"high"},models);assert.deepEqual(r.normalized,{model:null,effort:"high"});assert.equal(r.model,"a");});
+check("模型变化后不支持的强度独立回默认",()=>{const r=resolve({model:"b",effort:"high"},models);assert.equal(r.normalized.model,"b");assert.equal(r.normalized.effort,null);assert.equal(r.effort,"low");});
+check("隐藏项存在时不误判下线",()=>{const r=resolve({model:"hidden",effort:null},models);assert.equal(r.model,"hidden");assert(!r.modelReset);});
+check("不取无推荐或多推荐目录的首尾项",()=>{for(const rows of [models.map(m=>({...m,isDefault:false})),models.map(m=>({...m,isDefault:true}))])assert(resolve(defaults,rows).error);});
+check("推荐改变时默认仍是跟随关系",()=>{const r=resolve(defaults,models.map(m=>({...m,isDefault:m.id==="b"})));assert.equal(r.model,"b");assert.equal(r.effort,"low");assert.deepEqual(r.normalized,defaults);});
+check("没有模型时不凭未知能力清除强度",()=>{const r=resolve({model:"gone",effort:"high"},[]);assert(r.error&&r.modelReset);assert.equal(r.normalized.effort,"high");});
+check("当次、项目、全局优先级及明确默认",()=>{assert.deepEqual(selectDefaultValues({model:"a",effort:"high"},{model:"b"},{effort:"low"}),{model:"b",effort:"low"});assert.equal(selectDefaultValues({model:"a",effort:"high"},{model:"b"},{model:""}).model,null);});
+check("畸形偏好拒绝，默认档位不一致不伪造",()=>{for(const x of [null,[],{}, {...defaults,other:1},{model:2,effort:null},{model:"x\0",effort:null}])assert(!validDefaults(x));assert(validDefaults(defaults));assert(resolve(defaults,[{id:"x",isDefault:true,effort:{supported_levels:["low"],default_level:"high"}}]).error);});
+console.log(n+"/"+n+" passed");

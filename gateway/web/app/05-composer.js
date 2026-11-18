@@ -1,3 +1,89 @@
+  // ── 后端（Claude / Codex）──────────────────────────────────────────
+  // 只在「新会话」时可切；已有会话按服务端索引里的 backend 显示，不能中途换（P6-B1 §3）。
+  const backendEl = $("backend-chip");
+  function sessionBackendPending() {
+    return !!(view.sessionId && !view.backend
+      && !state.sessions.some(x => x.id === view.sessionId)
+      && !srv.runs.some(x => x.sessionId === view.sessionId));
+  }
+  function currentBackend() {
+    if (view.sessionId) {
+      // 本窗口刚发的这条：先认本地记下的后端（会话列表可能还没刷回来）
+      if (view.backend) return view.backend;
+      const s = state.sessions.find((x) => x.id === view.sessionId)
+        || srv.runs.find((x) => x.sessionId === view.sessionId);
+      return s && s.backend === "codex" ? "codex" : "claude";
+    }
+    return state.backend === "codex" ? "codex" : "claude";
+  }
+  function paintBackend() {
+    if (!backendEl) return;
+    const b = currentBackend();
+    backendEl.textContent = sessionBackendPending() ? t("读取中…") : b === "codex" ? "Codex" : "Claude";
+    backendEl.classList.toggle("codex", b === "codex");
+    backendEl.classList.toggle("locked", !!view.sessionId);
+    backendEl.title = view.sessionId ? t("当前会话的后端") : t("新会话使用的后端，点击选择");
+    paintPermForBackend();
+  }
+  /** 换后端后重置模型标签：旧后端的暂存选择/实时状态一律不留，等新后端的默认值回来再画 */
+  function resetModelForBackend() {
+    state.pendingModel = null;      // 新会话面板里暂存的模型 / 强度只属于上一个后端
+    state.sessEff = null;           // 上一个后端算出来的 provider / model / usage
+    state.rerouteLive = false;
+    state.modelBusy = true;         // 读取中：先不显示任何一边的模型名，免得误导
+    paintModel(chipName());
+    paintSessionStatus();
+    qbLoad(false).catch(() => {});
+    refreshSessModel().finally(() => { state.modelBusy = false; paintModel(chipName()); });
+  }
+  /** 后端不是「点一下盲切」：弹出已注册的后端列表，明确选一个 */
+  async function openBackendPicker() {
+    if (view.sessionId) { toast(t("已有会话不能切换后端，请新建会话")); return; }
+    if (OV.isOpen($("backend-pick"))) { OV.close($("backend-pick")); return; }
+    const cur = currentBackend();
+    let codexOk = true, codexWhy = "";
+    try {
+      const st = await api("/api/codex/status");
+      codexOk = !!st.available;
+      if (!codexOk) codexWhy = t("尚未就绪：到 设置 → 更新 安装环境，再到 Codex 账号设置登录");
+    } catch { codexOk = false; codexWhy = t("读取状态失败"); }
+    const row = (id, title, desc, ok) => `<button type="button" class="mp-item${id === cur ? " cur" : ""}${ok ? "" : " off"}" data-backend="${id}">
+      <span>${esc(title)}${id === cur ? ` · ${t("当前")}` : ""}</span>
+      <small>${esc(ok ? desc : codexWhy)}</small></button>`;
+    const m = document.createElement("div");
+    m.id = "backend-pick";
+    m.innerHTML = `<div class="sheet-panel mp-panel">
+      <div class="mp-head"><b>${t("选择后端")}</b><button class="mp-x" type="button" aria-label="${t("关闭")}">${uiI("x")}</button></div>
+      <div class="mp-lbl">${t("新会话用哪个 Agent")}</div>
+      <div class="mp-list">
+        ${row("claude", "Claude Code", t("现有后端，工具与登录保持不变"), true)}
+        ${row("codex", "OpenAI Codex", t("ChatGPT 订阅驱动，模型与账号在设置里管理"), codexOk)}
+      </div>
+      <div class="tiny mp-note">${t("只影响新会话；已有会话的后端在创建时固定，不能中途切换。")}</div></div>`;
+    OV.open(m, { kind: "modal", anchor: backendEl });
+    m.addEventListener("click", async (e) => {
+      if (e.target === m || e.target.closest(".mp-x")) { OV.close(m); return; }
+      const b = e.target.closest("button[data-backend]");
+      if (!b || b.disabled) return;
+      const prev = currentBackend(), next = b.dataset.backend === "codex" ? "codex" : "claude";
+      state.backend = next;
+      try { localStorage.setItem("cc.backend", state.backend); } catch {}
+      OV.close(m);
+      paintBackend();
+      // 换了后端：模型标签也得跟着换。新会话暂存的选择属于上一个后端（Claude 的模型名对 Codex 没意义），
+      // 清掉，按新后端的默认重新取（Codex 目录默认 / Claude 全局默认）—— 否则标签会把旧后端的模型挂在新后端下面
+      if (prev !== next) { hidePopup(); resetModelForBackend(); }
+      toast(t("新会话使用「{name}」", { name: state.backend === "codex" ? "Codex" : "Claude" }));
+      if(next==="codex"&&!codexOk){
+        await openCodexEnvironment();
+      }
+    });
+  }
+  if (backendEl) {
+    backendEl.addEventListener("click", openBackendPicker);
+    paintBackend();
+  }
+
   // ── 发送 ──────────────────────────────────────────────────────────
   // 附件大小门限（与 App 壳 MainActivity.BIG_ATTACH 同值）：超过的不写成 @路径 —— claude 见到 @路径 会把整份读进上下文，
   // 几百 MB 的东西读不进还白占一轮；只写路径和大小，用到时让它自己按路径读（解压、抽样、跑脚本）。这句落款各语言都写中文，气泡按它认（02 splitRefs）
@@ -15,7 +101,42 @@
   const uploading = new Set();
   let uploadSeq = 0;
 
-  async function send(forcedText, mode) {
+  let codexSkillSeq=0,codexSkillChoices=[],codexSkillScope="",codexSkillCatalog=null;
+  const skillScope=()=>JSON.stringify([view.gen,view.sessionId,view.projectId,currentBackend()]);
+  function selectedCodexSkills(text){
+    if(currentBackend()!=="codex"||codexSkillScope!==skillScope())return [];
+    const names=new Set([...text.matchAll(/(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9_-]*)(?![A-Za-z0-9_/-])/g)].map(m=>m[1]));
+    return codexSkillChoices.filter(s=>names.has(s.name)).map(({name,path})=>({name,path}));
+  }
+  let codexCommandSeq=0,codexCommandList=null,codexCommandLoading=null,codexCommandBusy=false;
+  async function sendCodexCommand(typed,fromInput) {
+    const sid=view.sessionId,project=view.projectId,backend=currentBackend(),generation=view.gen;
+    const same=()=>generation===view.gen&&sid===view.sessionId&&project===view.projectId&&backend===currentBackend();
+    if(sessionBackendPending())return toast(t("会话核心正在读取，请稍后再试。"),true);
+    if(fromInput&&state.attachments.length)return toast(t("此命令不接受附件，请先移除附件。"),true);
+    if(!sid&&isBusy())return toast(t("请等会话初始化完成后再使用此命令。"),true);
+    if(codexCommandBusy)return toast(t("上一条命令仍在处理，请稍后再试。"),true);
+    codexCommandBusy=true;
+    try{
+      const result=await post("/api/codex/slash",{text:typed,sessionId:sid,projectId:sid?null:project,pin:sid?null:state.pendingModel});
+      if(!same())return;
+      if(result.action==="login"){
+        openDrawer("settings");showSettingsCore("codex");await startCodexLogin();
+      }else{
+        if(result.changed){
+          if(!sid)await pickSessModel(result.reset?null:result.patch);
+          else await refreshSessModel();
+          if(!same())return;
+          paintModel(chipName());loadCtxModel();
+        }
+        addSysMsg(result.text,"/"+result.command);
+      }
+      if(fromInput&&same()&&inputEl.value.trim()===typed){inputEl.value="";autoGrow();}
+    }catch(e){if(same())toast(e.message||t("命令执行失败，请稍后重试。"),true);}
+    finally{codexCommandBusy=false;}
+  }
+
+  async function send(forcedText, mode, idempotencyKey) {
     const fromInput = forcedText == null;
     if (fromInput && uploading.size) return void toast(t("还有 {n} 个文件正在上传，传完再发送。", { n: uploading.size }), true);
     // 安卓壳在后台把选择器里的大文件收进工作区（不经网页，见 MainActivity.attachBig）：收完之前也不许发送，
@@ -37,8 +158,12 @@
       newConversation(t("已清空上下文，开始新会话"));
       return;
     }
-    // 下面两个命令按用户打的字认（typed），不看接了附件引用的 text：带着附件时 /rename 会把 @路径 写进标题、
-    // /login console 会被当成网页登录（11-04 报告 三）。附件留在附件栏里，下一条照常带上
+    const slash=typed.match(/^\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i);
+    if(slash&&(currentBackend()==="codex"||sessionBackendPending())){
+      const name=slash[1].toLowerCase();
+      if(!["compact","review"].includes(name)&&(name!=="rename"||!slash[2]?.trim()))
+        return sendCodexCommand(typed,fromInput);
+    }
     // 官方账户登录：OAuth 全程由 claude 自己完成，网关只转递授权页地址；授权码不经手（要贴码就在终端里贴给 claude）
     if (typed === "/login" || typed.startsWith("/login ")) {
       if (fromInput) { inputEl.value = ""; autoGrow(); }
@@ -82,7 +207,9 @@
 
     const cid = newCid();
     view.cids.add(cid);
-    lastSendAt = Date.now();   // 点下就记：run_start 可能比 POST 回执先到，等回执再记的话双击那一下会被当成「停止」（审查 v0.5.4 F1 残余）
+    lastSendAt = Date.now();
+    // 记住这一条用的是哪个后端：init 回来之前会话列表还没刷新，标识不能跳回 Claude
+    view.backend = view.sessionId ? null : currentBackend();
     const sentAtt = fromInput ? state.attachments : [];
     // 这条是从哪个会话的输入框发的：没发出去时正文和附件要回到那里，不能塞进切过去的会话（#174-1）
     const ep0 = draftEpoch, key0 = view.sessionId || "";
@@ -90,7 +217,7 @@
     if (fromInput) { inputEl.value = ""; autoGrow(); clearAttachments(); }
     const dk = draftOwner(ep0, key0);
     // 幂等键：该会话 lost 槽里还是这条、还没确认送到 = 同一条重发，沿用原键，网关只跑一轮（FIND-048/036）
-    const idem = fromInput ? draftSentIdem(dk, text) || newCid() : newCid();
+    const idem = fromInput ? draftSentIdem(dk, text) || newCid() : idempotencyKey || newCid();
     // 发出去先留底：POST 悬挂 / 刷新 / 被杀之后原文都还能找回（FIND-035、FIND-010）
     if (fromInput) draftKeepSent(dk, text, sentAtt, idem);
     syncInterject();
@@ -114,7 +241,11 @@
         timeout: 20000,   // 入队即回执；网关半死时别永远转圈（FIND-035）
         body: JSON.stringify({
           message: text,
-          idem,     // 网关按它在窗口内去重：重发回原 run，不另起一条（FIND-048/036）
+          idem,
+          attachments: sentAtt.map(a => ({ path: a.path })),
+          skills:selectedCodexSkills(typed),
+          // 新会话带后端；已有会话由服务端按索引决定
+          backend: view.sessionId ? null : currentBackend(),
           sessionId: view.sessionId,
           // 新会话还没拿到会话号时连发：告诉网关"跟在上一条后面"，它会接到同一个会话里
           follow: view.sessionId ? null : view.lastRunId,
@@ -130,15 +261,15 @@
       if (fromInput) draftDropLost(draftOwner(ep0, key0), idem);
       // 等回执期间切了会话：这一轮属于原来那个会话，别记进现在的视图（否则它的回复渲染到这边，
       // 下一条新会话消息还会带着 follow 接进原来那一轮 —— 审查 中11）
-      if (gen !== view.gen) return;
+      if (gen !== view.gen) return true;
       view.runIds.add(r.id);
       view.lastRunId = r.id;
       view.pendingMerge = null;
-      // 斜杠命令只在空闲时插进去，送进去就画出来了（gw/run.mjs 的 run.inject），不用再提示
-      if (r.duplicate) { /* 网关早就收过这条（重发）：别把「已排队」再说一遍 */ }
-      else if (r.injected) { if (!text.trim().startsWith("/")) toast(t("已插话：当前这一步做完，Claude 就会看到")); }
+      if (r.duplicate) { /* 已受理的重发不重复提示。 */ }
+      else if (r.injected) toast(currentBackend() === "codex" ? t("已插话，Codex 已接收") : t("已插话：当前这一步做完，Claude 就会看到"));
       else if (!r.started) toast(mode === "inject" ? t("这一轮正在收尾，插不进去 —— 已排到最前，马上发出")
         : srv.run && !srv.run.idle ? t("已排队，这一轮结束后发出") : srv.run?.sealed ? t("已排队：后台任务还在跑，这一轮收不进新消息了。点「立即发送」会停掉后台任务再发") : atCap() ? t("同时在跑的会话已到上限，已排队，有空位就发出") : t("已排队：这个会话的上一轮还没完全结束，结束后发出"));
+      return true;
     } catch (e) {
       const dk1 = draftOwner(ep0, key0);
       // 回执丢了不代表没发出去：网关收下时发 run_start（带 cid），状态快照的 runs / queue 里也有 cid。
@@ -152,7 +283,7 @@
           view.runIds.add(acceptedId); view.cidRuns.set(cid, acceptedId); view.lastRunId = acceptedId; view.pendingMerge = null;
           toast(t("网关已经收下这条了（只是回执没回来），不用重发"));
         }
-        return;
+        return true;
       }
       // 服务端明确回了错误（带 status）才叫没发出去；已经发出 POST 但没有明确回执（断网 / 超时）是结果未知，
       // 不能替用户下结论。没发出去 / 结果未知两种情况下这枚 cid 都还可能再出现，先留着认（BUG-R04）
@@ -183,6 +314,7 @@
         });
       } else toast(failTitle, true);
       if (e.status === 503 && gen === view.gen) openDrawer("settings");
+      return false;
     } finally { if (done) done(); }
   }
   let lastSendAt = 0;
@@ -203,6 +335,7 @@
   // ── 补全浮层（/ 命令 与 @ 文件）───────────────────────────────────
   function hidePopup() {
     dropReq("filepal");
+    codexCommandSeq++;codexSkillSeq++;
     MO.hide(popupEl, "mo-out-fade", 120);
     state.popup.mode = null;
     state.popup.items = [];
@@ -275,16 +408,48 @@
     if (selEl) selEl.scrollIntoView({ block: "nearest" });
   }
 
-  function openCmdPalette(filter) {
-    dropReq("filepal");   // 在途的 @ 文件请求作废：整段换成 /xx 时它迟到会把命令面板盖成文件面板（审查 #52 A-CHAT-003）
-    const caps = state.caps;
-    // 常用指令（自己存的 commands/*.md）排在最前；说明是用户自己写的，不过翻译。没在筛选时顶上放一个「管理常用指令…」
-    const all = (caps?.slashCommands || []).filter((c) => !filter || c.name.includes(filter));
-    const cmds = all.filter((c) => c.custom).concat(all.filter((c) => !c.custom));
-    const items = cmds.map((c) => ({ label: "/" + c.name, desc: c.custom ? [c.desc, c.hint].filter(Boolean).join(" · ") : c.desc ? t(c.desc) : "", cat: c.cat && t(c.cat), raw: c.name }));
-    if (!filter) items.unshift({ label: t("管理常用指令…"), desc: t("把常发的长提示存成 /指令"), cat: t("常用指令"), raw: "", manage: true });
-    showPopup("cmd", items,
-      t("斜杠命令") + (filter ? t(" · 匹配 “{q}”", { q: filter }) : ""));
+  async function openCmdPalette(filter) {
+    dropReq("filepal");
+    const seq=++codexCommandSeq,backend=currentBackend();
+    if(sessionBackendPending())return hidePopup();
+    let commands=state.caps?.slashCommands||[];
+    if(backend==="codex"){
+      try{
+        if(!codexCommandList){
+          codexCommandLoading ||= api("/api/codex/commands").then(r=>{codexCommandList=r.slashCommands||[];}).finally(()=>{codexCommandLoading=null;});
+          await codexCommandLoading;
+        }
+        commands=codexCommandList;
+      }catch{return hidePopup();}
+    }
+    if(seq!==codexCommandSeq||backend!==currentBackend())return;
+    const all=commands.filter(c=>!filter||c.name.includes(filter));
+    const cmds=all.filter(c=>c.custom).concat(all.filter(c=>!c.custom));
+    const items=cmds.map(c=>({label:"/"+c.name,desc:c.custom?[c.desc,c.hint].filter(Boolean).join(" · "):c.desc?t(c.desc):"",cat:c.cat&&t(c.cat),raw:c.name}));
+    if(backend!=="codex"&&!filter)items.unshift({label:t("管理常用指令…"),desc:t("把常发的长提示存成 /指令"),cat:t("常用指令"),raw:"",manage:true});
+    showPopup("cmd",items,
+      t("斜杠命令")+(filter?t(" · 匹配 “{q}”",{q:filter}):""));
+  }
+
+  async function openSkillPalette(filter) {
+    const seq=++codexSkillSeq,scope=skillScope(),text=inputEl.value,caret=inputEl.selectionStart;
+    codexCommandSeq++;
+    if(currentBackend()!=="codex"||sessionBackendPending())return hidePopup();
+    const params=new URLSearchParams({refresh:"1"});
+    if(view.sessionId)params.set("sid",view.sessionId);else if(view.projectId)params.set("project",view.projectId);
+    try{
+      if(!codexSkillCatalog||codexSkillCatalog.scope!==scope||Date.now()-codexSkillCatalog.at>15000){
+        const request={scope,at:Date.now(),promise:api("/api/codex/skills?"+params)};codexSkillCatalog=request;
+        request.promise.catch(()=>{if(codexSkillCatalog===request)codexSkillCatalog=null;});
+      }
+      const result=await codexSkillCatalog.promise;
+      if(seq!==codexSkillSeq||scope!==skillScope()||text!==inputEl.value||caret!==inputEl.selectionStart)return;
+      const items=(result.skills||[]).filter(s=>s.enabled&&(!filter||s.name.includes(filter))).map(s=>({
+        label:"$"+s.name,raw:s.name,path:s.path,cat:t(s.scope),
+        desc:[s.shortDescription,s.path].filter(Boolean).join(" · "),scope
+      }));
+      showPopup("skill",items,t("选择 Codex 技能")+(result.truncated?" · "+t("清单已截断"):""));
+    }catch(e){if(seq===codexSkillSeq&&scope===skillScope()){hidePopup();toast(e.message||t("技能清单暂不可用，请稍后重试。"),true);}}
   }
 
   async function openFilePalette(filter) {
@@ -338,6 +503,17 @@
       replaceToken(CMD_TOKEN, "/" + it.raw + " ");
       hidePopup(); autoGrow(); inputEl.focus();
       return;
+    }
+    if(state.popup.mode==="skill"){
+      if(it.scope!==skillScope()||currentBackend()!=="codex")return hidePopup();
+      const caret=inputEl.selectionStart,v=inputEl.value,before=v.slice(0,caret),match=before.match(/(?:^|\s)\$([A-Za-z0-9_-]*)$/);
+      if(!match)return hidePopup();
+      const start=caret-match[1].length-1,token="$"+it.raw+" ";
+      inputEl.value=v.slice(0,start)+token+v.slice(caret);
+      inputEl.setSelectionRange(start+token.length,start+token.length);
+      if(codexSkillScope!==skillScope())codexSkillChoices=[];
+      codexSkillScope=skillScope();codexSkillChoices=codexSkillChoices.filter(s=>s.name!==it.raw);codexSkillChoices.push({name:it.raw,path:it.path});
+      hidePopup();autoGrow();syncInterject();inputEl.focus();return;
     }
     if (state.popup.mode === "file") {
       const base = state.fileDir || "";
@@ -416,6 +592,9 @@
     const caret = inputEl.selectionStart;
     const before = v.slice(0, caret);
 
+    const skillM=before.match(/(?:^|\s)\$([A-Za-z0-9_-]*)$/);
+    if(skillM&&currentBackend()==="codex"){openSkillPalette(skillM[1]);return;}
+    codexSkillSeq++;
     const cmdM = before.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/);
     if (cmdM) { openCmdPalette(cmdM[1]); return; }
     const atM = before.match(/@([^\s@]*)$/);

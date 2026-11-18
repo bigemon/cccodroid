@@ -6,9 +6,12 @@
       const lim = state.sessLimit || 150;   // 点过「再显示」就一直按加大后的数拉，刷新不缩回去
       const r = await api(lim > 150 ? "/api/sessions?limit=" + lim : "/api/sessions");
       if (!ok()) return true;
+      const backend = currentBackend(), pending = sessionBackendPending();
       state.sessions = r.sessions || [];
       state.sessTotal = r.total || state.sessions.length;
       state.sessErr = "";
+      paintBackend();
+      if (pending || backend !== currentBackend()) refreshSessModel();
       if (sess.q.trim()) resessSearch(); else renderSessions();
       lineageDirty();
       return true;
@@ -21,7 +24,12 @@
 
   // 会话页三种视图：普通列表 / 多选（导出、批量删除）/ 回收站
   // q：搜索词；hits：网关返回的内容命中（null = 还没回来）；fold：各分组折叠状态（pin / today / week / month / m:年-月）
-  const sess = { mode: "list", sel: new Set(), trash: [], keepDays: 30, q: "", hits: null, fold: loadSessFold(), flt: "all" };
+  const sess = { mode: "list", sel: new Set(), trash: [], keepDays: 30, q: "", hits: null, partial: false, fold: loadSessFold(), flt: "all" };
+  const codexRecordBackupNote=()=>t("Codex 部分保存的是 App 对话记录；完整续聊需要原始 Codex 会话数据。");
+  function sessionExportPrompt(ids){
+    const hasCodex=ids.some(id=>((state.sessions||[]).find(s=>s.id===id)||(sess.hits||[]).find(s=>s.id===id))?.backend==="codex");
+    return t("会话记录可能含有你贴过的密钥、令牌或文件内容。导出的压缩包请只发给你信任的地方。继续？")+(hasCodex?"\n\n"+codexRecordBackupNote():"");
+  }
   function loadSessFold() {
     let f = {};
     try { const v = JSON.parse(localStorage.getItem("cc.sessFold") || "{}"); if (v && typeof v === "object" && !Array.isArray(v)) f = v; } catch {}
@@ -128,6 +136,7 @@
           <div class="it-meta">
             ${s.no ? `<span class="no">${esc(s.no)}</span>` : ""}<span title="${esc(t("更新 {time}", { time: new Date(s.mtime).toLocaleString() }) + (s.created ? " · " + t("创建 {time}", { time: new Date(s.created).toLocaleString() }) : ""))}">${s.no ? fmtRange(s.created, s.mtime) : fmtStamp(s.mtime)}</span>
             <button class="ss-size" data-a="size">${fmtSize(s.sizeKb * 1024)}</button>
+            ${s.backend === "codex" ? `<span class="badge codex">Codex</span>` : ""}
             ${st}
             ${pjOfCwd(s.cwd) ? pjMark(pjOfCwd(s.cwd)) : ""}
           </div>
@@ -140,7 +149,7 @@
       // 命中的会话不在本地这 150 条里时，拿命中结果自带的字段去筛，别绕过当前的置顶 / 项目筛选（审查 B-05）
       const list = (sess.hits || state.sessions.filter((s) => s.title.toLowerCase().includes(q.toLowerCase()))).filter((h) => keep(state.sessions.find((x) => x.id === h.id) || h));
       sess.visible = list.map((x) => x.id); pruneSel(); renderSessBar();
-      box.innerHTML = (sess.hitsErr
+      box.innerHTML = (sess.hits && sess.partial ? `<div class="tiny">${t("部分会话记录未完整纳入搜索，结果可能不完整。")}</div>` : "") + (sess.hitsErr
           ? `<div class="tiny err">${esc(t("搜索失败：{msg}", { msg: sess.hitsErr }))} <button class="btn ghost sm" data-sess-search-retry>${esc(t("重试"))}</button></div>`
           : sess.hits ? "" : `<div class="tiny">${t("正在搜索对话内容…")}</div>`)
         + (list.length ? list.map(item).join("") : sess.hits ? `<div class="tiny">${t("没有找到包含「{q}」的会话。", { q: esc(q) })}</div>` : "")
@@ -205,7 +214,7 @@
   // 搜索：输完停 300ms 再问网关；过时的回复丢掉
   let sessQT = 0, sessQN = 0;
   $("sess-q").addEventListener("input", (e) => {
-    sess.q = e.target.value; sess.hits = null; sess.hitsErr = ""; sess.hitsTotal = 0;
+    sess.q = e.target.value; sess.hits = null; sess.hitsErr = ""; sess.hitsTotal = 0; sess.partial = false;
     clearTimeout(sessQT);
     renderSessions();
     const q = sess.q.trim();
@@ -214,7 +223,7 @@
     sessQT = setTimeout(async () => {
       try {
         const r = await api("/api/sessions/search?q=" + encodeURIComponent(q));
-        if (n === sessQN && sess.q.trim() === q) { sess.hits = r.results || []; sess.hitsTotal = r.total || sess.hits.length; sess.hitsErr = ""; renderSessions(); }
+        if (n === sessQN && sess.q.trim() === q) { sess.hits = r.results || []; sess.partial = !!r.partial; sess.hitsTotal = r.total || sess.hits.length; sess.hitsErr = ""; renderSessions(); }
       } catch (err) {
         // 失败和「没有匹配」分开：以前失败也画成「没有找到」，还沿用上一次的命中数（0.6.9 审计 196-会话.2）
         if (n === sessQN) { sess.hits = null; sess.hitsErr = err.message || String(err); renderSessions(); }
@@ -240,6 +249,7 @@
     } else if (sess.mode === "exported") {
       const r = sess.exported;
       bar.innerHTML = `<span class="tiny">${t("已导出 {n} 个会话", { n: r.count })}</span>
+        ${r.codexCount?`<div class="tiny record-backup-note">${esc(codexRecordBackupNote())}</div>`:""}
         ${canSaveAs() ? `<button class="btn sm" data-b="save">${t("保存到…")}</button>` : ""}
         ${canShare() ? `<button class="btn sm" data-b="share">${t("分享…")}</button>` : ""}
         <button class="btn ghost sm" data-b="done">${t("完成")}</button>
@@ -270,14 +280,15 @@
     if (!sess.trash.length) { box.innerHTML = err || '<div class="tiny">' + t("回收站是空的。") + '</div>'; return; }
     box.innerHTML = err + sess.trash.map((m) => `
       <div class="item" data-id="${esc(m.id)}">
-        <div class="it-title">${esc(m.title || m.id)}</div>
+        <div class="it-title">${m.backend==="codex"?'<span class="badge codex">Codex</span> ':""}${esc(m.title || m.id)}</div>
         <div class="it-meta">
           <span>${t("删除于 {time}", { time: relTime(m.deletedAt) })}</span>
           <span>${Math.round((m.size || 0) / 1024)} KB</span>
         </div>
+        ${m.backend==="codex"?`<div class="tiny codex-trash-note">${t("仅管理本机记录；Codex 原生会话不受影响，续聊仍需原始会话数据。")}</div>`:""}
         <div class="it-acts">
           <button data-a="restore">${t("恢复")}</button>
-          <button data-a="purge">${t("彻底删除")}</button>
+          <button data-a="purge">${t(m.backend==="codex"?"彻底删除本机记录":"彻底删除")}</button>
         </div>
       </div>`).join("");
   }
@@ -329,6 +340,7 @@
       toast(skip
         ? t("已导入 {n} 个会话，跳过 {m} 个已存在的", { n, m: skip })
         : t("已导入 {n} 个会话", { n }));
+      if (r.codexRecords) toast(codexRecordBackupNote());
       // 正文进来了、自定义标题没写进去（FIND-014）：不提示的话重启后才发现标题回退了
       if (r.titleWarning) toast(t("会话已导入，但自定义标题没保存上（存储满了或没有权限），重启后会显示原来的标题"), true);
       // 章节档案也没写进去（BUG-P03）：复用建档接口的同一句提示，不再新增文案；重导同一个包可以补上
@@ -355,7 +367,7 @@
       return renderSessions();
     }
     if (act === "export") {
-      if (!confirm(t("会话记录可能含有你贴过的密钥、令牌或文件内容。导出的压缩包请只发给你信任的地方。继续？"))) return;
+      if (!confirm(sessionExportPrompt([...sess.sel]))) return;
       let r;
       try { r = await post("/api/sessions/export", { ids: selShown() }); }
       catch (err) { return toast(t("导出失败：{msg}", { msg: err.message }), true); }
@@ -387,8 +399,9 @@
       return;
     }
     if (act === "empty") {
-      if (!confirm(t("彻底删除回收站里全部 {n} 个会话？不可恢复。", { n: sess.trash.length }))) return;
-      await post("/api/trash/purge", { all: true }).catch((err) => toast(err.message, true));
+      const note=sess.trash.some(m=>m.backend==="codex")?"\n"+t("其中 Codex 只清理本机记录，原生会话仍会保留。"):"";
+      if (!confirm(t("彻底删除回收站里全部 {n} 个会话？不可恢复。", { n: sess.trash.length })+note)) return;
+      try{const r=await post("/api/trash/purge", { all: true });if(r.failed?.length)toast(t("{n} 个记录未能清理，请重试。",{n:r.failed.length}),true);}catch(err){toast(err.message,true);}
       loadTrash();
     }
   });
@@ -432,8 +445,9 @@
       return loadTrash();
     }
     if (a === "purge") {
-      if (!confirm(t("彻底删除这个会话？不可恢复。"))) return;
-      await post("/api/trash/purge", { ids: [id] }).catch((err) => toast(err.message, true));
+      const codex=sess.trash.find(m=>m.id===id)?.backend==="codex";
+      if (!confirm(t(codex?"彻底删除本机会话记录？不可恢复。Codex 原生会话仍会保留。":"彻底删除这个会话？不可恢复。"))) return;
+      try{const r=await post("/api/trash/purge", { ids: [id] });if(r.failed?.length)toast(t("{n} 个记录未能清理，请重试。",{n:r.failed.length}),true);}catch(err){toast(err.message,true);}
       return loadTrash();
     }
     if (a === "open") {

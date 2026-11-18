@@ -84,6 +84,7 @@ public class GatewayService extends Service {
     }
 
     private static boolean start(Context c, Intent i) {
+        if(BackupApplication.recoveryError!=null)return false;
         // targetSdk ≥ 31：后台（非精确闹钟、没在电池优化白名单）拉前台服务会抛 ForegroundServiceStartNotAllowedException，别让它崩掉调用方
         try { c.startForegroundService(i); return true; } catch (RuntimeException e) { Log.w(TAG, "拉起网关服务被系统拒绝", e); return false; }
     }
@@ -92,6 +93,7 @@ public class GatewayService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        if(BackupApplication.recoveryError!=null){stopSelf();return;}
         Tr.init(this);
         env = new Env(this);
         NotificationManager nm = getSystemService(NotificationManager.class);
@@ -133,6 +135,7 @@ public class GatewayService extends Service {
             while (!stopping) {
                 long t0 = android.os.SystemClock.uptimeMillis();
                 sleep(2000);
+                if(FullBackupController.active()||FullBackupController.maintenance()){idle=0;continue;}
                 // 界面开着就是用户在用它：把「跑完就停」作罢。闹钟 / 粘性重建拉起时界面恰好开着、之后按 Home
                 // 退到后台（没划掉）也不会被当成空闲退出（0.6.9 审计 13-01）
                 if (MainActivity.appForeground()) closeWhenIdle = false;
@@ -162,11 +165,18 @@ public class GatewayService extends Service {
     }
 
     @Override public int onStartCommand(Intent i, int flags, int id) {
+        if(BackupApplication.recoveryError!=null){stopSelf();return START_NOT_STICKY;}
         // 又收到一次启动请求（用户回到界面、闹钟、粘性重建）：划掉后的空闲查询查到一半也要作废重判（BUG-A02）
         synchronized (life) { startSeq++; }
         // 只认自己通知里那个「停止」：服务是导出的，有跨用户权限的进程（shell、别的拿了 Shizuku 的应用）也能发；对不上就当普通启动（审查 v0.5.9 B5）
-        String ik = i == null ? null : i.getStringExtra(MainActivity.IK);
-        boolean mine = ik != null && java.security.MessageDigest.isEqual(ik.getBytes(), MainActivity.intentKey(this).getBytes());
+        boolean mine = MainActivity.internalMatches(i);
+        if (!mine && i != null && (ACTION_STOP.equals(i.getAction()) || ACTION_BOOT.equals(i.getAction()))) {
+            MainActivity.checkInternal(this, i, ok -> {
+                if (!ok || self != this || stopping) return;
+                if (ACTION_STOP.equals(i.getAction())) shutdown();
+                else ShizukuSetup.get(this).reactivateAsync(true);
+            });
+        }
         if (i != null && ACTION_STOP.equals(i.getAction()) && mine) { shutdown(); return START_NOT_STICKY; }
         // 系统把被杀的服务带空 intent 重建：没任务在跑就不起了。用户在最近任务里划掉、ROM 只杀进程不强停时，
         // 粘性重建出来的服务紧接着又被冻住，通知卡在「正在启动…」（红魔，11-03 用户反馈）。
@@ -189,6 +199,7 @@ public class GatewayService extends Service {
 
     /** 在最近任务里划掉主界面 = 关掉：没任务在跑就停服务；有任务在跑照旧保活，跑完再停（守护循环里看） */
     @Override public void onTaskRemoved(Intent root) {
+        if(FullBackupController.active())return;
         android.content.ComponentName cn = root == null ? null : root.getComponent();
         if (cn != null && MainActivity.class.getName().equals(cn.getClassName())) {
             if (busy()) { Log.i(TAG, "界面被划掉，任务跑完再停"); closeWhenIdle = true; }
@@ -439,6 +450,41 @@ public class GatewayService extends Service {
         catch (java.io.IOException e) { Log.w(TAG, "启动随机数没交过去：" + e.getMessage()); }
     }
 
+    /** Quiesce registered command/app-server descendants after the gateway has stopped. */
+    static void stopOwnedForBackup(Context c)throws Exception{
+        Env e=new Env(c);int mine=android.os.Process.myPid(),uid=android.os.Process.myUid();
+        java.util.List<Integer> pids=new java.util.ArrayList<>();
+        File[] entries=new File("/proc").listFiles();
+        for(File f:entries==null?new File[0]:entries){
+            if(!f.getName().matches("\\d+"))continue;
+            int pid=Integer.parseInt(f.getName());if(pid!=mine&&backupOwned(pid,uid,e))pids.add(pid);
+        }
+        for(int pid:pids)if(backupOwned(pid,uid,e))android.os.Process.sendSignal(pid,15);
+        long until=android.os.SystemClock.elapsedRealtime()+2000;
+        while(android.os.SystemClock.elapsedRealtime()<until){
+            boolean alive=false;for(int pid:pids)if(backupOwned(pid,uid,e))alive=true;
+            if(!alive)return;sleep(50);
+        }
+        for(int pid:pids)if(backupOwned(pid,uid,e))android.os.Process.sendSignal(pid,9);
+        until=android.os.SystemClock.elapsedRealtime()+1500;
+        while(android.os.SystemClock.elapsedRealtime()<until){
+            boolean alive=false;for(int pid:pids)if(backupOwned(pid,uid,e))alive=true;
+            if(!alive)return;sleep(50);
+        }
+        throw new java.io.IOException("仍有环境进程没有退出，未修改任何数据");
+    }
+    private static boolean backupOwned(int pid,int uid,Env e){
+        try{
+            String proc="/proc/"+pid;
+            if(android.system.Os.stat(proc).st_uid!=uid)return false;
+            String stat=new String(java.nio.file.Files.readAllBytes(new File(proc,"stat").toPath()),java.nio.charset.StandardCharsets.UTF_8);
+            if(stat.substring(stat.lastIndexOf(')')+2).startsWith("Z "))return false;
+            String vars="\0"+new String(java.nio.file.Files.readAllBytes(new File(proc,"environ").toPath()),java.nio.charset.StandardCharsets.UTF_8);
+            return vars.contains("\0CCAPP_TOKEN_FILE="+new File(e.home,".gateway-token").getPath()+"\0")
+                &&vars.contains("\0CCAPP_HOME="+e.home.getPath()+"\0");
+        }catch(Exception ignored){return false;}
+    }
+
     private void killGateway() {
         Process p;
         synchronized (life) { p = proc; }
@@ -603,8 +649,20 @@ public class GatewayService extends Service {
         return SQUAT_HIJACKED;
     }
 
+    /** Replace the startup notification's temporary token once the durable key is ready.
+     * The main looper schedules this worker after Service.onCreate; notification IPC and
+     * its serialization lock stay off the UI thread too. */
+    static void refreshIntentNotification() {
+        GatewayService s = self;
+        if (s == null || s.stopping) return;
+        synchronized (s) {
+            try { s.getSystemService(NotificationManager.class).notify(1,
+                s.note(s.last == null ? Tr.t("正在启动…") : s.last)); }
+            catch (RuntimeException e) { Log.w(TAG, "刷新内部通知失败", e); }
+        }
+    }
     private String last;
-    private void update(String text) {
+    private synchronized void update(String text) {
         if (text.equals(last)) return;
         last = text;
         getSystemService(NotificationManager.class).notify(1, note(text));
@@ -616,7 +674,7 @@ public class GatewayService extends Service {
             PendingIntent.FLAG_IMMUTABLE);
         PendingIntent stop = PendingIntent.getService(this, 1,
             new Intent(this, GatewayService.class).setAction(ACTION_STOP).putExtra(MainActivity.IK, MainActivity.intentKey(this)),
-            PendingIntent.FLAG_IMMUTABLE);
+            PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         return new Notification.Builder(this, CH)
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
             .setContentTitle("cccodroid")

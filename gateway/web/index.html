@@ -80,6 +80,7 @@
   </div>
   <div id="hint-row">
     <span id="proj-chip" class="chip proj hidden" role="button" tabindex="0"></span>
+    <span id="backend-chip" class="chip" role="button" tabindex="0"></span>
     <span id="model-chip">—</span>
     <span id="perm-chip" role="button" tabindex="0" title="切换权限模式" data-i18n-attr="title"></span>
     <span id="stat-chip"></span>
@@ -175,8 +176,11 @@
            数据：额度来自 /api/login/status；token 来自网关的使用统计（home/ccapp-usage.json，按小时记）；耗电来自 /api/energy -->
       <!-- 额度与消费：当前接口（账户额度 / 厂商余额与消费）+ 其他配过的接口 + 快用完时的提醒。顶栏细条的速览卡「查看用量」跳到这里 -->
       <div class="chart-card" id="us-acct">
-        <div class="cc-h"><b data-i18n>额度与消费</b><span class="muted" id="us-acct-name"></span><span class="grow"></span><button class="btn sm ghost" id="us-acct-ref" data-i18n>刷新</button></div>
-        <div id="us-acct-cur"></div>
+        <div class="cc-h"><b data-i18n>额度与消费</b><span class="grow"></span><button class="btn sm ghost" id="us-acct-ref" data-i18n>刷新</button></div>
+        <details class="qb-row hidden" id="us-acct-cur" open>
+          <summary><span class="qb-name" id="us-acct-name"></span><span class="grow"></span><span class="qb-brief tiny" id="us-acct-brief"></span></summary>
+          <div class="qb-detail" id="us-acct-detail"></div>
+        </details>
         <div id="us-acct-others"></div>
         <div class="qb-warn">
           <label><input type="checkbox" class="sw" id="qb-warn-quota"><span data-i18n>额度用到 80% 和 95% 时提醒</span></label>
@@ -254,6 +258,11 @@
 
     <!-- 能力：这一轮 Claude 能用的全部东西（取自 init 报告）。顶上计数格点了跳到那一节；搜索框同时筛所有节 -->
     <section id="tab-caps" class="tab-pane hidden">
+      <div class="seg core-tabs" role="tablist" aria-label="核心能力" data-i18n-attr="aria-label">
+        <button id="caps-tab-claude" type="button" class="on" role="tab" data-cap-core="claude" aria-selected="true" aria-controls="caps-panel-claude" tabindex="0">Claude Code</button>
+        <button id="caps-tab-codex" type="button" role="tab" data-cap-core="codex" aria-selected="false" aria-controls="caps-panel-codex" tabindex="-1">Codex</button>
+      </div>
+      <div id="caps-panel-claude" role="tabpanel" aria-labelledby="caps-tab-claude">
       <!-- 能力（照设计稿）：一句说明 → 计数格 → 搜索 → 各节（节头在外，列表是一张底板） -->
       <div class="muted caps-lead" data-i18n>这一轮 Claude 能用的全部东西（取自启动时的 init 报告）。点斜杠命令插进输入框；工具的「允许 / 询问 / 拒绝」跟着权限模式和规则走。</div>
       <div class="tiles" id="cap-tiles"></div>
@@ -270,6 +279,52 @@
         <div id="caps-mcp" class="panel"></div></div>
       <div class="ext-sec-plain" data-sec="plugin"><div class="sec-h"><span class="icobox"><svg class="ei" viewBox="0 0 24 24"><path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3z"/></svg></span><div class="grow"><h3 data-i18n>插件</h3></div></div>
         <div id="caps-plugins" class="panel"></div></div>
+      </div>
+      <div id="caps-panel-codex" class="hidden" role="tabpanel" aria-labelledby="caps-tab-codex">
+        <p class="muted caps-lead" data-i18n>按全局与当前项目查看 Codex 能力；这里的选项不会切换对话核心。</p>
+        <div class="seg core-tabs" role="tablist" aria-label="Codex 能力范围" data-i18n-attr="aria-label">
+          <button id="codex-cap-tab-global" class="on" type="button" role="tab" data-codex-cap-scope="global" aria-controls="codex-cap-panel-global" aria-selected="true" data-i18n>全局能力</button>
+          <button id="codex-cap-tab-project" type="button" role="tab" data-codex-cap-scope="project" aria-controls="codex-cap-panel-project" aria-selected="false" aria-disabled="true" tabindex="-1" disabled data-i18n>当前项目</button>
+        </div>
+        <p id="codex-cap-project-context" class="tiny codex-skill-path" aria-live="polite"></p>
+        <div id="codex-cap-panel-global" role="tabpanel" aria-labelledby="codex-cap-tab-global">
+        <div class="field" id="codex-instruction-reuse">
+          <div class="srow"><div class="sl"><label for="codex-instruction-reuse-enabled"><b data-i18n>自动复用 Claude 全局指令</b></label><p data-i18n>共用全局 CLAUDE.md，新会话生效；已有 Codex 专用指令优先保留。</p></div><div class="sc"><input type="checkbox" class="sw" id="codex-instruction-reuse-enabled" disabled></div></div>
+          <p class="tiny" data-i18n>只共享此文件正文，不自动转换 rules、输出风格或 @ 导入；关闭不会清除已有会话上下文。</p>
+          <p id="codex-instruction-reuse-state" class="tiny codex-skill-path" aria-live="polite"></p>
+          <button id="codex-instruction-reuse-refresh" type="button" class="btn sm ghost" data-i18n>重新检查</button>
+        </div>
+        <div class="field" id="codex-skill-reuse">
+          <div class="srow"><div class="sl"><label for="codex-skill-reuse-enabled"><b data-i18n>自动复用 Claude 技能</b></label><p data-i18n>全局共享 Claude 用户技能，新增和更新自动可见；技能仍受 Codex 权限约束。</p></div><div class="sc"><input type="checkbox" class="sw" id="codex-skill-reuse-enabled" disabled></div></div>
+          <p class="tiny" data-i18n>通过软链接共享一份技能文件；关闭只移除应用创建的链接，不会主动中断任务。MCP、插件和 Hooks 需分别适配。</p>
+          <p id="codex-skill-reuse-state" class="tiny codex-skill-path" aria-live="polite"></p>
+          <button id="codex-skill-reuse-refresh" type="button" class="btn sm ghost" data-i18n>重新检查</button>
+        </div>
+        <div class="field" id="codex-project-automation">
+          <div class="srow"><div class="sl"><label for="codex-project-auto-enabled"><b data-i18n>自动复用项目 Claude 技能</b></label><p data-i18n>默认按需共享当前项目的 .claude/skills；项目单独设置优先。</p></div><div class="sc"><input type="checkbox" class="sw" id="codex-project-auto-enabled" disabled></div></div>
+          <p class="tiny" data-i18n>只检查正在使用的项目；不遍历其他项目。关闭后仍可在当前项目中单独开启。</p>
+          <p id="codex-project-auto-state" class="tiny" aria-live="polite"></p>
+          <button id="codex-project-auto-refresh" type="button" class="btn sm ghost" data-i18n>重新检查</button>
+        </div>
+        <details class="field ext-sec" id="codex-extension-check">
+          <summary data-i18n>全局指令、技能与 MCP</summary>
+          <p class="tiny" data-i18n>查看用户和系统来源的能力；项目目录生效的结果见当前项目。</p>
+          <button class="btn sm ghost" id="codex-extension-refresh" type="button" data-i18n>重新检查</button>
+          <div id="codex-extension-body" class="tiny"></div>
+        </details>
+        </div>
+        <div id="codex-cap-panel-project" class="hidden" role="tabpanel" aria-labelledby="codex-cap-tab-project">
+          <p class="muted caps-lead" data-i18n>以下为当前项目目录生效的能力，包含继承的全局能力；各项标明来源和设置保存范围。</p>
+          <button id="codex-project-extension-refresh" class="btn sm ghost" type="button" data-i18n>重新检查</button>
+          <div id="codex-project-extension-body" class="tiny"></div>
+        </div>
+        <details class="field ext-sec" id="codex-diagnostics">
+          <summary data-i18n>有效配置与能力</summary>
+          <p class="tiny" data-i18n>查看当前 Codex 会话的实际设置与接入能力；这里只读，不修改配置。</p>
+          <button class="btn sm ghost" id="codex-diagnostics-refresh" type="button" data-i18n>刷新诊断</button>
+          <div id="codex-diagnostics-body" class="tiny"></div>
+        </details>
+      </div>
     </section>
 
     <!-- 帮助：第一次点开才去取 help/<语言>.md 渲染（懒加载），目录点了跳到对应小节 -->
@@ -410,12 +465,19 @@
           <button data-cat="run"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01"/></svg><span data-i18n>后台与并行</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
           <button data-cat="storage"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span data-i18n>存储</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
           <button data-cat="device"><svg viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M11 18h2"/></svg><span data-i18n>设备与权限</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
+          <button data-cat="remote"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg><span data-i18n>远程访问</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
           <button data-cat="update"><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg><span data-i18n>更新</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
           <button data-cat="usage"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span data-i18n>用量与耗电</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
           <button data-cat="trouble"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.5-.5-.5-2.5z"/></svg><span data-i18n>排障</span><svg viewBox="0 0 24 24" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>
         </nav>
         <div class="set-main">
   
+        <div class="set-cat hidden" data-cat="remote">
+          <h3 class="set-h" data-i18n>远程访问</h3>
+          <div class="sblock">
+            <iframe id="remote-settings-frame" title="远程访问设置" class="remote-settings-frame"></iframe>
+          </div>
+        </div>
         <!-- ── 通用 ── -->
         <div class="set-cat hidden" data-cat="general">
           <h3 class="set-h" data-i18n>通用</h3>
@@ -537,6 +599,12 @@
         <!-- ── 接口与型号 ── -->
         <div class="set-cat hidden" data-cat="provider">
           <h3 class="set-h" data-i18n>接口与型号</h3>
+          <div class="seg core-tabs" role="tablist" aria-label="Agent">
+            <button type="button" id="core-tab-claude" role="tab" aria-selected="true" aria-controls="core-panel-claude" tabindex="0" data-settings-core="claude" class="on">Claude Code</button>
+            <button type="button" id="core-tab-codex" role="tab" aria-selected="false" aria-controls="core-panel-codex" tabindex="-1" data-settings-core="codex">Codex</button>
+          </div>
+          <p class="tiny core-settings-note" data-i18n>此处仅配置各个核心；新会话使用哪个核心，请在输入栏选择。已有会话的核心保持不变。</p>
+          <div id="core-panel-claude" role="tabpanel" aria-labelledby="core-tab-claude" data-core-panel="claude">
           <div class="srow">
             <div class="sl"><b><span data-i18n>接口</span> <span class="pill" id="provider-count"></span></b><p id="provider-info" data-i18n>正在读取…</p></div>
             <div class="sc"><select id="set-provider"></select><button class="btn sm ghost" id="prov-more"></button></div>
@@ -569,6 +637,48 @@
               <input id="ac-num" type="number" inputmode="numeric" min="100000" max="1000000" step="1000" placeholder="留空 = 交给 claude 按窗口决定" data-i18n-attr="placeholder">
             </div>
             <p class="tiny" data-i18n>用量逼近这条线时自动摘要历史。线放低更省、记得更少；放高记得多，但每轮更贵、更慢。</p>
+          </div>
+          </div>
+          <div id="core-panel-codex" role="tabpanel" aria-labelledby="core-tab-codex" data-core-panel="codex" class="hidden">
+          <!-- Codex 后端（P6-B2）：可选的第二个 Agent，不配也不影响 Claude -->
+          <div class="sblock" id="codex-field">
+            <div class="srow head">
+              <div class="sl"><b data-i18n>Codex 后端</b><p id="codex-now">—</p>
+                <p class="clamp" data-i18n>使用 ChatGPT 账户运行 Codex。运行环境和版本在“更新”页管理；高级路径可在下方配置。</p></div>
+            </div>
+            <p id="codex-installed-state" class="prov-state" aria-live="polite" data-i18n>正在读取安装状态…</p>
+            <div class="row-actions"><button type="button" id="codex-update-link" class="btn sm ghost" disabled data-i18n>读取中…</button></div>
+            <!-- ChatGPT 账号（P6-E2）：账号级状态，和上面的模型/上下文分开 -->
+            <div class="srow head" style="margin-top:10px">
+              <div class="sl"><b data-i18n>ChatGPT 账号</b>
+                <p id="codex-account-state" class="prov-state">—</p>
+                <p class="clamp tiny" data-i18n>用官方 App Server 的设备码流程登录；网关不读取、不保存、不转发任何 Token。退出只影响 Codex，Claude 的登录不受影响。</p></div>
+              <div class="sc"><div id="codex-account-acts" class="row-actions"></div></div>
+            </div>
+            <div id="codex-login-flow" class="hidden"></div>
+            <div id="codex-quota" class="hidden"></div>
+            <div class="sblock" id="codex-preferences">
+              <div class="srow head"><div class="sl"><b data-i18n>偏好设置</b><p class="tiny" data-i18n>新建 Codex 会话的默认值；项目和会话选择可以覆盖，已有会话保持原设置。</p></div></div>
+              <div class="srow"><div class="sl"><b data-i18n>默认模型</b></div><div class="sc"><select id="codex-default-model" disabled></select></div></div>
+              <div class="srow"><div class="sl"><b data-i18n>默认思考强度</b></div><div class="sc"><select id="codex-default-effort" disabled></select></div></div>
+              <p id="codex-preferences-state" class="tiny" aria-live="polite"></p>
+              <div class="row-actions"><button id="codex-preferences-save" type="button" class="btn sm" disabled data-i18n>保存偏好</button><button id="codex-preferences-refresh" type="button" class="btn sm ghost" data-i18n>刷新模型列表</button></div>
+            </div>
+            <details class="codex-advanced">
+              <summary data-i18n>高级配置</summary>
+            <div class="srow"><div class="sl"><b data-i18n>可执行文件</b></div>
+              <div class="sc"><input id="set-codex-bin" type="text" spellcheck="false" autocomplete="off" placeholder="留空使用应用安装的 Codex"></div></div>
+            <div class="srow"><div class="sl"><b data-i18n>CODEX_HOME</b></div>
+              <div class="sc"><input id="set-codex-home" type="text" spellcheck="false" autocomplete="off" placeholder="留空使用应用内默认目录"></div></div>
+            <div class="srow"><div class="sl"><b data-i18n>CA 证书</b></div>
+              <div class="sc"><input id="set-codex-cert" type="text" spellcheck="false" autocomplete="off" placeholder="$PREFIX/etc/tls/cert.pem"></div></div>
+            <div class="row-actions">
+              <button class="btn sm" data-act="save" data-i18n>保存</button>
+              <button class="btn sm ghost" data-act="check" data-i18n>检测</button>
+            </div>
+            </details>
+          </div>
+            <p class="tiny" data-i18n>Codex 的模型与思考强度可在对话输入栏的模型面板中选择。</p>
           </div>
         </div>
   
@@ -674,6 +784,12 @@
         <!-- ── 存储（D10）：占了多少、哪些能清。逻辑在 app/10b-storage.js，网关 gw/storage.mjs ── -->
         <div class="set-cat hidden" data-cat="storage">
           <h3 class="set-h" data-i18n>存储</h3>
+          <div class="sblock" id="st-backup">
+            <div class="srow head"><div class="sl"><b data-i18n>完整备份</b><p data-i18n>导出工具包、内部工作区、会话、环境配置与登录文件。备份含敏感凭据且未加密，请安全保管。导出前会预估目标剩余空间，写入期间持续保留安全余量。</p></div></div>
+            <p class="tiny" data-i18n>导入会覆盖当前数据；先校验备份，再经倒计时二次确认。操作期间显示进度，覆盖前可取消。系统授权、APK、WebView 缓存、工具临时文件及共享存储文件不迁移。</p>
+            <div class="row-actions"><button type="button" class="btn sm" id="st-backup-export" data-i18n>完整导出</button><button type="button" class="btn sm ghost danger" id="st-backup-import" data-i18n>导入完整备份</button></div>
+            <p class="tiny" id="st-backup-hint" aria-live="polite"></p>
+          </div>
           <div class="sblock" id="st-top">
             <div class="srow head">
               <div class="sl"><b data-i18n>占用空间</b><p id="st-sum"></p><p class="tiny" id="st-when"></p></div>
@@ -696,6 +812,16 @@
         <!-- ── 设备与权限 ── -->
         <div class="set-cat hidden" data-cat="device">
           <h3 class="set-h" data-i18n>设备与权限</h3>
+          <!-- 敏感设置的保存策略独立于 Shizuku；只在原生层提供此能力时显示。 -->
+          <div class="sblock hidden" id="consent-save">
+            <div class="srow head">
+              <div class="sl"><b data-i18n>保存敏感开关时验证身份</b>
+                <p class="clamp" data-i18n>可选。开启后，保存敏感设置需验证身份；未验证的更改仅本次运行有效。关闭时，经原生确认后直接保存。</p>
+                <p class="clamp" data-i18n>应用与工具共享权限；脚本可能修改普通存档，身份验证不能替代权限隔离。</p>
+                <p class="clamp hidden" id="consent-save-state" role="status" aria-live="polite"></p></div>
+              <div class="sc"><input type="checkbox" class="sw" id="consent-strong" aria-label="保存敏感开关时验证身份" data-i18n-attr="aria-label"></div>
+            </div>
+          </div>
           <!-- Shizuku：调试提权。只有 cccodroid 带这项集成，旧版里整块隐藏 -->
           <div class="sblock hidden" id="priv-field">
             <div class="srow head">
@@ -711,10 +837,16 @@
               <input id="priv-port" inputmode="numeric" maxlength="5" placeholder="端口（配对框里）" data-i18n-attr="placeholder">
               <button class="btn sm" data-act="pair" data-i18n>配对</button>
             </div>
+            <div class="hidden" id="priv-split">
+              <div class="row-actions"><button type="button" class="btn sm ghost" id="priv-split-settings" data-i18n>分屏打开设置</button></div>
+              <p class="hint" id="priv-split-state" role="status" aria-live="polite"></p>
+            </div>
             <div class="row-actions" id="priv-actions"></div>
             <div class="priv-audit hidden" id="priv-audit"></div>
             <div class="srow sub hidden" id="priv-auto-row">
-              <div class="sl"><p data-i18n>重启手机后自动重新激活（需连着 Wi‑Fi；会在开机时启动 cccodroid 后台服务）</p></div>
+              <div class="sl"><b data-i18n>重启手机后自动重新激活</b>
+                <p class="clamp" data-i18n>需连接 Wi-Fi；会在开机时启动 cccodroid 后台服务。</p>
+                <p class="hidden" id="priv-auto-state" role="status"></p></div>
               <div class="sc"><input type="checkbox" class="sw" id="priv-auto"></div>
             </div>
             <div class="srow sub" id="priv-ka-row">
@@ -723,14 +855,21 @@
             </div>
             <div class="prov-state" id="priv-ka-result"></div>
             <div class="srow sub" id="priv-na-row">
-              <div class="sl"><p data-i18n>特权命令不再逐条确认（风险自负）：打开后特权命令直接执行，在后台也不会卡在等确认；涉及 cccodroid 自身和 Shizuku / Sui 的会尽量拦下来再问，但拦不住所有写法。只想放行一个会话，在确认框里勾「这个会话后面的都允许」即可</p></div>
+              <div class="sl"><p data-i18n>特权命令不再逐条确认（风险自负）：打开后特权命令直接执行，在后台也不会卡在等确认；默认保留涉及 cccodroid 自身和 Shizuku / Sui 的额外确认，可在下方单独关闭。只想放行一个会话，在确认框里勾「这个会话后面的都允许」即可</p></div>
               <div class="sc"><select id="priv-na-hours" aria-label="时长" data-i18n-attr="aria-label">
                 <option value="1" data-i18n>1 小时</option><option value="4" data-i18n>4 小时</option><option value="24" selected data-i18n>1 天</option>
-                <option value="72" data-i18n>3 天</option><option value="168" data-i18n>7 天</option></select>
+                <option value="72" data-i18n>3 天</option><option value="168" data-i18n>7 天</option>
+                <option value="720">30 天</option><option value="-1">永久（高风险）</option></select>
                 <input type="checkbox" class="sw" id="priv-na"></div>
             </div>
             <div class="prov-state" id="priv-na-result"></div>
+            <div class="srow sub hidden" id="priv-na-self-row">
+              <div class="sl"><p>涉及自身的命令也免确认（高风险）</p>
+                <p class="hint">关闭对 CCCDroid、Shizuku / Sui 以及无法明确分析的命令的额外确认，可能停止或破坏当前运行环境。仅在主免确认开关有效时生效。</p></div>
+              <div class="sc"><input type="checkbox" class="sw" id="priv-na-self" aria-label="涉及自身的命令也免确认"></div>
+            </div>
           </div>
+          <div class="sblock hidden" id="priv-tcp"></div>
           <!-- 通知：应用在后台时，跑完 / 等确认提醒一下。只有 cccodroid 带（GatewayService 发），开发端整块隐藏 -->
           <div class="sblock hidden" id="ntf-field">
             <div class="srow head"><div class="sl"><b data-i18n>通知</b></div></div>
@@ -772,6 +911,12 @@
                 </select>
               </div>
             </div>
+            <div class="srow sub hidden" id="priv-na-screen-row">
+              <div class="sl"><b data-i18n>读屏或点按时不要求确认（高风险）</b>
+                <p class="clamp" data-i18n>仅跳过额外确认；仍需开启设备工具、对应单项和无障碍模式，不会自动授予权限。</p>
+                <p class="clamp" data-i18n>包括输入、截图及来源不明的调用。独立于特权命令免确认；关闭本项、设备工具或无障碍模式会撤销。核心权限模式仍生效。关闭时，首次允许后仅本会话免扰，拒绝后可重试。</p></div>
+              <div class="sc"><input type="checkbox" class="sw" id="priv-na-screen" aria-label="读屏或点按时不要求确认（高风险）" data-i18n-attr="aria-label"></div>
+            </div>
             <div class="srow sub" id="dev-idle-row">
               <div class="sl"><p data-i18n>空闲多久自动关（分钟）</p></div>
               <div class="sc"><input type="number" id="dev-idle" class="narrow" min="1" max="240"></div>
@@ -810,17 +955,22 @@
                 </select>
               </div>
             </div>
+            <div class="srow sub" id="codex-channel-row">
+              <div class="sl"><b data-i18n>Codex 跟哪个通道</b></div>
+              <div class="sc"><select id="upd-codex-channel"><option value="stable" data-i18n>CLI：stable</option><option value="alpha" data-i18n>CLI：alpha（预览版）</option><option value="pinned" data-i18n>CLI：固定版本…</option></select></div>
+            </div>
             <div class="srow sub hidden" id="upd-flavor-row">
               <div class="sl"><b data-i18n>安装包方案</b><p id="upd-flavor-now"></p><p class="clamp" data-i18n>targetSdk 28 是默认的那套，兼容性最好；targetSdk 36 给系统不让装 28 的新机器用。两套功能一样，数据通用，互相覆盖安装不丢东西。自动：跟着现在装的走，系统拒装 28 时自动换成 36。</p></div>
               <div class="sc"><select id="upd-flavor"><option value="auto" data-i18n>自动</option><option value="28">targetSdk 28</option><option value="36">targetSdk 36</option></select></div>
             </div>
             <div class="srow sub">
-              <div class="sl"><b data-i18n>自动更新</b><p class="clamp" data-i18n>自动更新（默认开）：Claude Code 静默更新；新版应用下载好后提醒安装（有 Shizuku 时空闲自动装）；开发工具包只在 Wi‑Fi 下预先下载，下次打开应用时装上</p></div>
+              <div class="sl"><b data-i18n>自动更新</b><p class="clamp" data-i18n>自动更新（默认开）：Claude Code、Codex 按各自选择的通道静默更新（Codex 空闲后切换，自定义路径需先确认）；新版应用下载好后提醒安装（有 Shizuku 时空闲自动装）；开发工具包只在 Wi‑Fi 下预先下载，下次打开应用时装上</p></div>
               <div class="sc"><input type="checkbox" class="sw" id="upd-auto"></div>
             </div>
             <div id="upd-orphans" class="hidden"></div>
             <div class="tiny" id="upd-last"></div>
           </div>
+
         </div>
   
         <!-- ── 排障：安全模式 / 打包诊断 / 反馈 / 核对记录 / 修复账本 / 运行状态 ── -->

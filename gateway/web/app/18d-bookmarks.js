@@ -4,12 +4,12 @@
   // 另有一个不占按钮的「上次读到」：切走时不在底部就记下视口顶部那一段，切回来落回去；滑到底就作废。只存本机。
   const BMK = { sid: null, items: [] };   // 当前会话的书签，给按钮上色用
   async function loadMarks() {
-    const sid = view.sessionId;
+    const sid = view.sessionId, gen=view.gen, backend=isCodexView()?"codex":"claude";
     BMK.sid = sid; BMK.items = [];
     if (!sid) return;
     try {
-      const r = await api("/api/bookmarks?session=" + encodeURIComponent(sid));
-      if (view.sessionId === sid) { BMK.items = r.items || []; paintMarks(); }
+      const r = await api("/api/bookmarks?session=" + encodeURIComponent(sid)+"&backend="+backend);
+      if (view.sessionId === sid && view.gen === gen) { BMK.items = r.items || []; paintMarks(); }
     } catch {}
   }
   const isUserMsg = (msg) => msg.classList.contains("user");
@@ -22,7 +22,10 @@
   function paraIndex(msg, box, para) {
     if (isUserMsg(msg)) return para;
     let n = 0;
+    const uuid=boxUuid(msg,box);
     for (const b of markBoxes(msg)) {
+      if(uuid&&boxUuid(msg,b)!==uuid)continue;
+      if(!uuid&&isCodexView()&&b!==box)continue;
       const ps = paraList(b);
       if (b === box) return n + Math.min(para, Math.max(0, ps.length - 1));
       n += ps.length;
@@ -64,12 +67,20 @@
 
   // 点了书签键：那颗键弹一下（加上、取消都弹，颜色本身说明是哪个）
   const bmTick = (msg) => { const b = msg.querySelector(':scope > .msg-acts button[data-a="mark"]'); if (b) MO.play(b, "mo-tick", 900); };
+  const markBusy=new WeakSet();
   async function toggleMark(msg) {
-    const sid = view.sessionId;
+    if(markBusy.has(msg))return;
+    markBusy.add(msg);
+    try { await changeMark(msg); } finally { markBusy.delete(msg); }
+  }
+  async function changeMark(msg) {
+    const sid = view.sessionId, gen=view.gen, codex=isCodexView();
+    const current=()=>sid===view.sessionId&&gen===view.gen;
     if (!sid) return toast(t("这个会话还没存下来，答完一轮再加书签"), true);
     const uu = msgUuids(msg), mine = BMK.items.filter((b) => uu.includes(b.uuid));
     if (mine.length) {   // 已经有：再点一下取消
-      try { await post("/api/bookmarks/del", { ids: mine.map((b) => b.id) }); } catch (e) { return toast(e.message, true); }
+      try { await post("/api/bookmarks/del", { ids: mine.map((b) => b.id) }); } catch (e) { if(current())toast(e.message, true); return; }
+      if(!current())return;
       BMK.items = BMK.items.filter((b) => !mine.includes(b));
       paintMarks(msg); bmTick(msg);
       return toast(t("已取消书签"));
@@ -81,7 +92,7 @@
     // 没有 uuid 时网关从尾部按开头认领：同样的话后面又出现过几次，就跳过几次，免得认成后一条（审查 #50 S2-02）
     const head = src.trim().slice(0, 200);
     let nth = 0, unsure = false;
-    if (!uuid && head) for (const m of chatEl.querySelectorAll(user ? ".msg.user" : ".msg.bot")) {
+    if (!codex && !uuid && head) for (const m of chatEl.querySelectorAll(user ? ".msg.user" : ".msg.bot")) {
       if (m === msg || !(msg.compareDocumentPosition(m) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
       for (const b of markBoxes(m)) {
         const t2 = user ? userTextOf.get(m) || "" : b._src ? b._src() : "";
@@ -95,17 +106,19 @@
     if (unsure) return toast(t("后面有一条同样的话还没确认存下，等那一轮答完（或重新打开这个会话）再加书签"), true);
     try {
       const r = await post("/api/bookmarks", {
-        session: sid, uuid, hint: Number(msg.closest(".page")?.dataset.from) || 0, para: paraIndex(msg, tg.box, tg.para),
+        session: sid, uuid, ...(codex?{backend:"codex",turnId:tg.box.closest(".codex-item")?.dataset.turnId,itemId:tg.box.closest(".codex-item")?.dataset.itemId}:{}), hint: Number(msg.closest(".page")?.dataset.from) || 0, para: paraIndex(msg, tg.box, tg.para),
         role: user ? "user" : "assistant", head, nth,
         excerpt: ((tg.el && tg.el.innerText) || src).trim().slice(0, 120),
       });
       // 刚答完的回复界面上没有 uuid：网关认领到了就补上，之后按钮状态、再点取消都靠它
+      if(!current())return;
       if (!uuid && r.item) (user ? msg : tg.box).dataset.uuid = r.item.uuid;
       if (sid === view.sessionId && r.item) { BMK.items.push(r.item); paintMarks(msg); bmTick(msg); }
       toast(t("已加书签"));
     } catch (e) {
-      toast(e.status === 409 ? t("这个会话的书签已满 {n} 个，先删掉一些", { n: (e.body && e.body.limit) || 50 })
-        : e.status === 404 ? t("没在会话记录里找到这条消息，稍后再试") : e.message, true);
+      if(!current())return;
+      toast(e.status === 409 && e.body?.error === "full" ? t("这个会话的书签已满 {n} 个，先删掉一些", { n: (e.body && e.body.limit) || 50 })
+        : codex ? e.body?.message || e.message : e.status === 404 ? t("没在会话记录里找到这条消息，稍后再试") : e.message, true);
     }
   }
 

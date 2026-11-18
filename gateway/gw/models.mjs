@@ -8,6 +8,8 @@ import { NEXT, fetchJsonCapped, sendJson } from "./http.mjs";
 import { localModels } from "./local.mjs";
 import { effectiveModel } from "./sessmodel.mjs";
 import { effectiveAutoCompact } from "./stream.mjs";
+import { isCodexSession } from "./codex/store.mjs";
+import { codexModelsResponse } from "./codex/catalog.mjs";
 
 // ── 模型清单（按厂商拉，10 分钟缓存，失败用该厂商的 fallback）─────────
 // MODELS 是全局生效那家的清单（老代码直接读它）；每家各自的缓存在 CACHE（0.3.16 起各会话可以用不同的家）
@@ -480,6 +482,19 @@ export async function routeModels(req, res, u, p) {
     // ?model= / ?effort= / ?provider=：还没会话号的新会话在面板里先选了（前端暂存，随第一条消息带走），按选的回
     // ?browse=接口：面板里点开别的接口看它的模型（只换清单，current 仍是这个会话的）
     const sid = u.searchParams.get("sid") || "", q = (k) => (u.searchParams.has(k) ? u.searchParams.get(k) : null);
+    // ── Codex 会话：数据源换成 App Server 的 model/list（P6-E2）──
+    // 判定顺序：显式 backend > 会话归属。Claude 路径一个字都不变。
+    const beAsked = u.searchParams.get("backend");
+    if (beAsked === "codex" || (!beAsked && sid && isCodexSession(sid))) {
+      return sendJson(res, 200, await codexModelsResponse(sid, {
+        projectId:u.searchParams.get("project"),
+        refresh: u.searchParams.get("refresh") === "1",
+        includeHidden: u.searchParams.get("hidden") === "1",
+        // 新会话在面板里先选了模型/强度：按选的回，别把标签刷回服务端默认
+        model: q("model"),
+        effort: q("effort"),
+      }));
+    }
     const now = effectiveModel(sid, q("project"), { provider: q("provider"), model: q("model"), effort: q("effort") });
     const pp = providerById(now.provider) || PROVIDER;
     const bp = (u.searchParams.get("browse") && providerById(u.searchParams.get("browse"))) || pp;

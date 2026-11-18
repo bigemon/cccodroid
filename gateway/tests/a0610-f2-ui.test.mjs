@@ -52,7 +52,8 @@ test("195-E.5/E.10/E.12 跟随默认看会话/项目默认；窗口未知仍显�
 test("195-K.2/K.6/K.7/BB.4 已删项目保留在任务下拉；型号晚到补下拉；返回前确认未保存指令；定时页轮询", () => {
   const s = src("14-projects-sched.js");
   has(s, /已删除的项目（\{id\}）/, "已删项目选项");
-  has(s, /if \(o\.isConnected && q\("#t-model"\)\) fillModels\(true\);/, "型号晚到补下拉");
+  has(s, /if\(seq!==modelSeq\|\|!o\.isConnected\|\|q\("#t-backend"\)\.value!==be\)return;/, "迟到清单不能覆盖关闭或已切核心的弹层");
+  has(s, /initialCatalog=await api\("\/api\/models\?backend="\+v\.backend\)/, "初始清单按核心加载后再显示弹层");
   has(s, /项目指令还没保存，返回会丢掉这次修改/, "返回前确认");
   has(s, /schedPollSet\(name === "sched"\);/, "进页开轮询");
   has(s, /schedPollSet\(false\);/, "离开停轮询");

@@ -6,6 +6,16 @@
   const permBar = $("perm-bar");
   let permWaiting = false;          // 状态栏此刻显示的是「等你确认」
   const MODE_KEYS = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
+  const CODEX_MODE_KEYS = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
+  const codexPermView = () => typeof currentBackend === "function" && currentBackend() === "codex";
+  function paintPermForBackend() {
+    const codex = codexPermView();
+    const live = srv.runs.find(r => (r.backend === "codex") === codex && ((view.sessionId && r.sessionId === view.sessionId) || view.runIds.has(r.id)));
+    if (!codex) return setPermChip(live?.permissionMode || state.settings?.permissionMode || "default");
+    const mode = live?.permissionMode || (state.sessEff?.backend === "codex" && state.sessEff.permissionSessionId === view.sessionId && state.sessEff.permissionMode)
+      || state.settings?.codex?.permissionMode || "default";
+    setPermChip(CODEX_MODE_KEYS.includes(mode) ? mode : "default");
+  }
   const modeLabel = (m) => ({
     default: t("逐项确认"), acceptEdits: t("自动接受编辑"), plan: t("只做计划"),
     auto: t("自动判断"), dontAsk: t("不询问"), bypassPermissions: t("全部放行"),
@@ -32,10 +42,42 @@
     const lines = (s, c) => String(s || "").split("\n").slice(0, 60).map((l) => `<span class="${c}">${c === "del" ? "-" : "+"} ${esc(l)}</span>`).join("\n");
     return `<pre class="perm-diff">${lines(oldS, "del")}\n${lines(newS, "add")}</pre>`;
   }
+  function nativeFormPreview(p) {
+    const i=p.input||{};
+    const fields=(i.questions||[]).map((q,qi)=>{
+      const value=Object.hasOwn(q,"default")?q.default:undefined;
+      let input;
+      if(q.type==="array"){
+        input='<div class="perm-opts">'+q.options.map(o=>'<label class="perm-opt"><input data-form-input type="checkbox" value="'+esc(o.value)+'"'+(value?.includes(o.value)?' checked':'')+'><span>'+esc(o.label)+'</span></label>').join("")+'</div>';
+      }else if(q.type==="boolean"||q.options){
+        const opts=q.type==="boolean"?[{value:"true",label:t("是")},{value:"false",label:t("否")}]:q.options;
+        input='<select class="perm-other" data-form-input><option value="">'+esc(t("请选择…"))+'</option>'+opts.map(o=>'<option value="'+esc(o.value)+'"'+(value!==undefined&&String(value)===o.value?' selected':'')+'>'+esc(o.label)+'</option>').join("")+'</select>';
+      }else{
+        const type=["number","integer"].includes(q.type)?"number":q.format==="email"?"email":q.format==="uri"?"url":q.format==="date"?"date":"text";
+        input='<input class="perm-other" data-form-input type="'+type+'" autocomplete="off"'+
+          (type==="number"?' step="'+(q.type==="integer"?'1':'any')+'"':'')+
+          (q.minimum!==undefined?' min="'+q.minimum+'"':'')+(q.maximum!==undefined?' max="'+q.maximum+'"':'')+
+          ' value="'+esc(value===undefined?"":String(value))+'">';
+      }
+      return '<div class="perm-q" data-q="'+qi+'"><div class="perm-qt">'+esc(q.title)+' · '+esc(t(q.required?"必填":"选填"))+'</div>'+
+        (q.description?'<div class="perm-sub">'+esc(q.description)+'</div>':"")+input+'</div>';
+    }).join("");
+    return '<div class="perm-path">'+esc(t("来自 {server}",{server:i.server}))+'</div><div class="perm-sub">'+esc(i.message)+'</div>'+fields;
+  }
+
   function permPreview(p) {
     const i = p.input || {};
     let h = "";
     switch (p.tool) {
+      case "MCP":
+        if(p.native){
+          h='<div class="perm-path">'+esc(i.server||"")+'</div><div class="perm-sub">'+esc(i.message||"")+'</div>'+
+            (i.description?'<div class="perm-sub">'+esc(i.description)+'</div>':"")+
+            '<pre class="perm-cmd">'+esc(JSON.stringify(i.arguments||{},null,2).slice(0,32768))+'</pre>'+
+            '<div class="perm-sub">'+esc(t("原生工具请求确认；批准仅限本次操作。"))+'</div>';
+          break;
+        }
+        h='<pre class="perm-cmd">'+esc(JSON.stringify(i,null,2).slice(0,4000))+'</pre>';break;
       case "Bash":
         h = `<pre class="perm-cmd">${esc(i.command || "")}</pre>` + (i.description ? `<div class="perm-sub">${esc(i.description)}</div>` : "");
         break;
@@ -70,6 +112,7 @@
       case "WebSearch": h = `<pre class="perm-cmd">${esc(i.query || "")}</pre>`; break;
       case "ExitPlanMode": h = `<div class="perm-plan">${renderMd(String(i.plan || ""))}</div>`; break;
       case "AskUserQuestion":
+        if(p.nativeForm){h=nativeFormPreview(p);break;}
         h = (i.questions || []).map((q, qi) => `
           <div class="perm-q" data-q="${qi}">
             <div class="perm-qt">${esc(q.question || "")}</div>
@@ -77,7 +120,7 @@
               <label class="perm-opt"><input type="${q.multiSelect ? "checkbox" : "radio"}" name="pq-${esc(p.id)}-${qi}" value="${esc(o.label)}">
                 <span><b>${esc(o.label)}</b>${o.description ? `<small>${esc(o.description)}</small>` : ""}</span></label>`).join("")}
             </div>
-            <input class="perm-other" placeholder="${t("或者直接写你的回答…")}">
+            ${q.allowOther === false ? "" : `<input class="perm-other" type="${q.isSecret ? "password" : "text"}" autocomplete="off" placeholder="${t("或者直接写你的回答…")}">`}
           </div>`).join("");
         break;
       default:
@@ -142,13 +185,13 @@
     const el = document.createElement("div");
     el.className = p.guard ? "perm guard" : "perm";
     el.dataset.id = p.id;
-    const kind = p.tool === "ExitPlanMode" ? t("计划待批准") : p.tool === "AskUserQuestion" ? t("Claude 想问你") : p.guard ? t("敏感操作") : t("需要确认");
+    const kind = p.tool === "ExitPlanMode" ? t("计划待批准") : p.tool === "AskUserQuestion" ? (p.backend === "codex" ? t("Codex 想问你") : t("Claude 想问你")) : p.guard ? t("敏感操作") : t("需要确认");
     el.innerHTML = `
       <div class="perm-head"><span class="perm-kind">${uiI("pause")}${kind}</span><span class="perm-tool">${esc(p.tool)}</span>${p.agentId ? `<span class="perm-sub">${t("子代理")}</span>` : ""}</div>
       <div class="perm-body">${permPreview(p)}</div>
       <div class="perm-acts">${permActions(p, runId)}</div>
       <div class="perm-deny hidden">
-        <textarea rows="2" placeholder="${p.tool === "ExitPlanMode" ? t("说说要怎么改（会发回给 Claude）") : t("可选：告诉 Claude 为什么 / 该怎么做")}"></textarea>
+        <textarea rows="2" placeholder="${p.tool === "ExitPlanMode" ? t("说说要怎么改（会发回给 Claude）") : p.backend === "codex" ? t("可选：说明原因或补充要求") : t("可选：告诉 Claude 为什么 / 该怎么做")}"></textarea>
         <div class="perm-acts">
           <button class="pa-deny">${p.tool === "ExitPlanMode" ? t("发回意见") : p.tool === "UserConfig" ? t("撤销改动") : t("拒绝")}</button>
           <button class="pa-stop">${p.tool === "UserConfig" ? t("撤销并停止") : t("拒绝并停止")}</button>
@@ -174,15 +217,25 @@
       if (b.classList.contains("pa-deny")) return permAnswer(p.id, { behavior: "deny", message: msg });
       if (b.classList.contains("pa-stop")) return permAnswer(p.id, { behavior: "deny", message: msg, interrupt: true });
       if (b.classList.contains("pa-answer")) {
-        const answers = {};
+        const answers = Object.create(null);
         el.querySelectorAll(".perm-q").forEach((qe) => {
           const q = (p.input.questions || [])[+qe.dataset.q];
-          const other = qe.querySelector(".perm-other").value.trim();
+          if(p.nativeForm){
+            if(q.type==="array"){
+              const selected=[...qe.querySelectorAll("input:checked")].map(x=>x.value);
+              if(selected.length||q.required)answers[q.id]=selected;
+            }else{
+              const v=qe.querySelector("[data-form-input]").value;
+              if(v!==""||q.required)answers[q.id]=v;
+            }
+            return;
+          }
+          const other = qe.querySelector(".perm-other")?.value.trim() || "";
           const picked = [...qe.querySelectorAll("input:checked")].map((x) => x.value);
           const v = other || picked.join(", ");
-          if (q && v) answers[q.question] = v;
+          if (q && v) answers[q.id || q.question] = v;
         });
-        if (!Object.keys(answers).length) return toast(t("先选一个选项，或者写下你的回答"), true);
+        if (!p.nativeForm && !Object.keys(answers).length) return toast(t("先选一个选项，或者写下你的回答"), true);
         return permAnswer(p.id, { behavior: "allow", answers });
       }
     });
@@ -242,7 +295,7 @@
       // 收起成一行，留在记录里；计划和问答的正文还有用，留着
       if (p.tool !== "ExitPlanMode" && p.tool !== "AskUserQuestion") it.el.querySelector(".perm-body").remove();
       it.el.querySelectorAll(".perm-acts, .perm-deny").forEach((x) => x.remove());
-      it.el.querySelectorAll("input").forEach((x) => { x.disabled = true; });
+      it.el.querySelectorAll("input,select,textarea,button").forEach((x) => { x.disabled = true; });
       it.el.querySelector(".perm-head").innerHTML = `<span class="perm-res">${label}</span><span class="perm-tool">${esc(p.tool)}</span><span class="tool-arg">${esc(String(what).slice(0, 90))}</span>`;
     }
     renderPermBar();
@@ -327,6 +380,9 @@
     if (view.tasksHide && (view.tasksHide === tasksSig(l) || view.tasksHide === tasksSigOld(l))) return "";
     const cur = l.find((x) => x.status === "in_progress") || l.find((x) => x.status !== "completed");
     const pct = Math.round(done / l.length * 100);
+    const plan = view.codexPlan;
+    const stateLabel = !plan ? "" : ["interrupted", "timeout"].includes(plan.status) ? t("本轮已中断") : plan.status === "failed" ? t("本轮失败")
+      : plan.status === "completed" && !all ? t("本轮结束，计划仍有未完成项") : "";
     const head = `<div class="rs-row rs-thead" role="button" tabindex="0" aria-expanded="${tasksOpen}">
       <span class="rs-ico">${uiI(all ? "check" : "list")}</span>
       <span class="rs-tcount">${all ? t("清单完成") : t("清单")} ${done}/${l.length}</span>
@@ -338,11 +394,12 @@
       <span class="rs-tico">${uiI(x.status === "completed" ? "check" : x.status === "in_progress" ? "half" : "ring")}</span>
       <span class="rs-ttxt">${taskLabel(x)}</span>
       ${x.blocked && x.status !== "completed" ? `<span class="rs-meta">${t("等 {ids}", { ids: x.blocked.map((b) => "#" + esc(b)).join(" ") })}</span>` : ""}</div>`).join("")}</div>`;
-    return `<div class="rs-tasks${all ? " ok" : ""}">${head}${rows}</div>`;
+    return `<div class="rs-tasks${all ? " ok" : ""}">${head}${stateLabel ? `<div class="tiny">${esc(stateLabel)}</div>` : ""}${tasksOpen && plan?.explanation ? `<div class="tiny">${esc(plan.explanation)}</div>` : ""}${rows}</div>`;
   }
+  const codexAgentLabel=status=>t({pending:"正在启动",running:"运行中",completed:"已完成",failed:"失败",interrupted:"已中断",closed:"已关闭",unavailable:"不可用",unconfirmed:"状态待确认"}[status]||"状态未知");
   function renderRunStrip() {
     const g = view.goal && !(view.goal.done && view.goal.at <= view.goalHide) ? view.goal : null;
-    const bg = (srv.run && srv.run.bgList) || [];
+    const bg = codexPermView()?(view.codexCommands||[]).filter(c=>c.background&&c.running).map(c=>({id:c.id,type:"shell",desc:c.command,codex:true})):((srv.run && srv.run.bgList) || []);
     // 清单的折叠管整条：收起时目标、后台任务（包括不能单独折叠的单个任务）一起收起，展开再全露出来
     let html = "";
     if (g && g.active) {
@@ -362,7 +419,7 @@
     if (bg.length) {
       // 后台任务：只有一个时直接一行带「停止」；多个时默认折成一行（数量 + 最新那个），点开看全部，列表过长自己滚
       const row = (x) => `<div class="rs-row rs-bg"><span class="rs-kind">${esc(BG_KIND(x.type))}</span>
-        <span class="rs-txt">${esc(x.desc || x.id)}</span><button class="rs-stop" data-task="${esc(x.id)}">${t("停止")}</button></div>`;
+        <span class="rs-txt">${esc(x.desc || x.id)}</span><button class="rs-stop" data-task="${esc(x.id)}"${x.codex?' data-codex-command="1"':""}>${t("停止")}</button></div>`;
       if (bg.length === 1) html += `<div class="rs-bgs">${row(bg[0])}</div>`;
       else {
         const last = bg[bg.length - 1];
@@ -372,6 +429,12 @@
           <span class="rs-chev${bgOpen ? " up" : ""}">${uiI("chevDown")}</span></div>
           ${bgOpen ? `<div class="rs-blist">${bg.map(row).join("")}</div>` : ""}</div>`;
       }
+    }
+    const agents=codexPermView()?(srv.run?.subagents||view.codexAgents||[]):[];
+    if(agents.length){
+      const running=agents.filter(a=>["pending","running"].includes(a.status)).length;
+      html+='<details class="rs-subagents"><summary>'+esc(t("子代理"))+" · "+esc(t("{n} 个运行中",{n:running}))+" / "+agents.length+'</summary>'+
+        agents.map(a=>'<div class="rs-row" data-agent-id="'+esc(a.agentThreadId)+'"><span class="rs-txt">'+esc(a.label||t("子代理"))+'</span><span class="rs-meta">'+esc(codexAgentLabel(a.status))+'</span><button class="btn ghost sm" data-codex-agent="'+esc(a.agentThreadId)+'">'+esc(t("查看状态"))+'</button></div>').join("")+'</details>';
     }
     const tasksShown = !!tasksHtml(0), fold = tasksShown && !tasksOpen;
     const more = fold ? (g ? 1 : 0) + bg.length : 0;
@@ -411,6 +474,7 @@
   }
   runStrip.addEventListener("click", (e) => {
     const b = e.target.closest("button");
+    if(b?.dataset.codexAgent&&currentBackend()==="codex"&&view.sessionId){openCodexAgent(view.sessionId,b.dataset.codexAgent,b);return;}
     if (b && b.classList.contains("rs-tx")) { view.tasksHide = tasksSig(view.tasks || []); saveStripHidden(); renderRunStrip(); return; }
     if (!b && e.target.closest(".rs-bhead")) { bgOpen = !bgOpen; localStorage.setItem("cc.bgOpen", bgOpen ? "1" : "0"); renderRunStrip(); return; }
     if (!b && e.target.closest(".rs-thead")) { tasksOpen = !tasksOpen; localStorage.setItem("cc.tasksOpen", tasksOpen ? "1" : "0"); renderRunStrip(); return; }
@@ -424,6 +488,9 @@
         api("/api/abort", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: srv.run.id }) }).catch(() => {});
       } else send("/goal clear");
       return;
+    }
+    if(b.classList.contains("rs-stop")&&b.dataset.codexCommand){
+      b.disabled=true;post("/api/codex/command/stop",{sessionId:view.sessionId,commandId:b.dataset.task}).catch(err=>{b.disabled=false;toast(err.message,true);});return;
     }
     if (b.classList.contains("rs-stop") && srv.run) {
       // 输入已关时停不了单个任务，只能整轮结束：不止一个就先说清楚
@@ -454,7 +521,7 @@
     permBar.innerHTML = `
       <div class="pb-main">
         ${list.length > 1 ? `<span class="pb-n">${t("第 {i}/{n} 个", { i: 1, n: list.length })}</span>` : ""}
-        <span class="pb-txt${f.guard ? " wrap" : ""}">${uiI("pause")}${f.tool === "ExitPlanMode" ? t("计划待批准") : f.tool === "AskUserQuestion" ? t("Claude 想问你") : t("Claude 在等你确认") + " · "}${simple(list[0]) ? `<b>${esc(f.tool)}</b> <span class="mono">${esc(String(what || "").slice(0, 80))}</span>`
+        <span class="pb-txt${f.guard ? " wrap" : ""}">${uiI("pause")}${f.tool === "ExitPlanMode" ? t("计划待批准") : f.tool === "AskUserQuestion" ? (f.backend === "codex" ? t("Codex 想问你") : t("Claude 想问你")) : t("Claude 在等你确认") + " · "}${simple(list[0]) ? `<b>${esc(f.tool)}</b> <span class="mono">${esc(String(what || "").slice(0, 80))}</span>`
           : quick(list[0]) ? `<b>${t("敏感操作")}</b> ${esc(permGuardWhat(f.guard, f.input))}` : ""}</span>
         ${quick(list[0]) ? `<button class="pb-allow primary" data-id="${esc(String(f.id))}">${t("允许")}</button>` : ""}
         <button class="pb-view">${t("查看")}</button>
@@ -507,7 +574,15 @@
       auto: t("由 Claude 的分类器判断哪些要问（实验）"),
       bypassPermissions: t("什么都不问。Claude 可以不经你同意删文件、跑任意命令"),
     };
-    m.innerHTML = MODE_KEYS.map((k) => `
+    const codex = codexPermView();
+    if (codex) Object.assign(desc, {
+      default: t("读文件不问，改文件、跑命令前先问你"),
+      auto:t("由 Codex 的审核模型判断是否允许（实验）"),
+      acceptEdits: t("改文件不问，跑命令还要问"),
+      plan: t("只读文件、制定计划，不改文件、不跑命令"),
+      bypassPermissions: t("改文件、跑命令都不再询问"),
+    });
+    m.innerHTML = (codex ? CODEX_MODE_KEYS : MODE_KEYS).map((k) => `
       <button data-mode="${k}" class="${k === state.permissionMode ? "cur" : ""}${k === "bypassPermissions" ? " danger" : ""}">
         <b>${modeLabel(k)}</b><small>${desc[k]}</small></button>`).join("");
     OV.open(m, { anchor: permEl });
@@ -527,16 +602,25 @@
   });
 
   async function changePermMode(mode) {
-    // 不能只看标签一样就不发：标签可能是旧的（重放过旧事件），用户要收紧时必须真送到网关（安全通告 GHSA-2w6p）
     if (!mode || (mode === state.permissionMode && mode === "bypassPermissions")) return;
-    if (mode === "bypassPermissions" && !confirm(t("切到「全部放行」？\n\nClaude 将不再询问，可以直接改写、删除文件，运行任意命令，访问网络。只在你信任当前任务、且出了事能承受的时候用。"))) {
-      // 取消：下拉框回到全局设置，不能被 chip 的运行模式带跑（0.6.9 审计 195-B.9）
-      $("set-perm").value = state.settings.permissionMode || state.permissionMode;
+    const codex = codexPermView(), sid = view.sessionId;
+    if (codex && !sid && isBusy()) return toast(t("会话正在启动，请稍后切换当前会话的模式"), true);
+    if (mode === "bypassPermissions" && !confirm(codex ? t("切到「全部放行」？\n\nCodex 将自动批准宿主文件、命令及受管设备工具。第三方服务的独立审批、交互问题和 Android 原生授权仍需你处理。脚本使用应用自身的文件权限。") : t("切到「全部放行」？\n\nClaude 将自动批准普通及敏感工具操作，可以改写、删除文件、运行命令和访问网络。交互问题、Android 原生授权仍需你处理。只在你信任当前任务时使用。"))) {
+      $("set-perm").value = state.permissionMode;
       return;
     }
     try {
-      const r = await api("/api/perm/mode", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode }) });
-      // 网关回的是实际生效的 mode（安全模式下会自动退回 default）和用户选的 wanted（0.6.9 审计 195-A.6 / P1-12）
+      const r = await api("/api/perm/mode", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode, ...(codex ? { backend: "codex", sessionId: sid } : {}) }) });
+      if (codex) {
+        if (!sid) state.settings.codex = { ...(state.settings.codex || {}), permissionMode: r.mode };
+        if (codexPermView() && view.sessionId === sid) {
+          state.sessEff = { ...(state.sessEff || {}), backend: "codex", permissionMode: r.mode, permissionSessionId: sid };
+          setPermChip(r.mode);
+          refreshSessModel();
+        }
+        toast(r.coreModePending ? t("已切到「{m}」，工具权限立即生效；Codex 从下一轮开始按新模式工作", { m: modeLabel(r.mode) }) : t("已切到「{m}」", { m: modeLabel(r.mode) }));
+        return;
+      }
       const eff = r.mode || r.wanted || mode;
       state.settings.permissionMode = r.wanted || r.mode || mode;   // 全局设置记用户选的；chip / 下拉显示实际生效的
       setPermChip(eff);
@@ -546,11 +630,7 @@
       if (eff !== mode) toast(t("安全模式下不问人的几档不生效，现在是「逐项确认」"));
       else if (r.saved === false) toast(t("设置没保存上，重启后会回到原来的权限模式"), true);
       else toast(r.live ? t("已切到「{m}」，这一轮当场生效", { m: modeLabel(eff) }) : t("已切到「{m}」", { m: modeLabel(eff) }));
-    } catch (err) {
-      // 保存失败：下拉框回到全局设置，别停在新值让人以为切了（0.6.9 审计 196-显示.1）
-      $("set-perm").value = state.settings.permissionMode || state.permissionMode;
-      toast(err.message, true);
-    }
+    } catch (err) { toast(err.message, true); }
   }
 
   // 回复底下的「复制 / 转发」：只取正文（Markdown 原文，多段之间空一行），思考和工具调用不算。
@@ -593,6 +673,7 @@
     if (!turn) for (const u of users) if (u.compareDocumentPosition(msgEl) & Node.DOCUMENT_POSITION_FOLLOWING) turn = u;
     const after = users.length - 1 - users.indexOf(turn);
     if (!turn) return toast(t("这条回复前面没有你的消息，没法单独删"), true);
+    if(isCodexView())return deleteCodexMessages(sid,turn);
     // 记录是原地重写的，删点之后的字节偏移都会挪：把手里的游标交给网关一起换算（#153-1）
     const pages = [...histPages()], gen = view.gen;
     const offs = [view.next, view.cursor, ...pages.flatMap((p) => [p.dataset.from, p.dataset.to])].filter((x) => x != null && x !== "").map(Number);
@@ -628,6 +709,57 @@
     } catch (e) { toast(e.message, true); }
   }
 
+  let codexDeletePending=false;
+  async function deleteCodexMessages(sid,turn) {
+    if(codexDeletePending)return;
+    codexDeletePending=true;
+    const body={userText:userTextOf.get(turn),...codexHistoryOf.get(turn)};
+    const post=patch=>api("/api/session/"+encodeURIComponent(sid)+"/delmsg",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({...body,...patch})});
+    const ov=document.createElement("div");ov.className="rw-ov";
+    const focused=document.activeElement,inert=[];
+    let phase="preview",answer=null;
+    const busy=(stage,label)=>{
+      phase=stage;ov.dataset.deleteBusy=stage;
+      ov.innerHTML=`<div class="rw-dlg" role="dialog" aria-modal="true" aria-busy="true" tabindex="-1"><h3 role="status" aria-live="polite">${esc(t(label))}</h3>${DOTS}<p>${esc(t("请稍候，完成前请勿重复操作。"))}</p></div>`;
+      ov.firstElementChild.focus();
+    };
+    const choose=value=>{const resolve=answer;answer=null;resolve?.(value);};
+    ov.addEventListener("click",e=>{
+      if(!answer)return;
+      if(e.target===ov||e.target.closest("[data-delete-cancel]"))choose(false);
+      else if(e.target.closest("[data-delete-confirm]"))choose(true);
+    });
+    try{
+      busy("preview","正在核对删除范围…");
+      OV.open(ov,{kind:"modal",keep:true,cover:true,canDismiss:()=>phase==="confirm",onClose:()=>choose(false)});
+      for(const el of document.body.children)if(el!==ov){inert.push([el,el.inert]);el.inert=true;}
+      ov.firstElementChild.focus();
+      const preview=await post({dryRun:true});
+      if(view.sessionId!==sid||!isCodexView())return;
+      phase="confirm";delete ov.dataset.deleteBusy;
+      ov.innerHTML=`<div class="rw-dlg" role="dialog" aria-modal="true"><h3>${esc(t("删除此轮及后续对话"))}</h3>
+        <p>${esc(t("将从当前会话删除所选轮次及之后的全部对话，共 {n} 轮。",{n:preview.removedTurns}))}</p>
+        <p>${esc(t("包含这些轮次的提问、回复和工具记录；同一轮中的插话也会一起删除。"))}</p>
+        <p class="rw-note">${esc(t("工作区文件不会还原。此操作暂不支持界面内撤销。"))}</p>
+        <div class="rw-acts"><button class="btn danger-fill" data-delete-confirm>${esc(t("删除 {n} 轮对话",{n:preview.removedTurns}))}</button><button data-delete-cancel>${esc(t("取消"))}</button></div></div>`;
+      ov.querySelector("[data-delete-cancel]").focus();
+      const confirmed=await new Promise(resolve=>{answer=resolve;});
+      if(!confirmed||view.sessionId!==sid||!isCodexView())return;
+      busy("execute","正在删除并同步历史…");
+      const result=await post({dryRun:false,confirmation:preview.confirmation});
+      if(view.sessionId===sid)await openSession(sid);
+      loadSessions();toast(t("已删除 {n} 轮对话",{n:result.removedTurns}));
+    }catch(e){
+      if(e.body?.recoveryRequired&&view.sessionId===sid)await openSession(sid);
+      toast(e.message,true);
+    }finally{
+      OV.close(ov);
+      for(const [el,value]of inert)el.inert=value;
+      if(focused?.isConnected)focused.focus();
+      codexDeletePending=false;
+    }
+  }
+
   // 分叉：保留到这条回复为止的对话，另起一个会话接着聊；原会话不动。
   // 告诉网关这一轮的用户消息原文、以及它后面还有几条用户消息，网关据此在 transcript 里定位（见 server.mjs forkSession）
   async function forkFrom(msgEl) {
@@ -642,13 +774,14 @@
     try {
       const r = await api("/api/session/" + encodeURIComponent(sid) + "/fork", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ userText: userTextOf.get(prev), after, uuid: prev.dataset.uuid || "" }),
+        body: JSON.stringify({ userText: userTextOf.get(prev), after, ...(isCodexView()?codexHistoryOf.get(prev):{}) }),
       });
       loadSessions();
+      const message = r.backend === "codex" ? t("已分叉：保留前 {n} 轮，共用当前工作目录", {n:r.kept}) : t("已分叉：保留了前 {n} 轮，接着聊就行", { n: r.kept });
       // 等回执的工夫切到了别的会话：别把人从那边拉走，给个入口（#174-4）。按会话号认：重连也会让 gen 变
-      if (view.sessionId !== sid) return toastAct(t("已分叉：保留了前 {n} 轮，接着聊就行", { n: r.kept }), t("打开"), () => openSession(r.id));
+      if (view.sessionId !== sid) return toastAct(message, t("打开"), () => openSession(r.id));
       openSession(r.id);
-      toast(t("已分叉：保留了前 {n} 轮，接着聊就行", { n: r.kept }));
+      toast(message);
     } catch (e) { toast(e.message, true); }
   }
 
@@ -665,6 +798,19 @@
     const post = (extra) => api("/api/session/" + encodeURIComponent(sid) + "/rewind", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ userText, after, uuid: msgEl.dataset.uuid || "", ...extra }),
     });
+    if (isCodexView()) {
+      if((codexHistoryOf.get(msgEl)?.itemIndex===0)||(!codexHistoryOf.has(msgEl)&&idx===0&&!view.cursor))return toast(t("回退到第一轮之前，请在同一项目新建会话。"),true);
+      if(!confirm(t("回到这条消息之前继续？将新建 Codex 会话并保留原会话。工作区文件不会还原。")))return;
+      const originalText=userTextOf.get(msgEl)||"";
+      try {
+        const r=await api("/api/session/"+encodeURIComponent(sid)+"/fork",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({userText:originalText,after,before:true,...codexHistoryOf.get(msgEl)})});
+        if (view.sessionId !== sid) return toastAct(t("已回退对话，工作区文件保持当前状态"), t("打开"), () => openSession(r.id));
+        openSession(r.id);
+        inputEl.value=originalText;autoGrow();inputEl.focus();loadSessions();
+        toast(t("已回退对话，工作区文件保持当前状态"));
+      }catch(err){toast(err.message,true);}
+      return;
+    }
     toast(t("正在查这之后改过哪些文件…"));
     let d;
     try { d = await post({ dryRun: true }); } catch (e) { return toast(e.message, true); }
@@ -733,6 +879,10 @@
     let dots = null;
     if (live) { bubble.innerHTML = DOTS; dots = bubble.firstChild; }
     const blocks = [];
+    const codexBlocks = new Map();
+    const commandBlocks = new Map();
+    const inspectionBlocks = new Map();
+    const agentBlocks = new Map();
     let last = null, any = false, ended = false;
     const undot = () => { if (dots) { dots.remove(); dots = null; } };
     // 生成中只在最末尾留一个光标 + 用时：每加一块就把它挪回气泡最后（工具卡跑着时也在）
@@ -760,6 +910,9 @@
           return t("连接出错，第 {a}/{m} 次重试", { a: phEv.attempt || 1, m: phEv.max || "?" }) + (why ? "：" + (why.length > 120 ? why.slice(0, 120) + "…" : why) : "");
         }
         case "think":   return t("思考中") + sec;
+        case "plan":    return t("正在制定计划") + sec;
+        case "commentary": return t("正在汇报进展") + sec;
+        case "final":   return t("正在整理回复") + sec;
         // 官方接口默认把工具参数攒成大块才下发（不像 DeepSeek 逐字流），字数常常一下跳到底就不动了；
         // 后面跟上这一步的用时，不动的时候也看得出没卡住
         case "tool":    return t("正在写 {name} 的参数", { name: phEv.name || "?" }) + (phEv.chars ? " · " + fmtChars(phEv.chars) : "") + sec;
@@ -817,6 +970,100 @@
     return {
       msgEl, bubble, tailTime,
       phase: setPhase,
+      codexItem(ev) {
+        const key = ev.itemId + ":" + (ev.summaryOnly ? "summary:" + ev.summaryIndex : "message");
+        let entry = codexBlocks.get(key);
+        if (!entry) {
+          const box = document.createElement("div");
+          box.className = "codex-item";
+          box.dataset.itemId = ev.itemId;
+          bubble.appendChild(box);
+          const badge = document.createElement("div"); badge.className = "tiny codex-stage"; box.appendChild(badge);
+          const block = ev.summaryOnly ? ThinkBlock(box, t("思考摘要")) : TextBlock(box, live);
+          if (ev.summaryOnly) block.kind = "codex-summary";
+          push(block);
+          entry = { block, box, badge }; codexBlocks.set(key, entry);
+        }
+        if(ev.turnId)entry.box.dataset.turnId=ev.turnId;
+        if(!ev.summaryOnly&&ev.uuid)entry.block.el.dataset.uuid=ev.uuid;
+        const label = { commentary: t("进展说明"), partial_answer: t("阶段回复"), final_answer: t("最终回复"), plan: t("计划") }[ev.phase] || "";
+        entry.box.dataset.phase = ev.phase || "";
+        entry.badge.textContent = label; entry.badge.hidden = !label;
+        if (ev.replace) entry.block.set(ev.text); else entry.block.append(ev.text);
+        if (Array.isArray(ev.questions)) {
+          const fingerprint=JSON.stringify(ev.questions);
+          if(entry.questionFingerprint!==fingerprint){
+            entry.questionFingerprint=fingerprint;entry.questions?.remove();
+            entry.questions=renderCodexAsyncQuestions(entry.box,ev.questions,{itemId:ev.itemId});
+          }
+        }
+        keepTail();
+      },
+      subagent(info){
+        let entry=agentBlocks.get(info.id);
+        if(!entry){
+          const box=document.createElement("details");box.className="codex-inspection codex-subagent";
+          box.dataset.agentId=info.agentThreadId;box.innerHTML="<summary></summary><div class='tiny'></div>";bubble.appendChild(box);
+          const control=document.createElement("button");control.className="btn ghost sm";control.textContent=t("查看状态");control.addEventListener("click",e=>{e.stopPropagation();openCodexAgent(info.parentThreadId,info.agentThreadId,control);});box.appendChild(control);
+          entry={box};agentBlocks.set(info.id,entry);push({kind:"subagent",finish(){}});
+        }
+        entry.box.dataset.status=info.status;
+        entry.box.querySelector("summary").textContent=t("子代理")+" · "+(info.label||t("子代理"))+" · "+codexAgentLabel(info.status);
+        entry.box.querySelector(".tiny").textContent=[info.model,info.effort,info.reason].filter(Boolean).join(" · ");
+        keepTail();
+      },
+      inspection(kind, info) {
+        const key=kind+":"+info.id;let entry=inspectionBlocks.get(key);
+        if(!entry){
+          const box=document.createElement("details");box.className="codex-inspection";
+          box.innerHTML="<summary></summary><pre></pre><div class='tiny'></div>";bubble.appendChild(box);
+          entry={box,info};inspectionBlocks.set(key,entry);push({kind:"inspection",finish(){}});
+          box.addEventListener("toggle",()=>{if(box.open)box.querySelector("pre").textContent=entry.info.text||"";});
+        }
+        entry.info=info;
+        entry.box.querySelector("summary").textContent=kind==="review" ? t("原生审查结果")+" · "+(info.status==="completed"?t("完成"):info.status==="running"?t("进行中"):info.status==="finishing"?t("等待轮次结束"):t("已中断或失败"))
+          : info.source==="core"?t("核心报告的本轮差异"):t("当前工作区差异（包含已有改动）");
+        const target=info.target;
+        const scope=target?.type==="uncommittedChanges"?t("未提交改动"):target?.type==="baseBranch"?t("对比分支")+" · "+target.branch
+          :target?.type==="commit"?t("指定提交")+" · "+target.sha:target?.type==="custom"?t("自定义审查")+" · "+target.instructions.slice(0,180)+(target.instructions.length>180?"…":""):"";
+        entry.box.querySelector(".tiny").textContent=kind==="review"?[scope,t("审查模型由核心配置决定；宿主写入与命令执行已锁定。")].filter(Boolean).join(" · "):info.truncated?t("差异过大，仅展示部分内容，请在 Git 页面核对。"):"";
+        if(entry.box.open)entry.box.querySelector("pre").textContent=info.text||"";
+        keepTail();
+      },
+      command(info) {
+        let entry = commandBlocks.get(info.id);
+        if (!entry) {
+          const box = document.createElement("details"); box.className = "codex-command";box.open=!!info.running;
+          box.dataset.commandId = info.id;
+          box.innerHTML = '<summary><b class="command-state"></b><span class="command-preview"></span><button type="button" class="btn sm ghost command-stop" aria-label="' + esc(t("停止命令")) + '" title="' + esc(t("停止命令")) + '">' + esc(t("停止")) + '</button></summary><div class="command-body"><pre class="command-text"></pre><pre class="command-output"></pre><div class="tiny command-note"></div></div>';
+          bubble.appendChild(box);
+          const stop = box.querySelector(".command-stop");
+          const sessionId = view.sessionId;
+          stop.addEventListener("click", async (event) => {
+            event.preventDefault();event.stopPropagation();
+            stop.disabled = true;
+            try { await post("/api/codex/command/stop", { sessionId, commandId: info.id }); }
+            catch (err) { toast(err.message, true); stop.disabled = false; }
+          });
+          entry = { box, stop, running:!!info.running }; commandBlocks.set(info.id, entry);
+          undot();any=true;
+        }
+        if(entry.running&&!info.running)entry.box.open=false;
+        entry.running=!!info.running;
+        entry.box.dataset.status = info.status;
+        entry.box.querySelector(".command-preview").textContent=String(info.command||"").replace(/\s+/g," ").trim();
+        const labels = { running: t("命令运行中"), completed: t("命令完成"), failed: t("命令失败"),
+          cancelled: t("命令已停止"), interrupted: t("命令已中断"), timeout: t("命令超时") };
+        entry.box.querySelector(".command-state").textContent = (labels[info.status] || info.status) + (info.exitCode != null ? " · " + t("退出码 {n}", { n: info.exitCode }) : "");
+        entry.box.querySelector(".command-text").textContent = info.command;
+        entry.box.querySelector(".command-output").textContent = info.output || "";
+        entry.box.querySelector(".command-note").textContent = [info.background?t("后台命令 · 跨轮次运行"):"",info.tty?"PTY":"",info.truncated?t("仅显示最近的输出，较早内容已省略"):""].filter(Boolean).join(" · ");
+        entry.stop.hidden = !info.running || (!live&&!info.background);
+        entry.info=info;
+        const tool=info.toolUseId&&TOOL_CARDS.get(info.toolUseId);
+        if(tool?.managedCommand&&bubble.contains(tool.el))tool.managedCommand(info,entry.box,entry.stop);
+        keepTail();
+      },
       /** 工具结果回来：这一批工具都有结果了，下一步就是再请求模型 */
       toolDone(id) { if (pendTools.delete(id) && !pendTools.size) setPhase({ phase: "connect" }); },
       delta(t) { textB().append(t); },
@@ -843,7 +1090,8 @@
           if (prev) { blocks.splice(blocks.indexOf(prev), 1); g.addThink(prev); }
           push(g);
         }
-        g.add(ToolBlock(g.body, id, name, input, live));
+        const tool=ToolBlock(g.body, id, name, input, live);g.add(tool);
+        for(const entry of commandBlocks.values())if(entry.info?.toolUseId===id)tool.managedCommand(entry.info,entry.box,entry.stop);
         keepTail();
         scrollDown();
       },
@@ -938,14 +1186,22 @@
     const page = document.createElement("div");
     page.className = "page";
     let av = null;
-    const avs = [], agTools = [];
+    const avs = [], agTools = [], commandTools=new Map();
+    // Older saved command snapshots have no toolUseId. Recover an exact id from the original tool result.
+    for(const m of items)if(m.role==="tool_result"&&typeof m.text==="string"&&m.text.trimStart().startsWith("{")){
+      try{const r=JSON.parse(m.text);if(typeof r?.id==="string"&&typeof r.command==="string"&&typeof r.running==="boolean"&&!commandTools.has(r.id))commandTools.set(r.id,m.id);}catch{}
+    }
     for (const m of items) {
-      if (m.role === "user") { renderUser(m.text, page, m.uuid); av = null; continue; }
+      if (m.role === "user") { renderUser(m.text, page, m); av = null; continue; }
       if (m.role === "note") { (m.chapter ? chapterSep : addNote)(m.chapter ? m : m.text, page); av = null; continue; }
       if (m.role === "hookctx") { addHookCtx(m.event, m.text, page); av = null; continue; }
       if (m.role === "tool_result") { toolResult(m.id, m.ok, m.text); continue; }
       if (!av) { av = AssistantView(page, false); avs.push(av); }
-      if (m.role === "assistant") av.text(m.text, m.uuid);
+      if(m.role==="subagent")av.subagent(m);
+      else if (m.role === "diff" || m.role === "review") av.inspection(m.role,m);
+      else if (m.role === "command") av.command({...m,toolUseId:m.toolUseId||commandTools.get(m.id)});
+      else if (m.itemId && (m.role === "assistant" || m.role === "thinking")) av.codexItem({ ...m, summaryOnly: m.summaryOnly || m.role === "thinking", replace: true });
+      else if (m.role === "assistant") av.text(m.text, m.uuid);
       else if (m.role === "thinking") av.thinking(m.text);
       else if (m.role === "tool_use") {
         av.tool(m.id, m.name, m.input);

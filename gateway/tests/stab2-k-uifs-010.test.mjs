@@ -40,6 +40,7 @@ const curModel = () => "";
 const t = T;
 const refreshSessModel = () => {};
 const setPermChip = () => {};
+const paintPermForBackend = () => {};
 const renderDirs = () => {};
 let toastLog = [];
 const toast = (m, e) => toastLog.push(m);

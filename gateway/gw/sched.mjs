@@ -1,5 +1,5 @@
 // ── 定时任务 ──────────────────────────────────────────────────────────
-// 到点在指定目录里跑一次 Claude（和用户发消息走同一条队列），没人看着：要确认的一律拒绝。
+// 到点在指定目录里跑一次指定核心（和用户发消息走同一条队列），没人看着：要确认的一律拒绝。
 // 跑完按设置通知、记运行记录，结果存成一个对话（列表里带时钟标记）。
 // 计时在网关里：应用活着（前台或后台常驻）就准点。另外把最近一次的时刻报给外壳（事件 sched_next + 文件
 // ccapp-sched-next），外壳定一个系统闹钟：到点叫醒应用、没在跑就拉起服务，再调 /api/sched/tick 立刻查一遍。
@@ -8,17 +8,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { CFG, LIVE, log, tz } from "./config.mjs";
-import { isObj, loadState, saveState, writeAtomic } from "./statefile.mjs";
-import { guarded } from "./crashguard.mjs";
-import { dec, NEXT, readBody, sendJson } from "./http.mjs";
-import { END_HOOKS, QUEUE, RECOVER_HOOKS, START_GUARDS, enqueue } from "./queue.mjs";
-import { capList } from "./settings-store.mjs";
+import { NEXT, readBody, sendJson, dec } from "./http.mjs";
+import { END_HOOKS, enqueue, QUEUE, RECOVER_HOOKS, START_GUARDS } from "./queue.mjs";
 import { RUNS, TRASH_HOOKS, maxParallel } from "./runs.mjs";
 import { publish } from "./bus.mjs";
-import { NAMES, findSessionFile, saveNames } from "./sessions.mjs";
+import { NAMES, saveNames, findSessionFile } from "./sessions.mjs";
+import { resolveBackend, normalizeBackend } from "./backends.mjs";
+import { getCodexSession } from "./codex/store.mjs";
+import { codexAvailable } from "./codex/config.mjs";
+import { codexTaskPolicy, CODEX_TASK_TOOLS } from "./codex/task-policy.mjs";
+import { isObj, loadState, saveState, writeAtomic } from "./statefile.mjs";
+import { guarded } from "./crashguard.mjs";
+import { capList } from "./settings-store.mjs";
 import { trashSession } from "./sessionops.mjs";
 import { projectById } from "./projects.mjs";
 import { isLoginMode } from "./models.mjs";
+import { sessProvider, sessModel } from "./sessmodel.mjs";
 import { pickProvider } from "./run.mjs";
 import { privCall } from "./usage.mjs";
 import { providerById, usdCny } from "./providers.mjs";
@@ -83,6 +88,8 @@ export function clearFollowingTaskModels() {
   if (n) save();
   return n;
 }
+
+for(const t of DB.tasks)if(!t.backend)t.backend=t.session==="same"&&getCodexSession(t.lastSid)?"codex":"claude";
 // 最近一次要跑的时刻（毫秒，0 = 没有）→ 外壳的系统闹钟。只在变了的时候报
 const NEXT_FILE = path.join(CFG.home, "ccapp-sched-next");
 let lastNext = -1;   // 上一次真正写进文件的值
@@ -256,6 +263,7 @@ export function schedSessions() {
   return out;
 }
 function addRun(rec) {
+  rec.backend ||= byId(rec.taskId)?.backend || "claude";
   RUNLOG.push(rec);
   // 月度聚合单独存：RUNLOG 只留最近 500 条，跳过也会占名额，月度统计会被截断（197-5.11）
   const k = monthKey(rec.at);
@@ -272,47 +280,60 @@ function note(t, title, text, sessionId, ok) { publish({ type: "sched_note", tas
 // 这个任务跑起来会用哪家：直接用 run.mjs 的 pickProvider，入参和下面 enqueue 的一致——
 // 以前这里抄了一份优先级，少了「会话钉的」那层：项目默认 API、接着的会话钉了官方账户时，门禁放行了、实际用订阅跑（审查 v0.5.20 03-013）
 const taskItem = (t) => ({ projectId: t.projectId && projectById(t.projectId) ? t.projectId : null, sessionId: t.session === "same" && t.lastSid ? t.lastSid : null, provider: t.provider || null });
-const usesLogin = (t) => { try { return isLoginMode(pickProvider(taskItem(t)).P); } catch { return false; } };
+const usesLogin = (t) => { if(t.backend==="codex")return false;try { return isLoginMode(pickProvider(taskItem(t)).P); } catch { return false; } };
 
 // ── 跑一次 ──
 const NULL_AT = new Map();  // 排不出下次时间的任务上次重算的时刻
 const MANUAL = new Set();   // 手动「立刻跑一次」还没落到队列里的任务
 const RUNNING = new Map();   // key → { taskId, startedAt, attempt, trial }
 let keyN = 0;
-/** 在跑 / 排着的任务。排队中的条目被用户在队列里 ✕ 掉（或清空）时没有结束钩子来删它：
- *  队列和运行里都已找不到的就清掉，不然任务一直显示「在跑」、到点不关、手动跑一直 409（DeepSeek 复核 中-1） */
+const WAITING = new Set();
 function runningNow() {
-  const alive = new Set();
-  for (const x of [...QUEUE, ...RUNS.values()]) if (x.sched && x.sched.key) alive.add(x.sched.key);
-  for (const k of [...RUNNING.keys()]) if (!alive.has(k)) RUNNING.delete(k);
-  const out = [...RUNNING.values()];
-  // 正在 30 分钟排队窗口里的也要算「在跑」：否则界面看不到、手动「立刻跑一次」也不会 409（审查 11-05）
-  for (const id of WAITING) if (!out.some((x) => x.taskId === id)) out.push({ taskId: id, startedAt: Date.now(), waiting: true });
-  return out;
+  const keys = new Set([...QUEUE, ...RUNS.values()].map(x => x.sched?.key).filter(Boolean));
+  for (const key of RUNNING.keys()) if (!keys.has(key)) RUNNING.delete(key);
+  return [...RUNNING.values(), ...[...FIRING].map(taskId => ({taskId, waiting:true}))];
 }
-const WAITING = new Set();   // 到点了、正排队等别的对话跑完的任务 id：计时别把它当成「没排上 / 时间已过」（审查 B17）
-async function fire(t, { reason = "due", attempt = 0, trial = false } = {}) {
-  if (trial) return fireNow(t, { reason, attempt, trial });
-  // 同一个任务已经有一个到点等待者时不再叠一个：排期间隔 ≤30 分钟时，每个新计划时刻都会进 fireNow 的忙等，
-  // 阻塞结束后同一任务会被连续执行多次（审查 11-05）
-  if (WAITING.has(t.id)) { log(`⏭ 定时任务「${t.name}」已在排队，跳过这次重复入队`); return null; }
-  WAITING.add(t.id);
-  try { return await fireNow(t, { reason, attempt, trial }); } finally { WAITING.delete(t.id); }
+const FIRING=new Set();
+const taskBusy=id=>FIRING.has(id)||[...RUNNING.values()].some(x=>x.taskId===id)||QUEUE.some(q=>q.sched?.taskId===id);
+async function fire(t, options = {}) {
+  if(FIRING.has(t.id)||(t.backend==="codex"&&taskBusy(t.id)))return {error:{status:409,message:"这个任务已经在运行或排队。"}};
+  FIRING.add(t.id);
+  if (!options.trial) WAITING.add(t.id);
+  try{return await fireOnce(t,options);}finally{FIRING.delete(t.id);WAITING.delete(t.id);}
 }
-async function fireNow(t, { reason, attempt, trial }) {
+async function fireOnce(t, { reason = "due", attempt = 0, trial = false } = {}) {
   const skip = (msg) => { log(`⏭ 定时任务「${t.name}」跳过：${msg}`); if (!trial) addRun({ taskId: t.id, at: Date.now(), st: "skip", msg }); };
-  // 指定的接口删了：不悄悄换成全局默认那家跑（全局可能是订阅账户，任务内容不该换家发出去）。
-  // 放在最前：回落到订阅后下面「订阅账户默认关闭」会先挡住，可报的原因不对，打开了订阅也就挡不住了
-  if (t.provider && !providerById(t.provider)) {
-    skip(tz("任务指定的接口已经删掉了：编辑任务重新选个接口"));
-    if (!trial) note(t, tz("定时任务已跳过"), tz("「{n}」指定的接口已经删掉了：编辑任务重新选个接口", { n: t.name }), null, false);
-    return;
+  const reject=(message,status=409)=>{
+    if(!trial)addRun({taskId:t.id,at:Date.now(),st:"skip",msg:message});
+    note(t,tz("定时任务已跳过"),message,null,false);
+    return t.backend === "codex" ? {error:{status,message}} : undefined;
+  };
+  const backend=normalizeBackend(t.backend || "claude");
+  if(!backend)return reject("任务核心无效，请编辑任务后重试。");
+  if (backend !== "codex" && t.provider && !providerById(t.provider)) return reject(tz("任务指定的接口已经删掉了：编辑任务重新选个接口"));
+  if (DB.dailyBudget > 0 && costToday() >= DB.dailyBudget) return reject(tz("今天的花费已到上限"));
+  const project=t.projectId?projectById(t.projectId):null;
+  if(t.projectId&&!project)return reject(tz("任务所在的项目已经删掉了：编辑任务重新选个项目"));
+  const directory=project?project.path:CFG.workspace;
+  try{if(!fs.statSync(directory).isDirectory())return reject(tz(project ? "项目目录已经不在了：编辑任务重新选个项目" : "任务工作目录不可用，未切换到其他目录。"));}catch{return reject(tz(project ? "项目目录已经不在了：编辑任务重新选个项目" : "任务工作目录不可用，未切换到其他目录。"));}
+  // Claude 的旧会话确已删除时，新开并保留丢失提示；Codex 仍要求精确归属。
+  if (backend === "claude" && !trial && t.session === "same" && t.lastSid && !getCodexSession(t.lastSid) && !findSessionFile(t.lastSid)) {
+    t.lostSid = t.lastSid; t.lastSid = null; save();
   }
-  // 每日预算也管试跑：以前试跑跳过这道检查、花掉的钱也不进 DB.spent（197-5.10）
-  if (DB.dailyBudget > 0 && costToday() >= DB.dailyBudget) {
-    skip(tz("今天的花费已到上限"));
-    if (!trial) note(t, tz("定时任务已跳过"), tz("「{n}」：今天的花费已到上限", { n: t.name }), null, false);
-    return;
+  const sessionId=!trial&&t.session==="same"?t.lastSid||null:null;
+  const target=resolveBackend({backend,sessionId},{isKnownClaudeSession:sid=>!!findSessionFile(sid)});
+  if(target.error)return reject(target.error.message,target.error.status);
+  let taskPolicy=null;
+  if(backend==="codex"){
+    if(!codexAvailable())return reject("Codex 核心不可用，请检查设置。",503);
+    if(t.saveSession===false)return reject("Codex 任务暂需保留结果会话，请打开「结果存成对话」。",400);
+    if(t.limitCost>0||(!trial&&DB.dailyBudget>0))return reject("Codex 暂无可核验的花费数据，设有花费上限时不运行。",400);
+    try{taskPolicy=codexTaskPolicy(t.perm||"ro",t.tools);}catch(err){return reject(err.message,400);}
+    if(sessionId){
+      const cwd=getCodexSession(sessionId)?.cwd;
+      try{if(!cwd||fs.realpathSync(cwd)!==fs.realpathSync(directory))return reject("任务目录与原会话不同，请改为每次新建会话。");}
+      catch{return reject("原会话目录不可用，未切换到其他目录。");}
+    }
   }
   if (!trial) {
     if (t.until?.kind === "date" && t.until.date && Date.now() > new Date(t.until.date + "T23:59:59").getTime()) { t.on = false; refreshNext(t); save(); return skip(tz("已过有效期，任务已关")); }
@@ -345,31 +366,8 @@ async function fireNow(t, { reason, attempt, trial }) {
       }
     }
   }
-  // 排队那 30 秒里被删 / 被关、而别的对话又正好在醒来前结束：循环条件直接为假，循环里那道检查没走到（审查 B16）。入队前再看一眼
   if (!trial && (byId(t.id) !== t || (reason === "due" && !t.on))) return skip(tz("排队时任务被关掉或删了"));
-  const p = t.projectId ? projectById(t.projectId) : null;
-  // 项目删了：不悄悄退回工作区跑（「可以改项目目录里的文件」到了工作区就是能改工作区，#178-7）
-  if (t.projectId && !p) {
-    skip(tz("任务所在的项目已经删掉了：编辑任务重新选个项目"));
-    if (!trial) note(t, tz("定时任务已跳过"), tz("「{n}」所在的项目已经删掉了：编辑任务重新选个项目", { n: t.name }), null, false);
-    return;
-  }
-  // 项目记录还在、目录没了（改名/拔卡/被删）：run.cwdOf 会静默回落到工作区，权限和型号却还按项目套（195-K.1）。
-  // 这里挡下来，别让任务在用户没选过的目录里跑
-  if (p) {
-    let isDir = false; try { isDir = fs.statSync(p.path).isDirectory(); } catch {}
-    if (!isDir) {
-      skip(tz("任务所在的项目目录已经不在了：编辑任务重新选个项目或目录"));
-      if (!trial) note(t, tz("定时任务已跳过"), tz("「{n}」所在的项目目录已经不在了：编辑任务重新选个项目或目录", { n: t.name }), null, false);
-      return;
-    }
-  }
-  // 接着同一个对话、可那个对话已经删了：--resume 必失败（每次到点都失败、重试也一样，#173-3）。
-  // 放下它，这次新开一个；任务详情里标出来
-  if (!trial && t.session === "same" && t.lastSid && !findSessionFile(t.lastSid)) {
-    log(`⏰ 定时任务「${t.name}」接着的对话 ${t.lastSid} 已不在，这次新开一个`);
-    t.lostSid = t.lastSid; t.lastSid = null; save();
-  }
+  const p = project;
   const perm = t.perm === "proj" ? { permissionMode: "acceptEdits" }
     : t.perm === "custom" ? { permissionMode: "default", allowedTools: capList(String(t.tools || "").split(/[,，\n]/).map((x) => x.trim()).filter(Boolean), 200, 512, 8192) }
     : { permissionMode: "default", disallowedTools: ["Edit", "Write", "MultiEdit", "NotebookEdit"] };
@@ -379,13 +377,19 @@ async function fireNow(t, { reason, attempt, trial }) {
     if (last) message = `${tz("（上一次的结果，供参考）")}\n${last.full}\n\n---\n\n${message}`;
   }
   const key = "s" + Date.now().toString(36) + (++keyN);
-  RUNNING.set(key, { taskId: t.id, startedAt: Date.now(), attempt, trial, reason });
+  RUNNING.set(key, { taskId: t.id, startedAt: Date.now(), attempt, trial, backend, reason });
   const item = enqueue({
-    internal: true, message, projectId: p ? p.id : null,
-    sessionId: !trial && t.session === "same" && t.lastSid ? t.lastSid : null,
+    internal: true, message, backend, cwd:directory, projectId: p ? p.id : null,
+    sessionId,
     model: t.model || null, effort: t.effort || null, provider: t.provider || null, ...perm,
-    unattended: true, timeoutMs: Math.max(1, +t.limitMin || 15) * 60000, limitCost: +t.limitCost || 0, sched: { taskId: t.id, key, ...(trial ? { trial: true } : {}) },
+    codexTaskPolicy: taskPolicy ? {perm:t.perm||"ro",tools:t.tools||""} : null,
+    unattended: true, timeoutMs: Math.max(1, +t.limitMin || 15) * 60000, sched: { taskId: t.id, key, attempt, trial, backend, startedAt:Date.now() },
   });
+  if (item.error) {
+    RUNNING.delete(key);
+    log(`⏰ 定时任务「${t.name}」无法运行：${item.error.message}`);
+    return reject(item.error.message,item.error.status||409);
+  }
   log(`⏰ 定时任务「${t.name}」开跑（${reason}${trial ? "，试跑" : ""}）`);
   if (!trial) { t.lastFiredAt = Date.now(); save(); }
   return item;
@@ -405,7 +409,7 @@ START_GUARDS.push((q) => {
   if (ctx.trial) return true;
   const t = byId(ctx.taskId);
   // 排队期间会话可能被改钉到官方账户：真开跑前按这一条实际会用的那家再核一次订阅许可
-  if (t && !DB.allowLogin && (() => { try { return isLoginMode(pickProvider(q).P); } catch { return false; } })()) {
+  if (q.backend !== "codex" && t && !DB.allowLogin && (() => { try { return isLoginMode(pickProvider(q).P); } catch { return false; } })()) {
     RUNNING.delete(q.sched.key);
     const msg = tz("用订阅账户跑定时任务默认关闭");
     log(`⏭ 定时任务「${t.name}」跳过：${msg}`);
@@ -455,7 +459,7 @@ TRASH_HOOKS.push((id) => {
 // 一轮结束：记运行记录、改会话名、通知、重试
 END_HOOKS.push((run, f) => {
   if (!run.sched) return;
-  const ctx = RUNNING.get(run.sched.key); RUNNING.delete(run.sched.key);
+  const ctx = RUNNING.get(run.sched.key) || {taskId:run.sched.taskId,startedAt:run.sched.startedAt||run.startedAt,attempt:run.sched.attempt||0,trial:run.sched.trial===true,backend:run.backend}; RUNNING.delete(run.sched.key);
   if (!ctx) return;
   const t = byId(run.sched.taskId), cost = Number(f.costRaw || f.costUsd || 0);
   // 跑着的时候任务被删了：已经花掉的钱照样记进当天的预算日桶，不然后面的任务会在超额以后继续跑（#149-1）。
@@ -492,7 +496,7 @@ END_HOOKS.push((run, f) => {
   // 接着同一个对话的不回收：下一次还要接着它，回收了就 --resume 失败（#173-3）。
   // 失败轮次也算：saveSession=false 说好的「只留运行记录」，以前失败时仍把会话留在主列表（197-2.5）
   const drop = !!sid && t.saveSession === false && t.session !== "same";
-  addRun({ taskId: t.id, at: ctx.startedAt, st, msg: msg.slice(0, 300), full: text.slice(0, 2000), cost, dur, sid: drop ? null : sid, attempt: ctx.attempt });
+  addRun({ taskId: t.id, at: ctx.startedAt, st, msg: msg.slice(0, 300), full: text.slice(0, 2000), cost, costKnown:ctx.backend!=="codex", backend:ctx.backend, dur, sid: drop ? null : sid, attempt: ctx.attempt });
   t.runsDone = (t.runsDone || 0) + 1;
   if (t.until?.kind === "count" && t.runsDone >= (+t.until.count || 1)) t.on = false;
   if (t.freq?.kind === "once") t.on = false;
@@ -559,7 +563,12 @@ function clean(b, old = {}) {
   const t = { ...old };
   const s = (k, n = 200) => { if (typeof b[k] === "string") t[k] = b[k].trim().slice(0, n); };
   s("name", 60); s("prompt", 8000); s("tools", 500); s("model", 80); s("effort", 20); s("provider", 40); s("quiet", 60);
-  if ("projectId" in b) t.projectId = b.projectId && projectById(b.projectId) ? b.projectId : null;
+  if("backend" in b){if(!normalizeBackend(b.backend))throw new Error("任务核心无效。");t.backend=b.backend;}
+  if(!t.backend)t.backend="claude";
+  if ("projectId" in b) {if(b.projectId&&!projectById(b.projectId))throw new Error("任务项目不存在。");t.projectId=b.projectId||null;}
+  const changedBackend=old.backend&&t.backend!==old.backend;
+  if(changedBackend){for(const k of ["model","effort","provider","tools"])if(!(k in b))t[k]="";if(!("perm"in b))t.perm="ro";}
+  if(changedBackend||("projectId"in b&&t.projectId!==old.projectId)||b.session==="new")t.lastSid=null;
   if (b.freq && KINDS.includes(b.freq.kind)) {
     const f = b.freq, o = { kind: f.kind };
     // 以前非法字段逐项静默丢掉：monthly 29–31 变成 1 号、weekly 空/小数永不跑、daily 99:99 归一成错时间（200-16-04）。
@@ -604,9 +613,15 @@ function clean(b, old = {}) {
   if (b.until?.kind === "count" && !(Number.isInteger(+b.until.count) && +b.until.count >= 1)) throw new Error(tz("次数至少填 1"));
   if (b.until?.kind === "date" && !/^\d{4}-\d{2}-\d{2}$/.test(b.until.date || "")) throw new Error(tz("到期日要填一个日期"));
   if (b.until && ["ever", "date", "count"].includes(b.until.kind)) t.until = { kind: b.until.kind, date: /^\d{4}-\d{2}-\d{2}$/.test(b.until.date || "") ? b.until.date : undefined, count: +b.until.count || undefined };
+  if(t.backend==="codex"){
+    if(t.provider)throw new Error("Codex 任务不使用 Claude 服务商，请清空接口选项。");
+    if(t.saveSession===false)throw new Error("Codex 任务暂需保留结果会话。");
+    if(t.limitCost>0)throw new Error("Codex 暂不支持按花费设置上限，请使用时长上限。");
+    if(["backend","perm","tools"].some(k=>k in b)||!old.id)codexTaskPolicy(t.perm||"ro",t.tools);
+  }
   return t;
 }
-const DEFAULTS = { on: true, session: "new", perm: "ro", busy: "queue", missed: "ask", notify: "all", saveSession: true, carryLast: false,
+const DEFAULTS = { backend:"claude", on: true, session: "new", perm: "ro", busy: "queue", missed: "ask", notify: "all", saveSession: true, carryLast: false,
   cond: { wifi: false, charging: false, battery: 0 }, limitCost: 0, limitMin: 15, retry: 0, until: { kind: "ever" }, freq: { kind: "daily", time: "09:00" } };
 
 function summary(t) {
@@ -627,8 +642,8 @@ export async function routeSched(req, res, u, p) {
     DB.missed = DB.missed.filter((m) => byId(m.taskId));
     return sendJson(res, 200, { tasks: DB.tasks.map(summary), missed: DB.missed, sids: DB.sids.slice(-2000),
       budget: { daily: DB.dailyBudget, today: costToday(), month: monthStats() },
-      allowLogin: !!DB.allowLogin, loginTasks: DB.tasks.filter(usesLogin).map((t) => t.id), fx: await Promise.race([usdCny().catch(() => null), new Promise((r) => setTimeout(() => r(null), 1500))]),   // 汇率：中文界面把美元花费换成人民币；取不到就照美元
-      running: runningNow().map((x) => x.taskId) });
+      codexTaskTools:CODEX_TASK_TOOLS, allowLogin: !!DB.allowLogin, loginTasks: DB.tasks.filter(usesLogin).map((t) => t.id), fx: await Promise.race([usdCny().catch(() => null), new Promise((r) => setTimeout(() => r(null), 1500))]),   // 汇率：中文界面把美元花费换成人民币；取不到就照美元
+      running: [...new Set([...FIRING,...[...RUNNING.values()].map(x=>x.taskId),...QUEUE.map(q=>q.sched?.taskId).filter(Boolean)])] });
   }
   if (p === "/api/sched" && req.method === "POST") {
     const b = await body();
@@ -685,39 +700,42 @@ export async function routeSched(req, res, u, p) {
   const sub = m[2] || "";
   if (!sub && req.method === "GET") {
     const mine = RUNLOG.filter((r) => r.taskId === t.id);
-    // runsTotal：界面只拿到最近 100 次，据此说「只列出最近 100 次」（#178-3）
-    return sendJson(res, 200, { task: summary(t), runs: mine.slice(-100).reverse().map(({ full, ...r }) => (r.sid ? r : { ...r, full })), runsTotal: mine.length, running: runningNow().some((x) => x.taskId === t.id) });
+    return sendJson(res, 200, { task: summary(t), runs: mine.slice(-100).reverse().map(({ full, ...r }) => (r.sid ? r : { ...r, full })), runsTotal: mine.length, running: taskBusy(t.id) });
   }
   if (!sub && req.method === "PATCH") {
     const b = await body();
-    try { clean(b, {}); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if(taskBusy(t.id)&&Object.keys(b).some(k=>k!=="on"))return sendJson(res,409,{message:"任务正在运行或排队，结束后再修改设置。"});
     const before = { ...t };
-    Object.assign(t, clean(b, t));
+    let next;
+    try { next = b.on === false && Object.keys(b).length === 1 ? { on: false } : clean(b, t); }
+    catch (e) { return sendJson(res, 400, { error: e.message }); }
+    Object.assign(t, next);
     if (b.on === true) { t.pausedUntil = 0; t.skipNext = false; t.skipAt = 0; }
-    if (b.on === false) cancelRetry(t.id);
     refreshNext(t);
-    if (!save()) { for (const k of Object.keys(t)) delete t[k]; Object.assign(t, before); refreshNext(t); return sendJson(res, 500, { ok: false, error: "write_failed", message: tz("没保存上：存储满了或没有权限") }); }
+    if (!save()) {
+      for (const k of Object.keys(t)) delete t[k];
+      Object.assign(t, before); refreshNext(t);
+      return sendJson(res, 500, { ok: false, error: "write_failed", message: tz("没保存上：存储满了或没有权限") });
+    }
+    if (b.on === false) cancelRetry(t.id);
     return sendJson(res, 200, { ok: true, task: summary(t) });
   }
   if (!sub && req.method === "DELETE") {
-    // 正在跑：删了的话这一次的记录、命名、通知、不存对话的回收都没人做了（#178-8）
-    if (runningNow().some((x) => x.taskId === t.id)) return sendJson(res, 409, { error: tz("任务正在跑：等它跑完，或先在对话里停掉，再删") });
-    cancelRetry(t.id);
+    if(taskBusy(t.id))return sendJson(res,409,{message:"任务正在运行或排队，结束后再删除。"});
     const tasks0 = DB.tasks, missed0 = DB.missed;
     DB.tasks = DB.tasks.filter((x) => x.id !== t.id); DB.missed = DB.missed.filter((x) => x.taskId !== t.id);
-    if (!save()) { DB.tasks = tasks0; DB.missed = missed0; return sendJson(res, 500, { ok: false, error: "write_failed", message: tz("没保存上：存储满了或没有权限") }); }
+    if (!save()) {
+      DB.tasks = tasks0; DB.missed = missed0; pushNext();
+      return sendJson(res, 500, { ok: false, error: "write_failed", message: tz("没保存上：存储满了或没有权限") });
+    }
+    cancelRetry(t.id);
     log(`⏰ 删除定时任务「${t.name}」`);
     return sendJson(res, 200, { ok: true });
   }
   if (sub === "/run" && req.method === "POST") {
     const b = await body();
-    // 同一任务手动跑还没结束（在排队或在跑）就别再起一次：连点会重复执行、重复花钱（审查 E05 / v0.5.3 B5）
-    if (MANUAL.has(t.id) || runningNow().some((r) => r.taskId === t.id)) return sendJson(res, 409, { error: tz("这个任务已经在跑了") });
-    MANUAL.add(t.id);
-    const go = fire(t, { reason: "manual", trial: !!b.trial }).finally(() => MANUAL.delete(t.id));
-    // 有对话在跑时 fire 会排队等最多 30 分钟：别让请求一直挂着，先回「已排队」
-    const item = await Promise.race([go, new Promise((r) => setTimeout(() => r("queued"), 3000))]);
-    if (item === "queued") return sendJson(res, 200, { ok: true, queued: true });
+    const item = await fire(t, { reason: "manual", trial: !!b.trial });
+    if(item?.error)return sendJson(res,item.error.status||409,{ok:false,message:item.error.message});
     return sendJson(res, 200, { ok: !!item, id: item && item.id });
   }
   if (sub === "/pause" && req.method === "POST") {

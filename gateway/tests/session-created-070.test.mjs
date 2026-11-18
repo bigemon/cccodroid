@@ -143,6 +143,7 @@ function runHello(helloCount, resume, dropped) {
     applyState() {}, beginReplay() {}, updateCtx() {}, renderSessions() {}, loadOlder() {}, showWelcome() {}, renderInterrupted() {}, calmStatus() {}, refreshSessModel() {},
     isBusy: () => false, setStatus() {}, intrList: () => [],
     draftSwap() {}, loadSessions: () => { calls.sessions++; },
+    isCodexView:()=>false,paintBackend(){},paintSessionStatus(){},qbLoad:async()=>{},document:{getElementById:()=>null},
   };
   vm.runInNewContext(
     take(sessionSource, "  function resetView(", "  /** 打开某个会话") +

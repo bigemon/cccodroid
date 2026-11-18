@@ -26,7 +26,7 @@ test("上一任排着一条带会话的消息：网关照常起来，消息放�
   let out = "";
   child.stdout.on("data", (d) => { out += d; }); child.stderr.on("data", (d) => { out += d; });
   let code = null; child.on("exit", (c) => { code = c; });
-  for (let i = 0; i < 150 && code === null && !/网关 v3 已启动/.test(out); i++) await new Promise((r) => setTimeout(r, 100));
+  for (let i = 0; i < 150 && code === null && !/排队的 1 条消息已放回队列/.test(out); i++) await new Promise((r) => setTimeout(r, 100));
   child.kill("SIGKILL");
   assert.equal(code, null, "网关退出了：\n" + out);
   assert.match(out, /网关 v3 已启动/, out);

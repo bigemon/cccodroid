@@ -14,6 +14,8 @@ import { SETTINGS } from "./settings-store.mjs";
 import { cachedModels, effortLevelsOf, normEffort } from "./models.mjs";
 import { projectById, projectDefaults, projectOfDir } from "./projects.mjs";
 import { findSessionFile, peekSession } from "./sessions.mjs";
+import { isCodexSession } from "./codex/store.mjs";
+import { checkModel, codexEffective, setCodexSessionModel } from "./codex/catalog.mjs";
 import { onShutdown } from "./crashguard.mjs";
 
 const FILE = path.join(CFG.home, "ccapp-session-models.json");
@@ -131,11 +133,28 @@ export async function routeSessModel(req, res, u, p) {
   if (p !== "/api/session-model") return NEXT;
   if (req.method === "GET") {
     const q = (k) => (u.searchParams.has(k) ? u.searchParams.get(k) : null);
-    return sendJson(res, 200, effectiveModel(q("id") || "", q("project"), { provider: q("provider"), model: q("model"), effort: q("effort") }));
+    // ── Codex 会话：读 Codex 自己的记录，不碰 Claude 的会话模型表（P6-E2）──
+    const sid = q("id") || "";
+    const beAsked = q("backend");
+    if (beAsked === "codex" || (!beAsked && sid && isCodexSession(sid))) {
+      return sendJson(res, 200, await codexEffective(sid, { model: q("model"), effort: q("effort"), projectId: q("project") }));
+    }
+    return sendJson(res, 200, effectiveModel(sid, q("project"), { provider: q("provider"), model: q("model"), effort: q("effort") }));
   }
   if (req.method === "POST") {
     let b = {};
     try { b = JSON.parse((await readBody(req)) || "{}"); } catch {}
+    // ── Codex 会话：只写 Codex 索引；下一轮 turn/start 生效 ──
+    if (b.id && isCodexSession(String(b.id))) {
+      if (typeof b.model === "string" && b.model) {
+        const v = await checkModel(b.model);
+        if (!v.ok) {
+          return sendJson(res, 400, { error: v.code || "codex_model_unavailable", message: v.message, available: v.available || [] });
+        }
+      }
+      setCodexSessionModel(String(b.id), b);
+      return sendJson(res, 200, { ok: true, ...(await codexEffective(String(b.id))) });
+    }
     const patch = {};
     if (typeof b.model === "string") patch.model = b.model.trim().slice(0, 200);
     if (typeof b.effort === "string") patch.effort = b.effort.trim().slice(0, 20);

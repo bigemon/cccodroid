@@ -149,13 +149,18 @@
     }
     const narrow = pagesNarrow(), cats = [...document.querySelectorAll("#set-cats [data-cat]")];
     // 一类里一项都没显示（比如开发端没有通知 / 更新）就连分类一起藏起来
-    const empty = (k) => ![...document.querySelectorAll(`.set-cat[data-cat="${k}"] > :is(.srow, .sblock)`)].some((f) => !f.classList.contains("hidden"));
+    const empty = (k) => ![...document.querySelectorAll(`.set-cat[data-cat="${k}"] > :is(.srow, .sblock, [data-core-panel])`)].some((f) => !f.classList.contains("hidden"));
     cats.forEach((b) => b.classList.toggle("hidden", empty(b.dataset.cat)));
     if (!narrow && (!setCatOpen || empty(setCatOpen))) setCatOpen = "general";
     $("tab-settings").classList.toggle("set-list", narrow && !setCatOpen);
     $("tab-settings").classList.toggle("set-one", narrow && !!setCatOpen);
+    $("tab-settings").classList.toggle("remote-open", setCatOpen === "remote");
     cats.forEach((b) => b.classList.toggle("on", b.dataset.cat === setCatOpen));
     // 每次进「更新」这一类都重新查一遍（不只读上回的结果）；离开再进来才算一次
+    if (setCatOpen === "remote") {
+      const frame = $("remote-settings-frame");
+      if (frame && !frame.getAttribute("src")) frame.src = "/api/remote/page";
+    }
     if (setCatOpen === "update" && setCatShown !== "update") updOnOpen();
     if (setCatOpen === "storage" && setCatShown !== "storage") stOnOpen();
     if (setCatShown !== "-" && setCatShown !== setCatOpen) {

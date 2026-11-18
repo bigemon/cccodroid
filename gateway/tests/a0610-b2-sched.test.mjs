@@ -211,3 +211,27 @@ test("保存失败：POST /api/sched 回 500 write_failed，任务不留在内�
     assert.equal(S.DB.tasks.some((t) => t.name === "写不进"), false);
   } finally { fs.rmSync(file, { recursive: true, force: true }); fs.writeFileSync(file, old); }
 });
+
+
+test("存储写失败：修改、关闭与删除任务均返回失败，并保留原任务", async () => {
+  const base = `http://127.0.0.1:${srv.address().port}/api/sched`;
+  const created = await fetch(base, { method: "POST", body: JSON.stringify({ name: "持久化回滚", prompt: "原始任务", on: true, freq: { kind: "daily", time: "09:00" } }) });
+  assert.equal(created.status, 200);
+  const id = (await created.json()).task.id;
+  const task = S.DB.tasks.find(t => t.id === id), file = path.join(CFG.home, "ccapp-sched.json"), bytes = fs.readFileSync(file);
+  const originalOn = task.on;
+  fs.rmSync(file); fs.mkdirSync(file);
+  try {
+    for (const [method, patch] of [["PATCH", { prompt: "不能生效" }], ["PATCH", { on: false }], ["DELETE", {}]]) {
+      const r = await fetch(base + "/" + id, { method, body: JSON.stringify(patch) });
+      assert.equal(r.status, 500);
+      assert.equal((await r.json()).error, "write_failed");
+      assert.equal(S.DB.tasks.find(t => t.id === id), task);
+      assert.equal(task.prompt, "原始任务");
+      assert.equal(task.on, originalOn);
+    }
+  } finally {
+    fs.rmSync(file, { recursive: true, force: true }); fs.writeFileSync(file, bytes);
+    await fetch(base + "/" + id, { method: "DELETE" });
+  }
+});

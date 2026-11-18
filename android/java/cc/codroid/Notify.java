@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.util.Log;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -25,7 +26,7 @@ import org.json.JSONObject;
  *   等权限确认 / 计划批准 / 选择题 → 单独一个渠道的通知，带命令摘要（不弹横幅）。
  * 通知里只放「拒绝」和「打开查看」：通知只能显示截断的摘要，看不全的命令不该在这里放行。
  *
- * 数据来源：订阅网关的事件流（/api/events），网关协议不动。每条 state 事件都带当前全部待确认项，
+ * 数据来源：订阅网关事件流（/api/events）；完成时优先 finalText，旧网关回退到本轮提问。每条 state 事件都带当前全部待确认项，
  * 和已发出的通知比对 —— 新的发、答掉的撤，断线重连或重放都不会重复。
  * 跑在 GatewayService 里：界面被关了、只剩前台服务时也能发。
  */
@@ -34,7 +35,7 @@ final class Notify {
     static final String CH_DONE = "done", CH_ASK = "ask";
     static final String ACTION_DENY = "cc.codroid.PERM_DENY";
     static final String ACTION_OPEN = "cc.codroid.OPEN_SESSION";
-    private static final int ID_DONE = 50;           // 完成通知只留最新一条
+    private static final int ID_DONE = 50;           // 没有会话号时的完成通知
     private static final String TAG_ASK = "ask";
     private static final String TAG_DONE = "done";     // 确认通知按 tag + 请求号区分
 
@@ -174,6 +175,7 @@ final class Notify {
                     onState(ev);
                 }
                 else if ("run_start".equals(type)) runText.put(ev.optString("runId"), clip(ev.optString("text"), RUN_TEXT_CHARS));
+                else if ("inject".equals(type)) runText.put(ev.optString("runId"), ev.optString("text"));
                 else if ("run_end".equals(type)) onRunEnd(ev);
                 else if ("sched_note".equals(type)) onSchedNote(ev);
                 else if ("sched_next".equals(type)) SchedAlarm.set(ctx, ev.optLong("at"));
@@ -192,7 +194,8 @@ final class Notify {
         for (int k = 0; k < runs.length(); k++) {
             JSONObject run = runs.optJSONObject(k);
             if (run == null) continue;
-            runText.put(run.optString("id"), clip(run.optString("text"), RUN_TEXT_CHARS));
+            // state 的 text 是原始提问，不能覆盖已经收到的插话。
+            if (!runText.containsKey(run.optString("id"))) runText.put(run.optString("id"), clip(run.optString("text"), RUN_TEXT_CHARS));
             JSONArray ps = run.optJSONArray("perms");
             if (ps != null) for (int i = 0; i < ps.length(); i++) {
                 JSONObject p = ps.optJSONObject(i);
@@ -217,7 +220,9 @@ final class Notify {
 
     private void onRunEnd(JSONObject ev) {
         String runId = ev.optString("runId");
-        String text = runText.remove(runId);
+        String prompt = runText.remove(runId);
+        String text = ev.optString("finalText", "").trim();
+        if (text.isEmpty()) text = prompt;
         // 只撤这一轮的确认项：别的会话可能还在等（紧跟着的 state 事件会再对齐一次）
         for (java.util.Iterator<JSONObject> it = pending.values().iterator(); it.hasNext(); )
             if (runId.equals(it.next().optString("runId"))) it.remove();
@@ -228,8 +233,12 @@ final class Notify {
         if (ev.optBoolean("sched")) return;
         if (ev.optBoolean("aborted") || !ev.optString("auto").isEmpty() || MainActivity.visible || !doneOn()) return;
         // 网关的 run_end 用 failed / isError 表示没成（审查 #105 06-004：以前只看 error 字段，网关从来不带，一律报「已完成」）
-        boolean failed = ev.optBoolean("failed") || ev.optBoolean("isError") || ev.has("error") && !ev.isNull("error");
         String sid = sidOf(ev);
+        if (MainActivity.visible) {
+            nm.cancel(TAG_DONE, sid.isEmpty() ? ID_DONE : sid.hashCode());
+            return;
+        }
+        boolean failed = ev.optBoolean("failed") || ev.optBoolean("isError") || (ev.has("error") && !ev.isNull("error"));
         // 每个会话各留最新一条：并行时几个会话先后跑完，不互相顶掉
         nm.notify(TAG_DONE, sid.isEmpty() ? ID_DONE : sid.hashCode(), new Notification.Builder(ctx, CH_DONE)
             .setSmallIcon(android.R.drawable.stat_notify_chat)

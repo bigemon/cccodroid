@@ -2,10 +2,12 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { CFG, LAST_LANG, PATHS, log, tr, tz, permModeAction } from "./config.mjs";
+import { saveSettings } from "./settings-store.mjs";
+import { publish } from "./bus.mjs";
+import { PERM_MODES, PROVIDER, billAfterRun, keyOf, noteTokens, providerById, noteTokenDelta, providersDiskCheck } from "./providers.mjs";
+import { ALIAS_SEEN, effortLevelsOf, fetchModels, isLoginMode, normEffort, modelsCached } from "./models.mjs";
+import { claudeCmd, claudeEnv, currentModelInfo, ensureBridge, settingsArgs, bridgeSwitching, claudeAtLeast, safeModePerm } from "./claude.mjs";
 import { SETTINGS, capList, settingsDiskCheck } from "./settings-store.mjs";
-import { PERM_MODES, PROVIDER, billAfterRun, keyOf, noteTokenDelta, providerById, providersDiskCheck } from "./providers.mjs";
-import { ALIAS_SEEN, effortLevelsOf, fetchModels, isLoginMode, modelsCached, normEffort } from "./models.mjs";
-import { bridgeSwitching, claudeAtLeast, claudeCmd, claudeEnv, currentModelInfo, ensureBridge, safeModePerm, settingsArgs } from "./claude.mjs";
 import { tasksCheck } from "./goal.mjs";
 import { setLastInit } from "./caps.mjs";
 import { RUNS, SESSIONS, rememberSession, runFlag, runList } from "./runs.mjs";
@@ -23,6 +25,12 @@ import { SUBAGENT_HINT, agentBook, takeAgentNote, putAgentNote, onShared, privat
 import { findSessionFile, peekSession } from "./sessions.mjs";
 import { projectById, projectDefaults, projectOfDir } from "./projects.mjs";
 import { sessLostProvider, sessModel, sessProvider, setSessModel } from "./sessmodel.mjs";
+import { codexScreenWitness } from "./codex/screen-witness.mjs";
+import { codexStartRun } from "./codex/run.mjs";
+import { validCodexMode } from "./codex/permissions.mjs";
+import { getCodexSession, touchCodexSession } from "./codex/store.mjs";
+import { registerChild, unregisterChild } from "./instances.mjs";
+
 import { noteManaged } from "./sessmanaged.mjs";
 import { inlineImages, inlineImagesSync, wantsInline } from "./inlineimg.mjs";
 import { pathWatch, previewHint, putPathNote, settlePathNote, takePathNote } from "./pathnote.mjs";
@@ -95,7 +103,7 @@ export function privWitness(anc, top) {
     if (!c || !c.pid || !run.privTok || c.exitCode !== null || c.signalCode !== null) continue;
     if (anc === process.pid ? top === c.pid : anc === c.pid || (run.claudePid > 0 && anc === run.claudePid)) return run.privTok;
   }
-  return "";
+  return codexScreenWitness(anc, top);
 }
 
 // 工具确认进日志只记参数多长，不记原文：命令、路径、网址可能带着用户的业务内容，诊断包里不该有（审查 v0.5.20 08-001）
@@ -237,14 +245,24 @@ SWALLOW_HOOKS.push((sid, msg, kind) => {
 });
 
 export async function startRun(item) {
-  const { sid0, pdef0, P } = pickProvider(item);
-  const KEY = keyOf(P);
+  // 跟的那条被撤销了也照样接上车道上首条跑出来的会话（#120-1），不然会另起一个会话
+  const sid0 = sidForItem(item);
+  const pdef0 = projectDefaults(item.projectId ? projectById(item.projectId) : projectOfDir(cwdPath(cwdOf(item, sid0))));
+  const rec0 = sessModel(sid0);
+  const P = item.backend==="codex" ? {id:"codex"} : (item.provider && providerById(item.provider))
+    || (item.pin && item.pin.provider && providerById(item.pin.provider))
+    || (rec0 && rec0.model != null ? sessProvider(sid0) : null)
+    || (pdef0.provider && providerById(pdef0.provider))
+    || sessProvider(sid0);
+  const KEY = item.backend==="codex" ? null : keyOf(P);
   const run = {
     id: item.id,
     text: item.message,
-    // 跟在一个还没拿到会话号的新会话后面排队的：等前一条 init 了再接上它的会话；
-    // 跟的那条中途被撤销、从没启动时，按车道找回首条已经跑出来的会话（#120-1）
-    sessionId: sidForItem(item),
+    // 会话绑定后端；分派在做完公共初始化（RUNS/lane/run_start）之后、Claude 专属逻辑之前
+    // 队列已经把后端解析好（含冲突/未知会话的拒绝）；直接 startRun 的调用方缺省 claude
+    backend: item.backend || "claude",
+    // 跟在一个还没拿到会话号的新会话后面排队的：等前一条 init 了再接上它的会话
+    sessionId: sid0,
     follow: item.follow,
     cid: item.cid,
     auto: item.auto || null,           // "idle" = 网关自己发起的空闲压缩（界面画成系统提示，不发通知）
@@ -274,6 +292,17 @@ export async function startRun(item) {
   const emit = (ev) => runEmit(run, ev);
   emit({ type: "run_start", text: run.text, sessionId: run.sessionId, follow: run.follow, cid: run.cid, startedAt: run.startedAt, ...(run.auto ? { auto: run.auto } : {}) });
   publishState();
+
+  // ── Backend 分派（P6-B1）────────────────────────────────────────────
+  // 公共 Run 初始化已完成；Claude 专属的厂商/模型/argv/spawn 从这里往下才发生。
+  // Codex 走自己的实现，但共用 RUNS / 车道 / runEmit / SSE / endRun。
+  if (run.backend === "codex") {
+    run.preSpawn = false;
+    return codexStartRun(run, item, {
+      emit: (ev) => runEmit(run, ev),
+      finish: (fields) => endRun(run, fields),
+    });
+  }
 
   const message = run.text;
   const local = message.trim().match(LOCAL_CMD_RE);
@@ -558,6 +587,7 @@ export async function startRun(item) {
     detached: true,            // 当进程组长，中断时好整组带走（见 killTree）
   });
   run.child = child; run.preSpawn = false;
+  registerChild(child.pid, "claude");
   // 首字前分段（F6）：准备（起进程前那些等待）→ 启动并连工具（到 claude 的 init）→ 等端口（到第一条 message_start）
   run.tBoot = Date.now();
   emit({ type: "phase", phase: "boot" });
@@ -741,8 +771,8 @@ export async function startRun(item) {
         return;
       }
       // 全部放行时 claude 不该再来问；来了（子代理没继承到模式之类）就直接放行，必须由人回答的（AskUserQuestion 等）照问。
-      // 敏感操作再确认的卡片例外：那是专门为全部放行加的一道兜底
-      if (run.permMode === "bypassPermissions" && !p.interactive && !HUMAN_TOOLS.has(p.tool) && !p.guard) {
+      // 用户明确选择全部放行时，应用的敏感操作 ask 同样放行；交互问题仍由用户回答。
+      if (run.permMode === "bypassPermissions" && !p.interactive && !HUMAN_TOOLS.has(p.tool)) {
         log(`✓ 全部放行，自动允许 ${p.tool}${p.agentId ? "（子代理）" : ""} ${argLen(p.input)}`);
         writeCtl({ type: "control_response", response: { subtype: "success", request_id: id, response: { behavior: "allow", updatedInput: p.input } } });
         return;
@@ -990,8 +1020,6 @@ export async function startRun(item) {
     if (/error|Error|failed|ENOENT|EACCES/.test(s)) log(`${runTag(run)} [claude!] ${s.trim().slice(0, 300)}`);
   });
 
-  // 收尾时把没送达的插话/斜杠命令退回队列。抽成函数，强制收尾路径（queue.abortRun）也要用，
-  // 否则 5 秒兜底直接 endRun 会把已经写进 stdin 的消息静默丢掉（审查 11-05）
   const requeuePending = () => {
     if (run.pendingInject.length) {
       log(`插话 ${run.pendingInject.length} 条没来得及送达，退回队首`);
@@ -1008,6 +1036,7 @@ export async function startRun(item) {
   run.requeuePending = requeuePending;
 
   const finish = (code, signal) => {
+    unregisterChild(child.pid);
     if (buf.trim()) feed(buf.trim());
     buf = "";
     noteSessionFile("finish");           // 记录只在退出前才落盘的情况：收尾前再核一次
@@ -1063,7 +1092,8 @@ export async function startRun(item) {
         // 本地命令（/context /cost …）的结果正文在这里
         localCommand: localCmd,
         resultText: localCmd ? String(lastResult.result || "") : "",
-        ...(run.sched ? { finalText: String(lastResult.result || "").slice(0, 4000), costRaw: P.nativeModels ? Number(lastResult.total_cost_usd || 0) : 0 } : {}),
+        finalText: String(lastResult.result || "").slice(0, 4000),
+        ...(run.sched ? { costRaw: P.nativeModels ? Number(lastResult.total_cost_usd || 0) : 0 } : {}),
       });
     }
     const hint = code !== 0 || signal ? exitHint(code, signal) : tz("生成结束但没有返回结果");
@@ -1073,8 +1103,9 @@ export async function startRun(item) {
   };
 
   child.on("error", (e) => {
-    log(`${runTag(run)} spawn 出错: ${e.message}`);
+    unregisterChild(child.pid);
     run.giveNotesBack?.();
+    log(`${runTag(run)} spawn 出错: ${e.message}`);
     emit({ type: "error", message: tr(LAST_LANG, tz("无法启动 claude：{err}", { err: e.message })) });
     endRun(run, { failed: true });
   });
@@ -1121,19 +1152,34 @@ export async function routeRun(req, res, u, p) {
     // 不带 runId（通知里的「拒绝」）就按请求号找它属于哪一轮
     const run = b.runId ? RUNS.get(String(b.runId)) || null : runList().find((r) => r.perms && r.perms.has(String(b.id || ""))) || null;
     if (!run || !run.answerPerm) return sendJson(res, 409, { error: "gone", message: tz("这一轮已经结束了") });
-    if (!run.answerPerm(String(b.id || ""), {
+    const answer = {
       behavior: b.behavior === "allow" ? "allow" : "deny",
       message: b.message, interrupt: !!b.interrupt, always: !!b.always,
       answers: b.answers, mode: b.mode ? String(b.mode) : null,
-    })) return sendJson(res, 409, { error: "gone", message: tz("这项已经回答过了") });
+    };
+    if (run.validatePermAnswer && !run.validatePermAnswer(String(b.id || ""), answer)) return sendJson(res, 400, { error: "invalid_answers", message: "请完整回答所有问题，或取消这次提问。" });
+    if (!run.answerPerm(String(b.id || ""), answer)) return sendJson(res, 409, { error: "gone", message: tz("这项已经回答过了") });
     return sendJson(res, 200, { ok: true });
   }
   if (req.method === "POST" && p === "/api/perm/mode") {
     const b = JSON.parse((await readBody(req)) || "{}");
-    const r = setPermMode(String(b.mode || ""));
-    if (!r) return sendJson(res, 400, { error: "bad mode" });
-    // mode 是实际生效的（安全模式下可能被退回 default），wanted 是用户选的；saved=false 时这次切换重启后会丢（195-A.6）
-    return sendJson(res, 200, { ok: true, mode: r.mode, wanted: SETTINGS.permissionMode, saved: r.saved, live: RUNS.size > 0 });
+    if (b.backend === "codex") {
+      const mode = String(b.mode || "");
+      if (!validCodexMode(mode)) return sendJson(res, 400, { error: "unsupported_mode", message: "Codex 不支持这个宿主权限模式。" });
+      const sid = b.sessionId ? String(b.sessionId) : null;
+      if (sid && !getCodexSession(sid)) return sendJson(res, 404, { error: "unknown_session" });
+      const live = sid ? runList().filter(r => r.backend === "codex" && r.sessionId === sid) : [];
+      if(live.some(r=>r.unattended))return sendJson(res,409,{message:"定时任务按自己的权限设置运行，结束后再修改会话模式。"});
+      if(live.some(r=>(mode==="auto")!==(r.permMode==="auto")))return sendJson(res,409,{error:"auto_mode_busy",message:"自动判断需要在本轮结束后切换，请先停止或等待完成。"});
+      for (const r of live) if (!r.setMode || !r.setMode(mode)) return sendJson(res, 409, { error: "tool_running", message: "正在执行的工具不能撤回，请先停止或等待完成后再切换模式。" });
+      if (sid) touchCodexSession(sid, { permissionMode: mode });
+      else { SETTINGS.codex = { ...(SETTINGS.codex || {}), permissionMode: mode }; saveSettings(); }
+      publish({ type: "perm_mode", backend: "codex", sessionId: sid, mode });
+      publishState();
+      return sendJson(res, 200, { ok: true, backend: "codex", mode, live: live.length > 0, coreModePending: live.length > 0 });
+    }
+    if (!setPermMode(String(b.mode || ""))) return sendJson(res, 400, { error: "bad mode" });
+    return sendJson(res, 200, { ok: true, mode: SETTINGS.permissionMode, live: RUNS.size > 0 });
   }
   if (req.method === "POST" && p === "/api/task/stop") {
     const b = JSON.parse((await readBody(req)) || "{}");

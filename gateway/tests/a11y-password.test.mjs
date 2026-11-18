@@ -15,7 +15,8 @@ test("读屏：密码框的内容和描述在输出之前清掉，框照样列�
   const clear = w.indexOf("if (pw) { text = null; desc = null; }"), firstOut = w.indexOf("out.append");
   assert.ok(w.includes("n.isPassword()"), "要看 isPassword");
   assert.ok(clear > 0 && clear < firstOut, "内容和描述都要在第一次 out.append 之前清掉");
-  assert.match(w, /boolean useful = all \|\| pw \|\|/, "密码框不管能不能点都要列出来");
+  assert.match(w, /boolean semantic = pw \|\|/, "密码框自身是可展示节点");
+  assert.match(w, /boolean useful = all \|\| semantic;/, "密码框不管能不能点都要列出来");
   assert.match(w, /if \(pw\) out\.append\(" password"\)/);
   assert.equal((w.match(/getText\(\)/g) || []).length, 1, "walk 里只能在开头读一次 getText");
 });

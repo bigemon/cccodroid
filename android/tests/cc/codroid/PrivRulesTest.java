@@ -17,7 +17,33 @@ public final class PrivRulesTest {
         if (PrivRules.namesSelf(cmd, "cc.codroid") != expect) { fail++; System.out.println("FAIL namesSelf " + expect + "：" + cmd); }
     }
 
+    static void selfQuery(boolean expected, String... argv) {
+        boolean actual = PrivRules.readOnlySelfQuery(argv, false, "/");
+        if (actual != expected) { fail++; System.out.println("FAIL readOnlySelfQuery " + expected + ": " + String.join(" ", argv)); }
+    }
+
     public static void main(String[] a) {
+        selfQuery(true, "/system/bin/sh", "-c", "dumpsys package cc.codroid");
+        selfQuery(true, "/system/bin/dumpsys", "package", "cc.codroid");
+        selfQuery(true, "/system/bin/sh", "-c", "pm path moe.shizuku.privileged.api");
+        selfQuery(true, "/system/bin/sh", "-c", "pm list packages cc.codroid");
+        selfQuery(true, "/system/bin/sh", "-c", "cmd package path cc.codroid");
+        selfQuery(true, "/system/bin/sh", "-c", "appops get cc.codroid");
+        selfQuery(false, "/system/bin/sh", "-c", "am force-stop cc.codroid");
+        selfQuery(false, "/system/bin/sh", "-c", "am set-bg-restriction-level cc.codroid restricted");
+        selfQuery(false, "/system/bin/sh", "-c", "pm uninstall cc.codroid");
+        selfQuery(false, "/system/bin/sh", "-c", "pm revoke cc.codroid android.permission.POST_NOTIFICATIONS");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys deviceidle whitelist +cc.codroid");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys package cc.codroid; am force-stop cc.codroid");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys package cc.codroid > /sdcard/a.txt");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys package $(cat /sdcard/pkg)");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys clipboard cc.codroid");
+        selfQuery(false, "/sdcard/dumpsys", "package", "cc.codroid");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys package cc.codroid --unknown-option");
+        selfQuery(false, "/system/bin/sh", "-c", "dumpsys unknown-service cc.codroid");
+        if (PrivRules.readOnlySelfQuery(new String[]{"dumpsys", "package", "cc.codroid"}, true, "/")) {
+            fail++; System.out.println("FAIL custom env must not skip self protection");
+        }
         // 11-04 报告 A3：am start 成功也有输出
         if (!PrivRules.amStarted(0, "Starting: Intent { cmp=cc.codroid/.MainActivity }")) { fail++; System.out.println("FAIL amStarted 成功输出"); }
         if (!PrivRules.amStarted(0, "Warning: Activity not started, its current task has been brought to the front")) { fail++; System.out.println("FAIL amStarted 已在前台"); }

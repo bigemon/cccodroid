@@ -123,9 +123,9 @@ const PAIRS = [
   ["--ok", "--bg", MINOR, "成功"], ["--err", "--bg", MINOR, "出错"], ["--warn", "--bg", MINOR, "警告"],
   ["--tool", "--bg", MINOR, "工具名"], ["--purple", "--bg", MINOR, "紫色标记"],
   ["--err-fg", "--err-bg", BODY, "错误框"], ["--think-ink", "--bg", MINOR, "思考标题"],
-  // 上下文条的字（#ctxtxt）平常是 --fg2，进度条只有一截、在条的左边；快满 / 满了时字压在暖色 / 红色上，
-  // 字按进度分界线分两色：条上近黑 #111、空白处 --fg（style.css #ctxbar.warn #ctxtxt），空白处核的是 --fg 对 --bg2
-  ["--fg2", "--bg2", MINOR, "上下文条的字"],
+  // 上下文文字使用实心 --fg 与 --bg 细轮廓，所有用量/额度文字一致；
+  // 核验文字与相邻轮廓的对比度，背景渐变不再通过透明文字填充。
+  ["--fg", "--bg", BODY, "上下文文字与轮廓"],
 ];
 
 let fail = 0, warn = 0;

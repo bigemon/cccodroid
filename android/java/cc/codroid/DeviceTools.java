@@ -60,7 +60,7 @@ final class DeviceTools {
     static void a11yConfirmed(Context c, String mode, boolean on) {
         if (on) Consent.grant(c, Consent.DEV_ON, "1");
         if (mode.equals("auto") || mode.equals("on")) Consent.grant(c, Consent.DEV_A11Y, mode);
-        if (mode.equals("on")) new Thread(() -> A11y.enable(c, 4000)).start();
+        // MainActivity checks the service connection after the confirmed choice and reports system restrictions.
     }
     static boolean on(Context c) { return Consent.on(c, Consent.DEV_ON); }
     /** 读屏模式：off / auto（用时自动开）/ on（常开） */
@@ -86,6 +86,7 @@ final class DeviceTools {
         for (String s : SCREEN) tools.put(new JSONObject().put("name", s).put("enabled", !off.contains(s)).put("screen", true));
         return new JSONObject().put("ok", true)
             .put("on", on(c))
+            .put("noaskScreen", Priv.noAskScreen())
             .put("tools", tools)
             .put("a11y", new JSONObject()
                 .put("mode", mode)
@@ -99,7 +100,7 @@ final class DeviceTools {
         SharedPreferences.Editor e = sp(c).edit();
         // 打开总开关同样要用户在原生对话框里点头（这条设置经网关谁都能发，被带偏的模型、混进来的脚本都行）
         boolean askOn = r.has("on") && r.getBoolean("on") && !on(c);
-        if (r.has("on") && !r.getBoolean("on")) Consent.revoke(c, Consent.DEV_ON);
+        if (r.has("on") && !r.getBoolean("on")) { Consent.revoke(c, Consent.DEV_ON); Consent.revoke(c, Consent.NOASK_SCREEN); }
         if (r.has("tool") && known(r.getString("tool"))) {
             Set<String> off = new HashSet<>(sp(c).getStringSet("off", new HashSet<>()));
             if (r.optBoolean("enabled", true)) off.remove(r.getString("tool")); else off.add(r.getString("tool"));
@@ -111,13 +112,13 @@ final class DeviceTools {
         // 之后谁发一条 dev_set 都能静默切到常开）。这条设置能经网关改，被带偏的模型也改得了；对话框只能在 App 前台弹，后台发起的直接没下文
         boolean ask = (mode.equals("auto") || mode.equals("on")) && !mode.equals(a11yMode(c));
         if (ask || askOn) {
-            try { c.startActivity(MainActivity.internal(c, MainActivity.ACTION_A11Y_OK).putExtra("mode", ask ? mode : "").putExtra("on", askOn)
-                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)); } catch (Exception ignored) {}
+            String why = MainActivity.requestA11yConfirmation(ask ? mode : "", askOn);
+            if (why != null) return status(c).put("ok", false).put("message", why);
         }
-        if (mode.equals("off")) Consent.revoke(c, Consent.DEV_A11Y);
+        if (mode.equals("off")) { Consent.revoke(c, Consent.DEV_A11Y); Consent.revoke(c, Consent.NOASK_SCREEN); }
         e.commit();
         JSONObject res = status(c);
-        if (ask || askOn) { res.put("message", Tr.t("请在弹出的对话框里确认")); return res; }
+        if (ask || askOn) { res.put("pendingConfirmation", true).put("message", Tr.t("请在弹出的对话框里确认")); return res; }
         // 切到「常开」就马上开；切到「关」就马上关；「用时自动开」现在开着就让它按空闲时间自己关
         if (mode.equals("on")) { String why = A11y.enable(c, 4000); res = status(c); if (why != null) res.put("message", why); }
         if (mode.equals("off")) { A11y.disable(c); res = status(c); }

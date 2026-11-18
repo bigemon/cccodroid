@@ -1,4 +1,11 @@
 import fs from "node:fs";
+import { forkCodexSession } from "./codex/fork.mjs";
+import {deleteCodexHistory} from "./codex/history-delete.mjs";
+import { historyPage, recoverCodexHistory } from "./codex/history.mjs";
+import { QUEUE, RUN_SESSIONS } from "./queue.mjs";
+import { commandHistory } from "./codex/commands.mjs";
+import { planTasks, visiblePlan } from "./codex/progress.mjs";
+import {visibleSubagent} from "./codex/subagents.mjs";
 import path from "node:path";
 import crypto from "node:crypto";
 import readline from "node:readline";
@@ -13,7 +20,9 @@ import { chapterView } from "./archive-core.mjs";
 import { incompleteItem } from "./incomplete.mjs";
 import { runOfSession } from "./runs.mjs";
 import { archiveBrief, archiveDb, archivedTitle } from "./archive-store.mjs";
-import { NEXT, readBody, sendJson } from "./http.mjs";
+import { getCodexSession, listCodexSessions, readHistory, codexTrashMeta } from "./codex/store.mjs";
+import { searchCodexSessions } from "./codex/search.mjs";
+import { NEXT, readBody, readBodyBuf, sendJson } from "./http.mjs";
 import { isInjected } from "./integrity.mjs";
 import { isObj, loadState, saveState } from "./statefile.mjs";
 import { looksBackground } from "./sessmanaged.mjs";
@@ -147,16 +156,15 @@ function peekSessionRaw(file) {
 
 export function listSessions(limit = 150) {
   const found = [];
+  let readError = null;
   let dirs = [];
   try {
     dirs = fs.readdirSync(PATHS.projects, { withFileTypes: true }).filter((d) => d.isDirectory());
   } catch (e) {
-    // 目录还不存在是正常的（刚装、还没跑过会话）；读不了（权限、IO 错误）不能当成空表（FIND-015）
-    if (e.code === "ENOENT") return [];
-    const out = [];
-    out.error = e.code || e.message || "read_failed";
-    out.total = 0;
-    return out;
+    if (e.code !== "ENOENT") readError = e.code || e.message;
+    // 没有 Claude 会话目录不代表没有会话：Codex 的索引在别处，继续往下合并。
+    // （以前这里直接 return []，新装的、只用 Codex 的 HOME 会看不到任何会话。）
+    dirs = [];
   }
 
   for (const d of dirs) {
@@ -200,8 +208,17 @@ export function listSessions(limit = 150) {
       currentProject: meta.cwd === CFG.workspace || meta.cwd === realWorkspace(),
     };
   });
-  out.total = visible.length;
-  return out;
+  // Codex 会话：索引在 ~/.ccapp-codex，字段与上面一致，多一个 backend
+  const codex = listCodexSessions().map((s) => ({
+    ...s,
+    title: NAMES[s.id] || s.title,
+    pinned: PINS[s.id] || 0,
+    renamed: !!NAMES[s.id],
+  }));
+  const merged = [...out, ...codex].sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+  merged.total = visible.length + codex.length;
+  if (readError) merged.error = readError;
+  return merged;
 }
 
 // ── 会话内容搜索 ──
@@ -362,9 +379,12 @@ async function searchSessionsNow(q) {
       pinned: PINS[f.id] || 0, sizeKb: Math.round(f.size / 1024), snippet, count, inTitle,
     });
   }
+  const codex=await searchCodexSessions(needle,{names:NAMES,pins:PINS});
+  results.push(...codex.results);
+  results.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
   const ms = Date.now() - t0;
-  if (ms > 1500) log(`会话搜索 ${files.length} 个文件用了 ${ms}ms`);
-  return { q, results: results.slice(0, 100), total: results.length, ms };
+  if (ms > 1500) log(`会话搜索 ${files.length} 个 Claude 文件及 Codex 记录用了 ${ms}ms`);
+  return { q, results: results.slice(0, 100), total: results.length, ms, partial:codex.partial };
 }
 
 // claude 按工作目录（真实路径）把会话存进 projects/<编码>/：非字母数字换成 -，过长截断加哈希（和 seal.mjs 的记忆目录同一算法）
@@ -450,7 +470,8 @@ export async function routeSessions(req, res, u, p) {
     const ids = b.all ? listTrash().map((m) => m.id) : [].concat(b.ids || []).map(String);
     const n = await purgeTrash(ids);
     log(`回收站：彻底删除 ${n} 个会话`);
-    return sendJson(res, 200, { ok: true, purged: n });
+    const remaining=new Set(listTrash().map(m=>m.id)),failed=ids.filter(id=>remaining.has(id));
+    return sendJson(res, 200, { ok: !failed.length, purged: n, failed });
   }
   if (req.method === "POST" && p === "/api/sessions/export") {
     const b = JSON.parse((await readBody(req)) || "{}");
@@ -459,7 +480,7 @@ export async function routeSessions(req, res, u, p) {
       const r = await exportSessions(ids);
       log(`导出 ${r.count} 个会话 → ${r.file}`);
       return sendJson(res, 200, { ok: true, ...r, shared: !!process.env.CCAPP_SHARED && r.file.startsWith(process.env.CCAPP_SHARED) });
-    } catch (e) { return sendJson(res, 400, { ok: false, message: e.message }); }
+    } catch (e) { return sendJson(res, e.status||400, { ok: false, message: e.message }); }
   }
   if (req.method === "POST" && p === "/api/sessions/import") {
     // 请求体直接落盘、逐条解压写盘（gw/bigfile.mjs），内存不跟包大小走：1 GB 以上的会话也导得进。
@@ -486,6 +507,83 @@ export async function routeSessions(req, res, u, p) {
     const [id, action] = rest.split("/");
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(id || "")) return sendJson(res, 400, { error: "bad session id" });
     const found = findSessionFile(id);
+    if(codexTrashMeta(id))return sendJson(res,req.method==="GET"?404:409,{error:"session_trashed",message:"这个会话在回收站中，请先恢复。"});
+
+    // 置顶是宿主列表元数据，两种核心复用同一份记录与操作。
+    if (req.method === "POST" && action === "pin") {
+      const b = JSON.parse((await readBody(req)) || "{}");
+      const before = PINS[id];
+      if (b.pin === false) delete PINS[id]; else PINS[id] = Date.now();
+      if (!savePins()) { if (before === undefined) delete PINS[id]; else PINS[id] = before; return sendJson(res, 500, { ok: false, error: "write_failed", message: tz("没保存上：存储满了或没有权限") }); }
+      return sendJson(res, 200, { ok: true, pinned: PINS[id] || 0 });
+    }
+
+    // ── Codex 会话（P6-B1）：同形状的 items，别的字段按需要给 ──
+    if (getCodexSession(id)) {
+      if(req.method==="POST"&&getCodexSession(id).historyMutation&&!["recover-history","rename"].includes(action))return sendJson(res,409,{recoveryRequired:true,message:"历史删除尚未完成同步，请先恢复界面历史再继续。"});
+      if(req.method==="POST"&&action==="delmsg"){
+        let body;try{body=JSON.parse((await readBody(req))||"{}");}catch{return sendJson(res,400,{message:"参数无效"});}
+        if(!body||typeof body!=="object"||Array.isArray(body))return sendJson(res,400,{message:"参数无效"});
+        try{return sendJson(res,200,await deleteCodexHistory(id,body));}
+        catch(err){
+          const recoveryRequired=err.recoveryRequired||!!getCodexSession(id)?.historyMutation;
+          return sendJson(res,err.status||502,{message:err.status?err.message:recoveryRequired?"历史删除状态尚未同步，请先恢复界面历史后再继续。":"删除范围核验失败，未确认成功；请稍后重试。",...(recoveryRequired?{recoveryRequired:true,coreChanged:err.coreChanged??"unknown"}:{})});
+        }
+      }
+      if (req.method === "GET" && !action) {
+        const rec = getCodexSession(id);
+        const live = runOfSession(id);
+        let page;
+        try { page=historyPage(readHistory(id),u.searchParams,{liveStart:live?.codexHistoryStart}); }
+        catch(err){return sendJson(res,err.status||409,{message:err.message,...(err.code==="anchor not found"?{error:"anchor not found"}:{})});}
+        return sendJson(res, 200, {
+          id,
+          title: NAMES[id] || rec.title,
+          cwd: rec.cwd || "",
+          backend: "codex",
+          recordBackup:rec.recordBackup===true,
+          historyRecoveryRequired:!!rec.historyMutation,
+          ...page,
+          commands:(await import("./codex/run.mjs")).codexCommandState(id),
+          items: commandHistory(page.items, !!live,(await import("./codex/run.mjs")).codexCommandState(id)).map(m=>m.role==="subagent"?visibleSubagent(m,!!live?.codexAgents?.some(a=>a.id===m.id)):m),
+          subagents:(live?.codexAgents||rec.subagents||[]).map(m=>visibleSubagent(m,!!live)),subagentsAt:live?.codexAgentsAt||rec.subagentsAt||0,
+          contextTokens: null,
+          liveRunId: live ? live.id : null,
+          goal: null,
+          tasks: planTasks(visiblePlan(rec.plan, !!live)),
+          plan: visiblePlan(rec.plan, !!live),
+          planAt: Date.now(),
+        });
+      }
+      if (req.method === "POST" && action === "recover-history") {
+        if(runOfSession(id)||QUEUE.some(q=>q.sessionId===id||(q.follow&&RUN_SESSIONS.get(q.follow)===id)))return sendJson(res,409,{message:"会话正在运行或排队，请等任务结束后再恢复历史。"});
+        try{return sendJson(res,200,await recoverCodexHistory(id));}
+        catch(err){
+          if(getCodexSession(id)?.historyMutation)return sendJson(res,err.status||502,{recoveryRequired:true,message:err.status?err.message:"历史恢复尚未完成提交，请稍后再次恢复界面历史。"});
+          return sendJson(res,err.status||502,{message:err.status?err.message:"核心历史读取失败，原记录已保留，请稍后重试。"});
+        }
+      }
+      if (req.method === "POST" && action === "fork") {
+        if(runOfSession(id)||QUEUE.some(q=>q.sessionId===id||(q.follow&&RUN_SESSIONS.get(q.follow)===id)))return sendJson(res,409,{message:"会话正在运行或排队，请等任务结束后再操作。"});
+        let body={};try{body=JSON.parse((await readBody(req))||"{}");}catch{return sendJson(res,400,{message:"参数无效"});}
+        if(body.before!=null&&typeof body.before!=="boolean")return sendJson(res,400,{message:"参数无效"});
+        try{return sendJson(res,200,await forkCodexSession(id,{userText:body.userText,after:body.after,before:body.before===true,itemIndex:body.itemIndex,historyEpoch:body.historyEpoch}));}
+        catch(err){return sendJson(res,err.status||502,{message:err.status?err.message:"Codex 原生分叉失败，请重试或检查核心版本。"});}
+      }
+      if (req.method === "DELETE" && !action) {
+        try{const r=trashSession(id);return sendJson(res,r.ok?200:r.status||404,r);}
+        catch(err){return sendJson(res,500,{message:err.message});}
+      }
+      if (req.method === "POST" && action === "rename") {
+        const b = JSON.parse((await readBody(req)) || "{}");
+        const name = String(b.title || "").trim().slice(0, 120);
+        if (!name) return sendJson(res, 400, { error: "empty" });
+        NAMES[id] = name;
+        saveNames();
+        return sendJson(res, 200, { ok: true, title: name });
+      }
+      if (req.method === "POST") return sendJson(res, 409, { error: "unsupported", message: tz("这个功能暂不支持 Codex 会话。") });
+    }
 
     if (req.method === "GET" && !action) {
       // trashed：在回收站里（可恢复）。界面据此给「恢复」，而不是一律当成没了（#173）
@@ -651,13 +749,6 @@ export async function routeSessions(req, res, u, p) {
       return sendJson(res, r.ok ? 200 : r.status, r.ok ? r : { ok: false, error: "fork", message: tr(LAST_LANG, r.message) });
     }
 
-    if (req.method === "POST" && action === "pin") {
-      const b = JSON.parse((await readBody(req)) || "{}");
-      const before = PINS[id];
-      if (b.pin === false) delete PINS[id]; else PINS[id] = Date.now();
-      if (!savePins()) { if (before === undefined) delete PINS[id]; else PINS[id] = before; return sendJson(res, 500, { ok: false, error: "write_failed", message: tz("没保存上：存储满了或没有权限") }); }
-      return sendJson(res, 200, { ok: true, pinned: PINS[id] || 0 });
-    }
   }
   return NEXT;
 }

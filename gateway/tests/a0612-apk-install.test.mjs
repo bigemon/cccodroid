@@ -20,7 +20,7 @@ test("应用侧：前台才受理；过分享同一道 guard；验的和装的�
   assert.ok(at("confirm(text") < at('Apk.install(ctx, staged, "file")'), "确认在安装之前");
   assert.match(block, /endsWith\("\.apk"\)/);
   assert.match(block, /finally \{ if \(staged != null\) staged\.delete\(\); \}/);
-  assert.match(PRIV, /op\.equals\("noask"\) \|\| op\.equals\("apk_install"\)\) \{/, "进特权命令记录");
+  assert.match(PRIV, /if \([^\n]*\|\| op\.equals\("apk_install"\)[^\n]*\) \{[\s\S]{0,450}?audit\(/, "进特权命令记录");
   // confirm 只给「允许这一次」，不会被「10 分钟内不再问」带过去
   assert.match(PRIV, /static boolean confirm\(String text, String who, String key\) \{ return ask\(text, who, key, false\); \}/);
 });
@@ -28,7 +28,7 @@ test("应用侧：前台才受理；过分享同一道 guard；验的和装的�
 test("确认框按来路换成「安装应用」的标题和说明，不说成以 Shizuku 身份跑命令（11-09 真机看到的）", () => {
   assert.match(PRIV, /!trustable && key\.startsWith\("apk:"\) \? "apk"/);
   const ma = rd("android/java/cc/codroid/MainActivity.java");
-  assert.match(ma, /"apk"\.equals\(i\.getStringExtra\("kind"\)\)\);/);
+  assert.match(ma, /ACTION_PRIV_OK[^\n]*confirmPriv\([^\n]*"apk"\.equals\(i\.getStringExtra\("kind"\)\)/);
   assert.match(ma, /apk \? Tr\.t\("安装这个应用？"\)/);
   assert.match(ma, /: apk \? cmd \+ "\\n\\n" \+ Tr\.t\("点「允许」后还会弹出系统的安装确认。/);
 });

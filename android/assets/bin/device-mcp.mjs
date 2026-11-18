@@ -24,7 +24,7 @@ function app(req, timeoutMs = 20000) {
 const node = { type: "integer", description: "Element number from the latest screen (screen_read, or the screen returned by the previous action)" };
 // 动作做完等界面静下来、带回新屏幕（A11y.withScreen）
 const read = { type: "boolean", description: "Return the new screen after the action (default true). Set false only when you will not look at the result." };
-const AFTER = " Waits until the UI settles, then returns the new screen in the same format as screen_read; its numbers replace the old ones.";
+const AFTER = " Waits until the UI settles, then returns the new screen in the same format as screen_read; its numbers replace the old ones. If screen_partial is true, re-read or take a screenshot as needed; do not repeat a successful action just because its screen is partial.";
 const TOOLS = {
   device_status: {
     description: "Battery, charging, network (wifi/cellular, VPN, metered), screen on, free storage, device model and Android version, whether cccodroid is in the foreground.",

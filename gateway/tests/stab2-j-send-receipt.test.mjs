@@ -46,6 +46,8 @@ const renderAttachments = () => {};
 const syncInterject = () => {};
 const autoGrow = () => {};
 const clearAttachments = () => { state.attachments = []; };
+const currentBackend = () => "claude";
+const sessionBackendPending = () => false;
 const draftPersist = () => {};
 const draftOwner = (ep, key) => key || "";
 const draftKeepSent = (k, text, att, idem) => { kept.push({ k, text, idem }); return true; };

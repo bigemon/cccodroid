@@ -41,7 +41,7 @@ test("前提：官方账户没填 Key 是订阅登录，项目默认那家不是
 });
 
 test("会话钉了官方账户、项目默认 API：没许可就跳过，许可了才入队", async () => {
-  const sid = crypto.randomUUID();
+  const sid = realSid();
   setSessModel(sid, { provider: "anthropic" });
   S.DB.allowLogin = false;
   const t = mk("s0520-a", sid);

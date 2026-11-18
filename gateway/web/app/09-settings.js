@@ -15,6 +15,472 @@
   const post = (p, body) => api(p, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}),
   });
+  // 设置视图独立于 state.backend / view.backend，切页不改变会话核心。
+  function showSettingsCore(core, focus = false) {
+    document.querySelectorAll("[data-settings-core]").forEach((button) => {
+      const active = button.dataset.settingsCore === core;
+      button.classList.toggle("on", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+      if (active && focus) button.focus();
+    });
+    document.querySelectorAll("[data-core-panel]").forEach((panel) => {
+      panel.classList.toggle("hidden", panel.dataset.corePanel !== core);
+    });
+    // 不重新填输入框，保留尚未保存的配置。
+    if (core === "codex") {
+      refreshCodexSetup();
+    }
+  }
+  document.querySelectorAll("[data-settings-core]").forEach((button) => {
+    button.addEventListener("click", () => showSettingsCore(button.dataset.settingsCore));
+    button.addEventListener("keydown", (event) => {
+      const tabs = [...document.querySelectorAll("[data-settings-core]")];
+      const index = tabs.indexOf(button);
+      let next;
+      if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+      else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      showSettingsCore(tabs[next].dataset.settingsCore, true);
+    });
+  });
+  // ── Codex 后端（P6-B2）────────────────────────────────────────────
+  // 只读/写三项：可执行文件、CODEX_HOME、CA 证书。配好之后新会话就能选 Codex。
+  async function paintCodexStatus() {
+    const el = $("codex-now");
+    if (!el) return;
+    try {
+      const s = await api("/api/codex/status");
+      if (!s.available) {
+        el.textContent = t("尚未就绪：请先安装运行环境，或检查高级配置");
+        el.className = "warn";
+        return;
+      }
+      let acct = s.account ? `${s.account.type}${s.account.planType ? " · " + s.account.planType : ""}` : "";
+      if (!acct) {
+        // 没有活跃会话时，状态行回落到账号接口，别和下面的账号区块自相矛盾
+        try {
+          const a = await api("/api/codex/account");
+          if (a.state === "logged_in") acct = `chatgpt${a.planType ? " · " + a.planType : ""}`;
+        } catch {}
+      }
+      acct = acct || t("账号尚未读取");
+      el.textContent = t("可用 · {acct} · 运行中会话 {n}", { acct, n: (s.live || []).length });
+      el.className = "";
+    } catch (e) {
+      el.textContent = t("读取失败：{err}", { err: e.message });
+      el.className = "err";
+    }
+  }
+  let codexDiagSeq = 0;
+  async function loadCodexDiagnostics() {
+    const seq = ++codexDiagSeq, sid = currentBackend() === "codex" ? view.sessionId : null;
+    const el = $("codex-diagnostics-body");
+    if (!el) return;
+    el.textContent = t("读取中…");
+    try {
+      const d = await api("/api/codex/diagnostics" + (sid ? "?sid=" + encodeURIComponent(sid) : ""));
+      if (seq !== codexDiagSeq) return;
+      if (sid !== (currentBackend() === "codex" ? view.sessionId : null)) {
+        if (pageOn("caps") && capabilitiesCore==="codex" && $("codex-diagnostics")?.open) loadCodexDiagnostics();
+        return;
+      }
+      const active = d.runtime?.active, values = active ? d.runtime : d.selected;
+      const row = (key, value) => '<div><b>' + esc(key) + '</b> · ' + esc(value == null || value === "" ? "—" : String(value)) + '</div>';
+      const evidence = x => x?.observed ? t("已接入，已收到进度数据") : t("已接入，尚未观察到核心事件");
+      el.innerHTML = '<p>' + esc(sid ? t("当前 Codex 会话") : t("新 Codex 会话")) + '</p>' +
+        row(t("生效范围"), active ? t("当前轮次") : t("下轮使用")) +
+        row(t("模型"), values.model) + row(t("思考强度"), values.effort) +
+        row(t("权限模式"), modeLabel(values.permissionMode)) + row(t("工作目录"), d.cwdAvailable ? d.cwd : d.cwd + " · " + t("不可用")) +
+        row(t("核心计划模式"), active ? d.runtime.coreMode || t("不可用") : t("下一轮确定")) +
+        row(t("最近显式技能输入"),d.capabilities.skills?.lastSubmitted?.skills?.map(s=>s.name).join("、")||t("尚未提交")) +
+        row(t("自动判断"),d.runtime?.autoReview?.enabled?t("原生审核模型；写入和执行经审批后运行"):t("未启用")) +
+        row(t("原生工具审批基线"),d.runtime?.nativePolicy?.state==="configured"?t("按只读声明判断，其他操作需确认；保留更严格的确认与禁用规则"):t("启动或恢复线程时核验")) +
+        row(t("原生工具审批"), t("已接入核心工具批准与普通表单；登录跳转暂不支持")) +
+        row(t("原生计划支持"), d.capabilities.nativePlan === "supported" ? t("支持") : d.capabilities.nativePlan === "unsupported" ? t("不支持") : t("尚未探测")) +
+        row(t("计划进度"), evidence(d.capabilities.planProgress)) +
+        row(t("计划更新工具"), d.capabilities.planTool === "declared" ? t("已向本线程提供") : d.capabilities.planTool === "new-thread" ? t("新线程可用") : t("旧线程是否具备此工具未知，新线程可用")) +
+        row(t("命令执行"), d.capabilities.commandExecution?.runtimeAvailable === false ? t("当前环境未提供命令执行器") : d.capabilities.commandExecution?.declared ? t("本线程已提供命令工具") : t("旧线程是否具备此工具未知，可在新线程检测")) +
+        row(t("回复阶段"), evidence(d.capabilities.messagePhases)) +
+        row(t("思考摘要"), evidence(d.capabilities.reasoningSummary)) +
+        '<p><b>' + esc(t("配置默认值（运行时可能覆盖）")) + '</b></p>' +
+        (d.config.state === "available" ? Object.entries(d.config.fields).map(([key, v]) => row(key, (v.value == null ? t("未设置，由核心决定") : String(v.value)) + " · " + v.source)).join("") : esc(t("核心配置读取暂不可用"))) +
+        '<p><b>' + esc(t("已注册的宿主工具")) + '</b></p><div>' + d.capabilities.tools.map(esc).join(" · ") + '</div>' +
+        '<p>' + esc(t("默认命令在当前轮次结束时停止；显式后台命令可跨轮次运行，支持 PTY。后台命令可查看输出并单独停止，应用退出后不会自动恢复。")) + '</p>' +
+        row(t("已禁用的原生能力"), d.capabilities.disabledNative.join(" · "));
+    } catch {
+      if (seq === codexDiagSeq) el.textContent = t("诊断暂不可用，请稍后重试");
+    }
+  }
+  $("codex-diagnostics")?.addEventListener("toggle", () => { if ($("codex-diagnostics").open) loadCodexDiagnostics(); });
+  $("codex-diagnostics-refresh")?.addEventListener("click", loadCodexDiagnostics);
+
+  function renderProjectSkillReuse(d){
+    if(!d?.eligible)return "";
+    const messages={disabled:"尚未开启此项目的技能共享。",active:"项目共享链接已就绪，下次技能发现时可用。","waiting-source":"已启用，等待此项目的 .claude/skills 目录。",pending:"已启用，下次技能发现时创建项目链接。",preserved:"项目共享位置已有其他内容，未接管或覆盖。",blocked:"项目技能目录是文件或链接，未修改；请在文件浏览器检查。",unavailable:"项目技能共享暂不可用，请重新检查。"};
+    const choices=[["inherit","跟随全局"],["on","单独开启"],["off","单独关闭"]];
+    return '<div class="panel codex-skills" data-project-skill-reuse><b>'+esc(t("共享此项目的 Claude 技能"))+'</b><p class="muted codex-skill-path">'+esc(d.root||d.projectName||"")+'</p><div class="seg codex-project-mode" role="group" aria-label="'+esc(t("项目共享方式"))+'">'+choices.map(([mode,label])=>'<button type="button" data-codex-project-skill-reuse="'+mode+'" class="'+(d.mode===mode?'on':'')+'" aria-pressed="'+(d.mode===mode)+'"'+(!d.writable?' disabled':'')+'>'+esc(t(label))+'</button>').join("")+'</div><p>'+esc(t(d.autoEnabled?"全局自动共享已开启。":"全局自动共享已关闭。"))+'</p><p>'+esc(t(messages[d.state]||messages.unavailable))+'</p><p>'+esc(t("只在当前项目创建链接，共用 .claude/skills；原技能目录保持。"))+'</p><p>'+esc(t("此开关管理项目共享链接；下方单个技能的启停仍保存到 Codex 用户配置。"))+'</p></div>';
+  }
+  function renderCodexExtensions(d) {
+    const row=(name,value)=>"<p><b>"+esc(name)+"</b> · "+esc(value==null?"—":String(value))+"</p>";
+    const global=d.scope==="global",local=(global?d.instructions?.global:d.instructions?.local)||{},skills=d.skills||{},mcp=d.mcp||{},management=d.mcpManagement||{};
+    const mcpScopes={user:t("用户配置"),project:t("项目配置"),host:t("应用内置连接")};
+    const skillScopes={user:t("用户全局"),repo:t("项目来源"),system:t("系统内置"),admin:t("受管配置"),unknown:t("未知来源")};
+    const statuses={notStarted:t("尚未启动"),starting:t("连接中"),connected:t("已连接"),authenticationRequired:t("需要认证"),failed:t("连接失败"),cancelled:t("已取消"),disabled:t("已停用"),unknown:t("未知")};
+    return row(t(global?"全局能力目录":"当前检查目录"),d.cwd)+
+      "<p>"+esc(t(global?"以下为用户和系统来源的能力；设置影响使用该配置的 Codex 会话。":"以下为此目录下生效的结果，包含用户和系统来源；开关的保存范围见各项说明。"))+"</p>"+
+      row(t(global?"全局指令文件":"目录中的指令文件"),local.state==="available"?(local.name+(local.shared?" · "+t("共享文件"):"")+(local.linked?" → "+local.target:"")):t("暂不可读取"))+
+      row(t("核心指令字节上限"),d.config?.instructions?.maxBytes??t("未知"))+
+      "<p>"+esc(t(global?"全局指令遵循 Codex 文件优先级；共享正文由上方开关管理。":"文件存在不等于已加载；默认共用 CLAUDE.md，专用指令和自定义备用文件名按核心规则优先。"))+"</p>"+
+      renderProjectSkillReuse(d.projectSkillReuse)+
+      "<p><b>"+esc(t("核心发现的技能"))+"</b></p>"+
+      "<p>"+esc(t("在 Codex 输入框输入 $ 选择技能；提交给核心不等于已执行技能中的操作。"))+"</p>"+
+      (skills.state==="available"?'<div class="panel codex-skills">'+(skills.skills.map((s,i)=>'<div class="row"><div class="grow">'+esc(s.name)+" · "+esc(skillScopes[s.scope]||s.scope)+" · "+esc(s.enabled?t("已启用"):t("已停用"))+'<div class="muted codex-skill-path">'+esc(s.path)+'</div></div><button class="btn sm ghost" type="button" data-codex-skill-toggle="'+i+'"'+(skills.truncated?' disabled':'')+'>'+esc(s.enabled?t("停用"):t("启用"))+"</button></div>").join("")||esc(t("未发现技能")))+"</div>"+(skills.truncated?"<p>"+esc(t("清单已截断，暂不允许修改技能。"))+"</p>":"")+row(t("技能解析错误"),skills.errorCount):esc(t("技能清单暂不可用")))+
+      "<p>"+esc(t("技能开关按路径保存，影响使用该技能的 Codex 会话；下次使用生效，已经开始的任务不会停止。"))+"</p>"+
+      (global&&!d.sessionId?"":"<p><b>"+esc(t(global?"当前会话 MCP":"MCP"))+"</b></p>")+
+      (global&&!d.sessionId?"":(mcp.state==="available"?(mcp.servers.map(s=>row(s.name,(statuses[s.status]||t("未知"))+" · "+t("{n} 个工具",{n:s.toolCount}))+ "<div>"+s.tools.slice(0,8).map(esc).join(" · ")+"</div>").join("")||esc(t("本线程没有原生 MCP 工具"))):esc(mcp.state==="not_loaded"?t("线程尚未加载，开始一轮后可核对实际连接。"):t("线程 MCP 状态暂不可用"))))+
+      "<p><b>"+esc(t("配置中的 MCP"))+"</b></p>"+
+      (management.state==="available"?'<div class="panel codex-skills">'+(management.servers.map((s,i)=>'<div class="row"><div class="grow"><b class="codex-skill-path">'+esc(s.name)+'</b> · '+esc(s.enabled?t("已启用"):t("已停用"))+'<div class="muted">'+esc(mcpScopes[s.scope]||t("其他配置来源"))+(s.reason?' · '+esc(t(s.reason)):'')+'</div></div><button class="btn sm ghost" type="button" data-codex-mcp-toggle="'+i+'"'+(!s.writable||management.truncated?' disabled':'')+'>'+esc(s.enabled?t("停用"):t("启用"))+'</button></div>').join("")||esc(t("无普通 MCP 配置")))+'</div>':row(t("配置状态"),t("暂不可读取")))+
+      "<p>"+esc(t("只修改 Codex 用户配置，影响各 Codex 会话；项目和受管配置在此只读。保存不会中断正在执行的任务。"))+"</p>"+
+      (d.sessionId?'<button class="btn sm ghost" type="button" data-codex-mcp-reload'+(!d.canReloadMcp?' disabled':'')+'>'+esc(t("重载当前会话 MCP"))+'</button><p>'+esc(t("任务结束后可显式重载当前会话；其他会话会在重新连接时读取配置。"))+'</p>':'<p>'+esc(t("新会话会读取已保存配置；已有会话可在空闲时重载 MCP。"))+'</p>')+
+      "<p>"+esc(t("技能被发现不等于本轮已使用；MCP 连接状态不等于操作已获授权。"))+"</p>";
+  }
+  function bindCodexExtensionControls(el,d,context,reload,isCurrent) {
+    let saving=false;
+    el.onclick=async event=>{
+      const button=event.target.closest("[data-codex-skill-toggle],[data-codex-mcp-toggle],[data-codex-mcp-reload],[data-codex-project-skill-reuse]");
+      if(!button||!el.contains(button)||button.disabled||saving||!isCurrent())return;
+      const skill=button.hasAttribute("data-codex-skill-toggle")?d.skills?.skills?.[Number(button.dataset.codexSkillToggle)]:null;
+      const server=button.hasAttribute("data-codex-mcp-toggle")?d.mcpManagement?.servers?.[Number(button.dataset.codexMcpToggle)]:null;
+      const reconnect=button.hasAttribute("data-codex-mcp-reload");
+      const projectReuse=button.hasAttribute("data-codex-project-skill-reuse")?d.projectSkillReuse:null;
+      if(!skill&&!server&&!reconnect&&!projectReuse)return;
+      saving=true;
+      el.querySelectorAll("[data-codex-skill-toggle],[data-codex-mcp-toggle],[data-codex-mcp-reload],[data-codex-project-skill-reuse]").forEach(b=>b.disabled=true);
+      button.textContent=t(reconnect?"重载中…":"保存中…");
+      try{
+        if(projectReuse){
+          await post("/api/codex/project-skill-reuse",{...context,mode:button.dataset.codexProjectSkillReuse,revision:projectReuse.revision});
+          toast(t("项目共享设置已保存，下次技能发现时使用；已有任务不会停止。"));
+        }else if(reconnect){
+          await post("/api/codex/mcp/reload",{sessionId:d.sessionId});
+          toast(t("MCP 已重载，连接状态已更新。"));
+        }else if(server){
+          const r=await post("/api/codex/mcp/config",{...context,name:server.name,enabled:!server.enabled,expectedEnabled:server.enabled,revision:server.revision});
+          toast(r.enabled===r.requestedEnabled?t("MCP 配置已保存；新会话或显式重载后应用。"):t("配置被其他来源覆盖，请重新检查实际状态。"),r.enabled!==r.requestedEnabled);
+        }else{
+          const r=await post("/api/codex/skills/config",{...context,name:skill.name,path:skill.path,enabled:!skill.enabled,expectedEnabled:skill.enabled});
+          toast(r.enabled===r.requestedEnabled?t("技能设置已保存，下次使用生效。"):t("核心策略未允许这次切换，已保留实际状态。"),r.enabled!==r.requestedEnabled);
+        }
+      }catch(e){toast(e.message,true);}
+      finally{
+        codexSkillCatalog=null;codexSkillSeq++;
+        if(isCurrent())await reload();
+      }
+    };
+  }
+  let codexExtensionSeq=0;
+  function codexCapabilityContext(which=codexCapabilitiesScope){
+    if(which==="global")return {scope:"global"};
+    const project=curProject();if(!project)return null;
+    return currentBackend()==="codex"&&view.sessionId?{sessionId:view.sessionId}:{projectId:project.id};
+  }
+  async function loadCodexExtensions(which=codexCapabilitiesScope) {
+    const el=$(which==="global"?"codex-extension-body":"codex-project-extension-body");if(!el)return;
+    const scope=()=>JSON.stringify([which,which===codexCapabilitiesScope,capabilitiesCore,codexCapabilityContext(which),which==="project"?curProject()?.path:currentBackend()==="codex"?view.sessionId:null]);
+    const token=scope(),seq=++codexExtensionSeq,context=codexCapabilityContext(which),observer=which==="global"&&currentBackend()==="codex"?view.sessionId:null;
+    if(!context){el.textContent=t("当前会话未指定项目，请先选择项目。");return;}
+    const q=new URLSearchParams({refresh:"1"});
+    if(context.scope)q.set("scope",context.scope);if(context.sessionId)q.set("sid",context.sessionId);if(context.projectId)q.set("project",context.projectId);
+    el.textContent=t("读取中…");
+    try{
+      const [d,connection]=await Promise.all([
+        api("/api/codex/extensions?"+q),
+        observer?api("/api/codex/extensions?scope=thread&sid="+encodeURIComponent(observer)).catch(()=>({sessionId:observer,canReloadMcp:false,mcp:{state:"unavailable",servers:[]}})):null
+      ]);
+      if(connection)Object.assign(d,connection,{scope:"global"});
+      if(seq!==codexExtensionSeq||token!==scope())return;
+      el.innerHTML=renderCodexExtensions(d);
+      bindCodexExtensionControls(el,d,context,()=>loadCodexExtensions(which),()=>seq===codexExtensionSeq&&token===scope());
+    }catch{if(seq===codexExtensionSeq&&token===scope())el.textContent=t("生效检查暂不可用，请稍后重试。");}
+  }
+  $("codex-extension-check")?.addEventListener("toggle",()=>{if($("codex-extension-check").open&&codexCapabilitiesScope==="global")loadCodexExtensions("global");});
+  $("codex-extension-refresh")?.addEventListener("click",()=>loadCodexExtensions("global"));
+  $("codex-project-extension-refresh")?.addEventListener("click",()=>loadCodexExtensions("project"));
+
+  let projectAutoState=null,projectAutoBusy=false;
+  function paintProjectAutomation(d){projectAutoState=d;$("codex-project-auto-enabled").checked=d.enabled;$("codex-project-auto-state").textContent=t(d.enabled?"全局自动共享已开启。":"全局自动共享已关闭。");}
+  async function loadProjectAutomation(){
+    if(projectAutoBusy)return;projectAutoBusy=true;$("codex-project-auto-enabled").disabled=true;$("codex-project-auto-refresh").disabled=true;
+    try{paintProjectAutomation(await api("/api/codex/project-skill-automation"));}catch(e){$("codex-project-auto-state").textContent=e.message;}
+    finally{projectAutoBusy=false;$("codex-project-auto-enabled").disabled=!projectAutoState;$("codex-project-auto-refresh").disabled=false;}
+  }
+  $("codex-project-auto-refresh").addEventListener("click",loadProjectAutomation);
+  $("codex-project-auto-enabled").addEventListener("change",async()=>{
+    if(projectAutoBusy||!projectAutoState)return;const previous=projectAutoState,enabled=$("codex-project-auto-enabled").checked;projectAutoBusy=true;
+    $("codex-project-auto-enabled").disabled=true;$("codex-project-auto-refresh").disabled=true;$("codex-project-auto-state").textContent=t("保存中…");
+    try{paintProjectAutomation(await post("/api/codex/project-skill-automation",{enabled,revision:previous.revision}));codexSkillCatalog=null;codexSkillSeq++;}
+    catch(e){paintProjectAutomation(previous);toast(e.message,true);}
+    finally{projectAutoBusy=false;$("codex-project-auto-enabled").disabled=false;$("codex-project-auto-refresh").disabled=false;}
+  });
+
+  let claudeInstructionReuseState=null,claudeInstructionReuseLoading=false;
+  function paintClaudeInstructionReuse(d){
+    claudeInstructionReuseState=d;$("codex-instruction-reuse-enabled").checked=d.enabled;
+    const messages={disabled:"未启用全局指令共享。",active:"全局指令链接已就绪，新会话生效。","waiting-source":"已启用，等待 Claude 全局 CLAUDE.md；下次连接时检查。","waiting-home":"已启用，请先配置 Codex 目录。",pending:"已启用，指令链接将在下次连接时创建。",preserved:"已保留现有 Codex 专用指令，没有覆盖。",overridden:"Codex 全局覆盖指令优先生效，共享正文未必会加载。"};
+    $("codex-instruction-reuse-state").textContent=t(messages[d.state]||"全局指令共享状态暂不可用。");
+  }
+  async function loadClaudeInstructionReuse(){
+    if(claudeInstructionReuseLoading)return;claudeInstructionReuseLoading=true;$("codex-instruction-reuse-enabled").disabled=true;$("codex-instruction-reuse-refresh").disabled=true;
+    try{paintClaudeInstructionReuse(await api("/api/codex/instruction-reuse"));}
+    catch(e){$("codex-instruction-reuse-state").textContent=e.message||t("全局指令共享状态暂不可用。");}
+    finally{claudeInstructionReuseLoading=false;$("codex-instruction-reuse-enabled").disabled=!claudeInstructionReuseState;$("codex-instruction-reuse-refresh").disabled=false;}
+  }
+  $("codex-instruction-reuse-enabled")?.addEventListener("change",async()=>{
+    if(!claudeInstructionReuseState||claudeInstructionReuseLoading)return;const previous=claudeInstructionReuseState,enabled=$("codex-instruction-reuse-enabled").checked;claudeInstructionReuseLoading=true;
+    $("codex-instruction-reuse-enabled").disabled=true;$("codex-instruction-reuse-refresh").disabled=true;
+    try{paintClaudeInstructionReuse(await post("/api/codex/instruction-reuse",{enabled,revision:previous.revision}));}
+    catch(e){paintClaudeInstructionReuse(previous);toast(e.message,true);}
+    finally{claudeInstructionReuseLoading=false;$("codex-instruction-reuse-enabled").disabled=false;$("codex-instruction-reuse-refresh").disabled=false;}
+  });
+  $("codex-instruction-reuse-refresh")?.addEventListener("click",loadClaudeInstructionReuse);
+
+  let claudeSkillReuseState=null,claudeSkillReuseLoading=false;
+  function paintClaudeSkillReuse(d){
+    claudeSkillReuseState=d;$("codex-skill-reuse-enabled").checked=d.enabled;
+    const messages={disabled:"未启用共享，保留现有 Codex 技能。",active:"共享链接已就绪；新会话和下次技能发现时生效。","waiting-source":"已启用，等待 Claude 用户技能目录；下次使用时自动检查。","waiting-home":"已启用，请先配置 Codex 目录。",pending:"已启用，共享链接将在下次使用时创建。",conflict:"共享位置已有其他内容，已保留，请检查目录。"};
+    $("codex-skill-reuse-state").textContent=t(messages[d.state]||"技能共享状态暂不可用。")+(d.target?" "+t("共享位置：{path}",{path:d.target}):"");
+  }
+  async function loadClaudeSkillReuse(){
+    if(claudeSkillReuseLoading)return;claudeSkillReuseLoading=true;$("codex-skill-reuse-enabled").disabled=true;$("codex-skill-reuse-refresh").disabled=true;
+    try{paintClaudeSkillReuse(await api("/api/codex/skill-reuse"));}
+    catch(e){$("codex-skill-reuse-state").textContent=e.message||t("技能共享状态暂不可用。");}
+    finally{claudeSkillReuseLoading=false;$("codex-skill-reuse-enabled").disabled=!claudeSkillReuseState;$("codex-skill-reuse-refresh").disabled=false;}
+  }
+  $("codex-skill-reuse-enabled")?.addEventListener("change",async()=>{
+    if(!claudeSkillReuseState||claudeSkillReuseLoading)return;const enabled=$("codex-skill-reuse-enabled").checked,previous=claudeSkillReuseState;claudeSkillReuseLoading=true;
+    $("codex-skill-reuse-enabled").disabled=true;$("codex-skill-reuse-refresh").disabled=true;$("codex-skill-reuse-state").textContent=t("保存中…");
+    try{
+      const d=await post("/api/codex/skill-reuse",{enabled,revision:previous.revision});paintClaudeSkillReuse(d);
+      codexSkillCatalog=null;codexSkillSeq++;
+      if(capabilitiesCore==="codex")loadCodexExtensions();
+    }catch(e){paintClaudeSkillReuse(previous);$("codex-skill-reuse-state").textContent=e.message||t("共享设置未能保存，请重新检查。");toast($("codex-skill-reuse-state").textContent,true);}
+    finally{claudeSkillReuseLoading=false;$("codex-skill-reuse-enabled").disabled=false;$("codex-skill-reuse-refresh").disabled=false;}
+  });
+  $("codex-skill-reuse-refresh")?.addEventListener("click",loadClaudeSkillReuse);
+
+  let codexPreferenceState=null,codexPreferenceSeq=0,codexPreferenceDirty=false,codexPreferenceLoading=false;
+  const preferenceValues=()=>({model:$("codex-default-model").value||null,effort:$("codex-default-effort").value||null});
+  function preferenceBusy(busy){
+    ["codex-default-model","codex-default-effort","codex-preferences-save","codex-preferences-refresh"].forEach(id=>$(id).disabled=busy);
+  }
+  function preferenceEfforts(value){
+    const d=codexPreferenceState,model=d?.models.find(m=>m.id===($("codex-default-model").value||d.recommended));
+    const el=$("codex-default-effort");el.replaceChildren(new Option(t("默认（模型推荐）"),""));
+    for(const level of model?.effort?.supported_levels||[])el.add(new Option(level,level));
+    el.value=(model?.effort?.supported_levels||[]).includes(value)?value:"";
+  }
+  function paintCodexPreferences(d,draft=null){
+    codexPreferenceState=d;const values=draft||d.defaults,el=$("codex-default-model");
+    el.replaceChildren(new Option(t("默认（官方推荐）"),""));
+    for(const model of d.models.filter(m=>!m.hidden||m.id===values.model))el.add(new Option(model.name+" · "+model.id+(model.hidden?" "+t("（已隐藏）"):""),model.id));
+    el.value=d.models.some(m=>m.id===values.model)?values.model:"";preferenceEfforts(values.effort);
+    $("codex-preferences-state").textContent=[d.configured?t("偏好已保存，仅影响新会话。"):t("尚未设置应用偏好；保存后用于新会话。"),d.recommended?t("当前推荐：{model}",{model:d.recommended}):t("推荐默认暂不可确定，请刷新或选择模型。"),d.resolved?.warning||""].filter(Boolean).join(" ");
+    preferenceBusy(false);
+  }
+  function adoptCodexPreferences(d){
+    if(d.configured){state.settings=state.settings||{};state.settings.codex={...(state.settings.codex||{}),defaults:d.defaults};if(!view.sessionId)refreshSessModel();}
+  }
+  async function loadCodexPreferences(preserveDraft=false){
+    const seq=++codexPreferenceSeq,draft=preserveDraft&&codexPreferenceDirty?preferenceValues():null;codexPreferenceLoading=true;preferenceBusy(true);$("codex-preferences-state").textContent=t("读取模型偏好…");
+    try{
+      let d=await api("/api/codex/preferences");
+      if(seq!==codexPreferenceSeq)return;
+      if(d.needsReset){d=await post("/api/codex/preferences",{action:"normalize",revision:d.revision});if(seq!==codexPreferenceSeq)return;if(d.reset)toast(t("原选择当前不可用，已恢复默认。"));}
+      paintCodexPreferences(d,draft);adoptCodexPreferences(d);codexPreferenceDirty=!!draft;
+    }catch(e){if(seq!==codexPreferenceSeq)return;$("codex-preferences-state").textContent=e.message||t("保存偏好失败，请刷新后重试。");$("codex-preferences-refresh").disabled=false;}finally{if(seq===codexPreferenceSeq)codexPreferenceLoading=false;}
+  }
+  $("codex-default-model")?.addEventListener("change",()=>{codexPreferenceDirty=true;preferenceEfforts($("codex-default-effort").value);});
+  $("codex-default-effort")?.addEventListener("change",()=>{codexPreferenceDirty=true;});
+  $("codex-preferences-refresh")?.addEventListener("click",()=>loadCodexPreferences(true));
+  $("codex-preferences-save")?.addEventListener("click",async()=>{
+    if(!codexPreferenceState)return;const seq=++codexPreferenceSeq,values=preferenceValues();codexPreferenceLoading=true;preferenceBusy(true);$("codex-preferences-state").textContent=t("保存偏好…");
+    try{const d=await post("/api/codex/preferences",{action:"save",revision:codexPreferenceState.revision,defaults:values});if(seq!==codexPreferenceSeq)return;paintCodexPreferences(d);adoptCodexPreferences(d);codexPreferenceDirty=false;toast(t(d.reset?"原选择当前不可用，已恢复默认。":"偏好已保存，仅影响新会话。"));}
+    catch(e){if(seq!==codexPreferenceSeq)return;$("codex-preferences-state").textContent=e.message||t("保存偏好失败，请刷新后重试。");toast($("codex-preferences-state").textContent,true);preferenceBusy(false);}finally{if(seq===codexPreferenceSeq)codexPreferenceLoading=false;}
+  });
+
+  async function fillCodexSettings() {
+    const c = (state.settings && state.settings.codex) || {};
+    if ($("set-codex-bin")) $("set-codex-bin").value = c.bin || "";
+    if ($("set-codex-home")) $("set-codex-home").value = c.home || "";
+    if ($("set-codex-cert")) $("set-codex-cert").value = c.sslCertFile || "";
+    await refreshCodexSetup();
+  }
+
+  // ── ChatGPT 账号（P6-E2）：只走官方 App Server 的 account/* ────────
+  // 账号状态是「账号级」的，和模型/上下文（会话级）分开显示，不混在同一个进度条里。
+  let codexPoll = null;
+  function stopCodexPoll() { if (codexPoll) { clearInterval(codexPoll); codexPoll = null; } }
+
+  function paintCodexLoginFlow(info) {
+    const el = $("codex-login-flow");
+    if (!el) return;
+    if (!info) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+    el.classList.remove("hidden");
+    el.innerHTML = `<div class="prov-state warn">${t("在浏览器里打开下面的地址，输入设备码完成授权：")}</div>
+      <div class="row-actions"><code class="tiny" id="codex-user-code">${esc(info.userCode || "")}</code>
+        <button class="btn sm ghost" data-cact="copy-code">${t("复制设备码")}</button>
+        <button class="btn sm ghost" data-cact="open-url">${t("打开授权页")}</button></div>
+      <div class="tiny" id="codex-verify-url">${esc(info.verificationUrl || "")}</div>
+      <div class="tiny">${t("设备码只显示在这里，不会写进日志。")}</div>`;
+  }
+
+  async function paintCodexQuota() {
+    const el = $("codex-quota");
+    if (!el) return;
+    let q;
+    try { q = await api("/api/codex/limits"); } catch { el.classList.add("hidden"); return; }
+    if (!q || q.state === "logged_out" || !(q.windows || []).length) { el.classList.add("hidden"); return; }
+    el.classList.remove("hidden");
+    el.innerHTML = codexQuotaHtml(q);
+  }
+
+  function codexQuotaHtml(q) {
+    if (!q?.windows?.length) return `<div class="tiny">${t("Codex 额度暂不可用")}</div>`;
+    const rows = q.windows.map((w) => {
+      const pct = Math.max(0, Math.min(100, Math.round(w.usedPercent)));
+      const cls = pct >= 90 ? "hot" : pct >= 70 ? "warm" : "";
+      const at = w.resetsAt ? new Date(w.resetsAt * 1000) : null;
+      const when = at ? t("{time} 重置", { time: esc(at.toLocaleDateString([], { month: "numeric", day: "numeric" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })) }) : "";
+      return `<div class="quota-row"><span class="quota-l">${esc(w.label || t("额度"))}</span>
+        <span class="quota-bar"><i class="${cls}" style="width:${pct}%"></i></span>
+        <span class="quota-v">${pct}%</span><span class="tiny">${when}</span></div>`;
+    }).join("");
+    return `<div class="quota">${rows}
+      <div class="tiny">${t("订阅额度来自 account/rateLimits/read，与会话的上下文占用无关。")}</div></div>`;
+  }
+
+  let codexAccountSeq=0;
+  async function paintCodexAccount() {
+    const seq=++codexAccountSeq;
+    const el = $("codex-account-state"), acts = $("codex-account-acts");
+    if (!el || !acts) return;
+    let st;
+    try { st = await api("/api/codex/account"); }
+    catch (e) {
+      if(seq!==codexAccountSeq)return;
+      el.className = "prov-state warn";
+      el.textContent = t("读取失败：{msg}", { msg: e.message });
+      acts.innerHTML = "";
+      $("codex-quota")?.classList.add("hidden");
+      return;
+    }
+    if(seq!==codexAccountSeq)return;
+    if(st.code==="codex_not_configured"){
+      el.className="prov-state warn";el.textContent=t("请先安装 Codex 运行环境，再登录 ChatGPT。");acts.innerHTML="";
+      paintCodexLoginFlow(null);$("codex-quota")?.classList.add("hidden");
+    } else if(st.pending){
+      el.className = "prov-state warn";
+      el.textContent = t("等待浏览器里完成授权…");
+      acts.innerHTML = `<button class="btn sm ghost" data-cact="cancel">${t("取消登录")}</button>`;
+      $("codex-quota")?.classList.add("hidden");
+    } else if(st.state==="logged_in"){
+      el.className = "prov-state ok";
+      el.innerHTML = t("✓ 已登录") + (st.planType ? ` · ${esc(st.planType)}` : "") +
+        (st.email ? `<br><span class="tiny">${esc(st.email)}</span>` : "");
+      acts.innerHTML = `<button class="btn sm ghost danger" data-cact="logout">${t("退出登录")}</button>`;
+      paintCodexLoginFlow(null);
+      paintCodexQuota();
+    } else {
+      el.className = st.state === "failed" ? "prov-state" : "prov-state warn";
+      el.textContent = st.state === "failed"
+        ? t("登录失败：{msg}", { msg: st.message || st.error || t("未知原因") })
+        : st.state === "error"
+          ? t("后端异常：{msg}", { msg: st.message || t("无法启动 App Server") })
+          : st.expired ? t("登录已过期，请重新登录") : t("未登录");
+      acts.innerHTML = `<button class="btn sm" data-cact="login">${t("登录 ChatGPT 账户")}</button>`;
+      paintCodexLoginFlow(null);
+      $("codex-quota")?.classList.add("hidden");
+    }
+  }
+
+  async function startCodexLogin() {
+    codexAccountSeq++;
+    stopCodexPoll();
+    const acts = $("codex-account-acts");
+    try {
+      const r = await post("/api/codex/login/start", { method: "device" });
+      codexAccountSeq++;
+      paintCodexLoginFlow(r);
+      acts.innerHTML = `<button class="btn sm ghost" data-cact="cancel">${t("取消登录")}</button>`;
+      $("codex-account-state").className = "prov-state warn";
+      $("codex-account-state").textContent = t("等待浏览器里完成授权…");
+      const started = Date.now();
+      codexPoll = setInterval(async () => {
+        if (Date.now() - started > 5 * 60 * 1000) {
+          // 设备码过期：顺手取消，别在 app-server 里留一个没人认领的登录流程
+          stopCodexPoll();
+          post("/api/codex/login/cancel", {}).catch(() => {});
+          paintCodexLoginFlow(null);
+          paintCodexAccount();
+          return;
+        }
+        let st;
+        try { st = await api("/api/codex/account"); } catch { return; }
+        if (!st.pending) { stopCodexPoll(); paintCodexLoginFlow(null); paintCodexAccount(); if (st.state === "logged_in") { toast(t("已登录 ChatGPT")); recheckSetup(); paintBackend(); } }
+      }, 2500);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  async function cancelCodexLogin() {
+    codexAccountSeq++;
+    stopCodexPoll();
+    try { await post("/api/codex/login/cancel", {}); } catch {}
+    paintCodexLoginFlow(null);
+    await paintCodexAccount();
+  }
+
+  async function logoutCodex() {
+    // 退出只影响 Codex；Claude 的登录是另一套，明确写出来免得误操作
+    if (!confirm(t("退出 Codex 的 ChatGPT 账号？\nClaude 的登录不受影响。"))) return;
+    try { await post("/api/codex/logout", {}); toast(t("已退出 Codex 账号")); } catch (e) { toast(e.message, true); }
+    await paintCodexAccount();
+  }
+
+  function bindCodexAccount() {
+    const box = $("codex-field");
+    if (!box) return;
+    box.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-cact]");
+      if (!b) return;
+      const act = b.dataset.cact;
+      if (act === "login") startCodexLogin();
+      else if (act === "cancel") cancelCodexLogin();
+      else if (act === "logout") logoutCodex();
+      else if (act === "copy-code") copyText(($("codex-user-code") || {}).textContent || "").then((ok) => toast(ok ? t("已复制设备码") : t("复制失败"), !ok));
+      else if (act === "open-url") openExternal(($("codex-verify-url") || {}).textContent || "");
+    });
+  }
+  bindCodexAccount();
+  document.querySelectorAll("#codex-field [data-act]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      if (b.dataset.act === "save") {
+        await saveSettings({
+          codex: {
+            bin: $("set-codex-bin").value.trim(),
+            home: $("set-codex-home").value.trim(),
+            sslCertFile: $("set-codex-cert").value.trim(),
+          },
+        });
+      }
+      await refreshCodexSetup();
+    });
+  });
 
   async function loadProviders() {
     try {
@@ -491,16 +957,31 @@
     const top = Math.max(0, ...ws.map((x) => +x[1].used || 0));
     return { text: ws.map((x) => x[0] + " " + Math.round(x[1].used) + "%").join(" · "), lvl: top >= 90 ? 2 : top >= 70 ? 1 : 0 };
   }
-  const qbBrief = (c) => (!c ? { text: "", lvl: 0 } : c.login ? loginBrief(c.limits) : billBrief(c.bill));
+  function codexBrief(l) {
+    const ws = l?.windows || [];
+    if (!ws.length) return { text: t("Codex 额度暂不可用"), lvl: 0 };
+    const top = Math.max(...ws.map(x => x.usedPercent));
+    return { text: ws.map(x => (x.windowDurationMins === 300 ? t("5 小时") : x.windowDurationMins === 10080 ? t("每周") : x.label) + " " + Math.round(x.usedPercent) + "%").join(" · "), lvl: top >= 90 ? 2 : top >= 70 ? 1 : 0 };
+  }
+  const qbBrief = (c) => (!c ? { text: "", lvl: 0 } : c.codex ? codexBrief(c.rateLimits) : c.login ? loginBrief(c.limits) : billBrief(c.bill));
   /** 拉当前接口的额度 / 余额，画到细条上；速览卡、用量页开着就一起重画 */
   async function qbLoad(force) {
     const s = state.serverStatus;
-    if (!s || !s.provider) return null;
-    const seq = ++QB.seq;
+    const seq = ++QB.seq, sid = view.sessionId, backend = currentBackend();
+    const pid = curProv();
+    if (!s || !pid || sessionBackendPending()) {
+      QB.cur = null; qbPaint({ text: t("读取中…"), lvl: 0 }); qcRender(); return null;
+    }
+    if (!QB.cur || QB.cur.id !== pid) {
+      QB.cur = null; qbPaint({ text: t("读取中…"), lvl: 0 }); qcRender();
+    }
     // 按当前会话用的那家（0.3.16 起会话可以钉在别家上），不是只看全局
-    const pid = curProv() || s.provider, pb = pid !== s.provider ? provOf(pid) : null;
-    const cur = pb ? { id: pid, name: provLabel(pid), login: pb.keyMode === "login" } : { id: s.provider, name: provName(s), login: s.keyMode === "login" };
-    if (cur.login) {
+    const pb = provOf(pid);
+    const cur = pid === "codex" ? { id: "codex", name: "Codex", codex: true, login: false }
+      : { id: pid, name: provLabel(pid) || provName(s), login: pb ? pb.keyMode === "login" : pid === s.provider && s.keyMode === "login" };
+    if (cur.codex) {
+      cur.rateLimits = await api("/api/codex/limits").catch(() => null);
+    } else if (cur.login) {
       let st = null, failed = false;
       try { st = await api("/api/login/status"); } catch { failed = true; }
       // 查询失败（网络/网关忙）别把已经显示的已登录额度清掉；只有接口明确回“没登录”才撤（195-O.9）
@@ -510,8 +991,8 @@
       cur.bill = await api(`/api/billing?id=${encodeURIComponent(cur.id)}${force ? "&refresh=1" : ""}`).catch(() => null);
       if (cur.bill && cur.bill.error) cur.bill = null;
     }
-    if (seq !== QB.seq) return QB.cur;          // 期间又发了一次（切了接口、连点刷新），以后发的为准
-    if (!cur.login && !cur.bill && QB.cur && QB.cur.id === cur.id && QB.cur.bill) return QB.cur;   // 一时没查到：留着上次的，别把细条上的字清掉
+    if (seq !== QB.seq || sid !== view.sessionId || backend !== currentBackend() || pid !== curProv()) return QB.cur;          // 期间又发了一次（切了接口、连点刷新），以后发的为准
+    if (!cur.codex && !cur.login && !cur.bill && QB.cur && QB.cur.id === cur.id && QB.cur.bill) return QB.cur;   // 一时没查到：留着上次的，别把细条上的字清掉
     QB.cur = cur;
     qbPaint();
     qbRemind(cur);
@@ -523,16 +1004,13 @@
     if (!el) return;
     if (!br) {
       br = qbBrief(QB.cur);
-      // 记下这次的一句话：下次打开界面先画它，不用等状态和额度接口回来（上下文数字是本地存的，一打开就有，两边一起出）
-      if (QB.cur) try { localStorage.setItem("cc.qbLast", JSON.stringify({ id: QB.cur.id, text: br.text, lvl: br.lvl })); } catch {}
     }
     el.textContent = br.text;
     el.className = br.lvl === 2 ? "hot" : br.lvl === 1 ? "warm" : "";
     ctxBar.classList.toggle("has-q", !!br.text);
     if (br.text) ctxBar.classList.remove("hidden");
   }
-  const qbLast = (() => { try { return JSON.parse(localStorage.getItem("cc.qbLast") || "null"); } catch { return null; } })();
-  if (qbLast && qbLast.text) qbPaint(qbLast);
+  // 额度缓存不能在会话核心尚未恢复时盲画，否则会把上次 Claude 余额挂到 Codex。
   // 快用完时提醒：5 小时 / 每周（或套餐窗口）过 80%、95% 各提醒一次（按重置时间区分窗口）；余额低于设定值每天一次
   function qbRemind(c) {
     const cfg = qbWarnCfg();
@@ -597,6 +1075,7 @@
     if (!qcOpen()) return;
     const c = QB.cur;
     const body = !c ? `<div class="tiny">${t("读取中…")}</div>`
+      : c.codex ? codexQuotaHtml(c.rateLimits)
       : c.login ? quotaHtml(c.limits)
       : c.bill ? billRows(c.bill, { id: c.id }, true)
       : `<div class="tiny">${t("查不到这个接口的额度")}</div>`;
@@ -624,8 +1103,15 @@
     if (!$("us-acct")) return;
     const cur = await qbLoad(force);
     if (curPage !== "usage") return;
+    const current = $("us-acct-cur");
+    current.classList.toggle("hidden", !cur);
+    // Same platform keeps its expanded state on refresh; a newly selected platform opens by default.
+    if (cur && current.dataset.id !== cur.id) { current.dataset.id = cur.id; current.open = true; }
     $("us-acct-name").textContent = cur ? cur.name : "";
-    $("us-acct-cur").innerHTML = !cur ? "" : cur.login ? quotaHtml(cur.limits)
+    const brief = qbBrief(cur);
+    $("us-acct-brief").textContent = brief.text;
+    $("us-acct-brief").classList.toggle("hot", brief.lvl === 2);
+    $("us-acct-detail").innerHTML = !cur ? "" : cur.codex ? codexQuotaHtml(cur.rateLimits) : cur.login ? quotaHtml(cur.limits)
       : cur.bill ? billRows(cur.bill, { id: cur.id }) : `<div class="tiny">${t("查不到这个接口的额度")}</div>`;
     let list = [];
     try { list = (await api("/api/providers")).providers || []; } catch {}
@@ -636,8 +1122,8 @@
     const others = list.filter((p) => p.id !== (cur ? cur.id : state.serverStatus?.provider) && !p.local && (p.login ? !!(lst && lst.loggedIn) : p.hasKey));
     const box = $("us-acct-others");
     const keep = new Set([...box.querySelectorAll("details[open]")].map((d) => d.dataset.id));
-    box.innerHTML = others.length ? `<div class="sub">${t("其他接口")}</div>` + others.map((p) =>
-      `<details class="qb-row" data-id="${esc(p.id)}"${keep.has(p.id) ? " open" : ""}><summary><span>${esc(pLabel(p))}</span><span class="grow"></span><span class="qb-brief tiny">${esc(usBrief(p.id) || t("读取中…"))}</span></summary><div class="qb-detail"></div></details>`).join("") : "";
+    box.innerHTML = others.map((p) =>
+      `<details class="qb-row" data-id="${esc(p.id)}"${keep.has(p.id) ? " open" : ""}><summary><span class="qb-name">${esc(pLabel(p))}</span><span class="grow"></span><span class="qb-brief tiny">${esc(usBrief(p.id) || t("读取中…"))}</span></summary><div class="qb-detail"></div></details>`).join("");
     const fill = (d) => {
       const x = usOther.get(d.dataset.id), det = d.querySelector(".qb-detail");
       if (!x) return;

@@ -59,15 +59,27 @@
       let d0;
       try { d0 = await api("/api/projects/" + encodeURIComponent(id)); } catch (e) { if (PJ.cur === id) box.innerHTML = pageHead("", "", true) + `<div class="muted">${esc(e.message)}</div>`; return; }
       if (PJ.cur !== id) return;
-      // 指令读不出来：不能当成空的，不然一保存就把原来的 CLAUDE.md 盖掉（审查 E06）
-      try { const r = await api("/api/projects/" + encodeURIComponent(id) + "/instr"); d0.instr = r.text || ""; } catch (e) { d0.instr = ""; d0.instrErr = e.message || "?"; }
-      if (PJ.cur !== id) return;
+      const instructions=await Promise.allSettled(["claude","codex"].map(backend=>api("/api/projects/"+encodeURIComponent(id)+"/instr?backend="+backend)));
+      if(PJ.cur!==id)return;
       d = PJ.detail = d0;
+      d.instructions={};
+      ["claude","codex"].forEach((backend,i)=>{d.instructions[backend]=instructions[i].status==="fulfilled"?instructions[i].value:{state:"unavailable",backend};});
     }
     // 定时任务、模型清单刷新会重画整页：正在改、还没保存的指令草稿接着留着（审查 E03）
     const oldTa = box.querySelector(".pj-instr");
     const keepDraft = oldTa && oldTa.dataset.pid === id && oldTa.value !== (d.instr || "") ? oldTa.value : null;
     const p = d.project;
+    const reportKey=JSON.stringify([p.id,p.path]),oldReport=box.querySelector("#project-extension-report");
+    const keptReport=oldReport?.dataset.projectContext===reportKey?oldReport:null;
+    const instruction=()=>{
+      const backend=PJ.instrBackend?.[id]||"claude",entry=d.instructions?.[backend]||{backend,name:backend==="codex"?"CLAUDE.md":"CLAUDE.md",target:"CLAUDE.md",text:"",state:"unavailable"};
+      const key=id+":"+(entry.target||entry.name),draft=PJ.instrDrafts?.[key];
+      return {backend,entry,key,text:draft??entry.text??""};
+    };
+    const guide=instruction(),entry=guide.entry;
+    const guideLabel=entry.name+(entry.linked?" → "+entry.target:"");
+    const guideNote=guide.backend==="codex"?t("默认共用 CLAUDE.md；已有 Codex 专用文件时优先使用。保存后请新建会话核验。"):t("与 Codex 共用时只需维护这一份；核心专用语法请分别说明。");
+
     setOv(p.name); setPageSub("projects", p.path);
     // 拉回来是空清单（端侧模型删光了）也算拉过：以前按「空 = 没拉过」判断，回执重画又拉，一直循环（#143-2）
     if (!MODELS.length && !PJ.mLoaded) api("/api/models").then((r) => { MODELS = r.models || []; PJ.mLoaded = true; PJ.effLevels = r.effortLevels || []; if (PJ.cur === id && curPage === "projects") renderProject(box); }).catch(() => {});
@@ -82,18 +94,26 @@
     const effs = PJ.effLevels && PJ.effLevels.length ? PJ.effLevels : ["low", "medium", "high", "xhigh", "max"];
     const effSel = `<select data-def="effort">${opt("", follow, p.effort)}${effs.map((e) => opt(e, e, p.effort)).join("")}</select>`;
     const permSel = `<select data-def="perm">${opt("", follow, p.perm)}${["default", "acceptEdits", "plan", "auto", "dontAsk"].map((k) => opt(k, t(PERM_SHORT[k]), p.perm)).join("")}</select>`;
+    const cx=p.codex||{},cxms=PJ.codexCatalog?.models||[];
+    if(!PJ.codexCatalog&&!PJ.codexLoading){
+      PJ.codexLoading=true;
+      api("/api/models?backend=codex").then(r=>{PJ.codexCatalog=r;if(PJ.cur===id)renderProject(box);}).catch(()=>{}).finally(()=>{PJ.codexLoading=false;});
+    }
+    const cxModel=`<select data-codex-def="model">${opt("",follow,cx.model)}${cxms.map(m=>opt(m.id,m.name||m.id,cx.model)).join("")}${cx.model&&!cxms.some(m=>m.id===cx.model)?opt(cx.model,cx.model,cx.model):""}</select>`;
+    const cxe=(cxms.find(m=>m.id===cx.model)?.effort?.supported_levels)||PJ.codexCatalog?.effortLevels||["low","medium","high","xhigh"];
+    const cxEff=`<select data-codex-def="effort">${opt("",follow,cx.effort)}${[...new Set([...cxe,...(cx.effort?[cx.effort]:[])])].map(e=>opt(e,e,cx.effort)).join("")}</select>`;
+    const cxPerm=`<select data-codex-def="perm">${opt("",follow,cx.perm)}${CODEX_MODE_KEYS.map(k=>opt(k,modeLabel(k),cx.perm)).join("")}</select>`;
     const tasks = ((SC.data && SC.data.tasks) || []).filter((x) => x.projectId === id);
     const files = d.files || [];
     box.innerHTML = pageHead(`<span class="pj-fold" style="color:${pjCol(p.color)}">${pi("folder")}</span>${esc(p.name)}`,
         `<button class="btn sm pj-primary" data-a="chat">${pi("plus")}${esc(t("新对话"))}</button>${kebabBtn("pmenu")}`, true) +
       `<div class="mono muted pj-dpath">${esc(p.path)}${p.exists === false ? ` · <span class="pj-gone">${esc(t("目录不在了"))}</span>` : ""}</div>` +
       `<div class="pj-sec"><span class="grow">${esc(t("对话"))}（${d.sessions.length}）</span></div>
-      <div class="panel">${d.sessions.length ? d.sessions.slice(0, 30).map((s) => `<div class="row pj-row" data-sid="${esc(s.id)}"><div class="grow"><div class="t1">${schedSids().has(s.id) ? pi("clock", "pj-ic") : ""}${esc(s.title)}</div><div class="muted pj-sub">${esc(relTime(s.mtime))}</div></div></div>`).join("") : emptyRow(t("还没有对话"))}${d.sessions.length > 30 ? `<div class="row muted pj-sub">${esc(t("还有 {n} 个", { n: d.sessions.length - 30 }))}</div>` : ""}</div>
-      <div class="pj-sec"><span class="grow">${esc(t("指令 · CLAUDE.md"))}</span><span class="muted pj-note">${esc(t("每次对话自动带上"))}</span></div>
-      ${d.instrErr ? `<div class="muted pj-gone">${esc(t("指令读取失败：{msg}。为免盖掉原文，这里先不让改。", { msg: d.instrErr }))}</div>` : ""}
-      <textarea class="pj-field pj-instr" data-pid="${esc(id)}"${d.instrErr ? " readonly" : ""} placeholder="${esc(t("这个项目是什么、怎么构建、有什么规矩…"))}">${esc(d.instr || "")}</textarea>
-      <div class="pj-save hidden"><button class="btn sm ghost" data-a="instr-undo">${esc(t("还原"))}</button><button class="btn sm" data-a="instr-save">${esc(t("保存"))}</button></div>
-      <div class="pj-sec"><span class="grow">${esc(t("默认设置"))} <span class="muted pj-note">${esc(t("（只管这个项目里新开的对话）"))}</span></span></div>
+      <div class="panel">${d.sessions.length ? d.sessions.slice(0, 30).map((s) => `<div class="row pj-row" data-sid="${esc(s.id)}"><div class="grow"><div class="t1">${schedSids().has(s.id) ? pi("clock", "pj-ic") : ""}${esc(s.title)}</div><div class="muted pj-sub">${esc(relTime(s.mtime))}</div></div></div>`).join("") : emptyRow(t("还没有对话"))}</div>
+      <div class="pj-sec pj-instr-head"><span class="grow">${esc(t("项目指令"))} · ${esc(guideLabel)}</span><select data-instr-core aria-label="${esc(t("项目指令"))}"><option value="claude"${guide.backend==="claude"?" selected":""}>Claude · CLAUDE.md</option><option value="codex"${guide.backend==="codex"?" selected":""}>Codex · ${esc(d.instructions?.codex?.name||"CLAUDE.md")}</option></select><span class="muted pj-note">${esc(guideNote)}</span></div>
+      <textarea class="pj-field pj-instr" placeholder="${esc(t("这个项目是什么、怎么构建、有什么规矩…"))}">${esc(guide.text)}</textarea>
+      <div class="pj-save${guide.text===(entry.text||"")?" hidden":""}"><button class="btn sm ghost" data-a="instr-undo">${esc(t("还原"))}</button><button class="btn sm" data-a="instr-save">${esc(t("保存"))}</button></div>
+      <div class="pj-sec"><span class="grow">${esc(t("默认设置 · Claude"))} <span class="muted pj-note">${esc(t("（只管这个项目里新开的对话）"))}</span></span></div>
       <div class="panel">
         ${usableProvs().length > 1 || p.provider ? `<div class="row"><div class="grow"><b>${esc(t("接口"))}</b></div>${provSel}</div>` : ""}
         <div class="row"><div class="grow"><b>${esc(t("型号"))}</b></div>${modelSel}</div>
@@ -101,23 +121,35 @@
         <div class="row"><div class="grow"><b>${esc(t("权限模式"))}</b></div>${permSel}</div>
         <div class="row"><div class="grow"><b>${esc(t("MCP 服务器"))}</b><div class="muted pj-sub">${d.mcp && d.mcp.length ? esc(t("项目自己的 .mcp.json：{list}", { list: d.mcp.join("、") })) : esc(t("没有 .mcp.json；用的是全局的"))}</div></div></div>
       </div>
+      <div class="pj-sec"><span class="grow">${esc(t("默认设置 · Codex"))}</span><button class="btn sm ghost" data-a="cx-check">${esc(t("生效检查"))}</button></div>
+      <div id="project-extension-report" class="tiny"></div>
+      <div class="panel">
+        <div class="row"><div class="grow"><b>${esc(t("型号"))}</b></div>${cxModel}</div>
+        <div class="row"><div class="grow"><b>${esc(t("思考强度"))}</b></div>${cxEff}</div>
+        <div class="row"><div class="grow"><b>${esc(t("权限模式"))}</b><div class="muted pj-sub">${esc(t("分别保存两种核心的默认值；已有 Codex 会话沿用自己的设置。"))}</div></div>${cxPerm}</div>
+      </div>
       <div class="pj-sec"><span class="grow">${esc(t("文件"))}</span><button class="btn sm ghost" data-a="files">${esc(t("在文件浏览器打开"))}</button></div>
       <div class="panel pj-files">${files.length ? files.slice(0, 12).map((f) => `<div class="row pj-row" data-file="${esc(f.name)}" data-dir="${f.dir ? 1 : ""}"><span class="mono grow">${esc(f.name)}${f.dir ? "/" : ""}</span></div>`).join("") + (files.length > 12 ? `<div class="row"><span class="muted">${esc(t("还有 {n} 项", { n: files.length - 12 }))}</span></div>` : "") : emptyRow(t("（空目录）"))}</div>
       <div class="pj-sec"><span class="grow">${esc(t("记忆"))}</span></div>
       <div class="panel"><div class="row"><div class="grow"><b>${esc(t("{n} 条", { n: (d.memory || []).length }))}</b><div class="muted pj-sub">${esc(t("Claude 在这个项目里记下的事"))}</div></div>${(d.memory || []).length ? `<button class="btn sm ghost" data-a="memory">${esc(t("查看"))}</button>` : ""}</div></div>
       <div class="pj-sec"><span class="grow">${esc(t("定时任务"))}</span><button class="btn sm ghost" data-a="newtask">${pi("plus")}${esc(t("新建"))}</button></div>
       <div class="panel">${tasks.length ? tasks.map((x) => `<div class="row pj-row" data-task="${esc(x.id)}"><div class="grow"><div class="t1">${pi("clock", "pj-ic")}${esc(x.name)}</div><div class="muted pj-sub">${esc(freqText(x.freq))}</div></div><span class="pill ${x.on ? "acc" : ""}">${esc(x.on ? t("开") : t("关"))}</span></div>`).join("") : emptyRow(t("没有"))}</div>`;
+    // 同一项目的目录／型号异步刷新不拆掉正在检查或保存的 Codex 控件。
+    if(keptReport)box.querySelector("#project-extension-report").replaceWith(keptReport);
+    box.querySelector("#project-extension-report").dataset.projectContext=reportKey;
     const ta = box.querySelector(".pj-instr");
-    const syncSave = () => box.querySelector(".pj-save").classList.toggle("hidden", !!d.instrErr || ta.value === (d.instr || ""));
-    ta.addEventListener("input", syncSave);
-    if (keepDraft != null) { ta.value = keepDraft; syncSave(); }
-    // 新建时选的目录里本来就有 CLAUDE.md，填的指令没写进去：把用户填的内容并进指令框当草稿，
-    // 「保存」按钮亮着由他决定要不要合并，别跟着弹窗一起丢掉（0.6.9 审计 195-K.4）
-    if (PJ.instrDraft && PJ.instrDraft.id === id) {
-      const draft = PJ.instrDraft.text;
-      PJ.instrDraft = null;
-      if (!d.instrErr && draft) { ta.value = (d.instr ? d.instr.replace(/\n+$/, "") + "\n\n" : "") + draft; syncSave(); }
+    ta.dataset.pid = id;
+    ta.disabled=entry.state==="unavailable";
+    box.dataset.instrKey=guide.key;box.dataset.instrBackend=guide.backend;
+    if (PJ.instrDraft && PJ.instrDraft.id === id && guide.backend === "claude" && !ta.disabled) {
+      const text = [entry.text, PJ.instrDraft.text].filter(Boolean).join("\n\n");
+      (PJ.instrDrafts ||= {})[guide.key] = text; ta.value = text; PJ.instrDraft = null;
+      box.querySelector(".pj-save").classList.remove("hidden");
     }
+    ta.addEventListener("input", () => {
+      (PJ.instrDrafts||(PJ.instrDrafts={}))[guide.key]=ta.value;
+      box.querySelector(".pj-save").classList.toggle("hidden",ta.value===(entry.text||""));
+    });
   }
   $("tab-projects").addEventListener("click", async (e) => {
     const box = $("tab-projects");
@@ -135,24 +167,38 @@
     const sid = e.target.closest("[data-sid]"); if (sid) return goSession(sid.dataset.sid);
     const tk = e.target.closest("[data-task]"); if (tk) { SC.cur = tk.dataset.task; SC.detail = null; return openPage("sched"); }
     const p = PJ.detail && PJ.detail.project; if (!p) return;
+    if(a==="cx-check"){
+      const target=box.querySelector("#project-extension-report"),id=p.id;target.textContent=t("读取中…");
+      try{
+        const d=await api("/api/codex/extensions?project="+encodeURIComponent(id)+"&refresh=1");
+        if(PJ.cur===id&&target.isConnected){
+          target.innerHTML=renderCodexExtensions(d);
+          bindCodexExtensionControls(target,d,{projectId:id},()=>box.querySelector('[data-a="cx-check"]')?.click(),()=>PJ.cur===id&&target.isConnected);
+        }
+      }
+      catch{if(PJ.cur===id&&target.isConnected)target.textContent=t("生效检查暂不可用，请稍后重试。");}
+      return;
+    }
     if (a === "chat") return newChatIn(p.id);
     if (a === "pmenu") return projMenu(p, e.target.closest("[data-a]"));
     if (a === "files") return openFiles(p.path);
     if (a === "memory") { const m = PJ.detail.memory[0]; return openFiles(m.path.replace(/\/[^/]+$/, "")); }
     if (a === "newtask") return taskDlg(null, { projectId: p.id });
     const f = e.target.closest("[data-file]");
-    if (f) {
-      const full = p.path.replace(/\/$/, "") + "/" + f.dataset.file;
-      if (f.dataset.dir) return openFiles(full);
-      // 项目摘要里只有名字和是不是目录，没有类型：走 openPath 先问一次 stat，和文件浏览器进同一个查看器（#145-1）
-      return openPath(full);
+    if (f) { const full = p.path.replace(/\/$/, "") + "/" + f.dataset.file; return f.dataset.dir ? openFiles(full) : openPath(full); }
+    if (a === "instr-undo") {
+      delete (PJ.instrDrafts||(PJ.instrDrafts={}))[box.dataset.instrKey];
+      return renderProject(box);
     }
-    if (a === "instr-undo") { box.querySelector(".pj-instr").value = PJ.detail.instr || ""; box.querySelector(".pj-save").classList.add("hidden"); return; }
     if (a === "instr-save") {
-      const ta = box.querySelector(".pj-instr");
-      if (!ta || ta.dataset.pid !== p.id || PJ.detail.instrErr) return;    // 眼前的编辑框必须是这个项目的
-      const text = ta.value;
-      try { await jsend(`/api/projects/${encodeURIComponent(p.id)}/instr`, { text }, "PUT"); PJ.detail.instr = text; box.querySelector(".pj-save").classList.add("hidden"); toast(t("已保存")); }
+      const text = box.querySelector(".pj-instr").value;
+      const backend=box.dataset.instrBackend,entry=PJ.detail.instructions?.[backend],draftKey=box.dataset.instrKey,projectId=p.id;
+      if(!entry||entry.state==="unavailable")return toast(t("指令暂不可读取，请重新打开项目。"),true);
+      try {
+        await jsend("/api/projects/"+encodeURIComponent(p.id)+"/instr?backend="+backend,{text,name:entry.name,revision:entry.revision},"PUT");
+        delete (PJ.instrDrafts||(PJ.instrDrafts={}))[draftKey];
+        if(PJ.cur===projectId){PJ.detail=null;renderProject(box);}toast(backend==="codex"?t("已保存，Codex 请在新会话核验指令"):t("已保存"));
+      }
       catch (err) { toast(err.message, true); }
     }
   });
@@ -163,11 +209,16 @@
     e.preventDefault(); projMenu(p, c);
   });
   $("tab-projects").addEventListener("change", async (e) => {
-    const k = e.target.dataset.def; const p = PJ.detail && PJ.detail.project; if (!k || !p) return;
+    if(e.target.matches("[data-instr-core]")){
+      const p=PJ.detail?.project;if(!p)return;
+      (PJ.instrBackend||(PJ.instrBackend={}))[p.id]=e.target.value;return renderProject($("tab-projects"));
+    }
+    const cxkey=e.target.dataset.codexDef;
+    const k = cxkey||e.target.dataset.def; const p = PJ.detail && PJ.detail.project; if (!k || !p) return;
     // 换接口时型号一起清掉：旧型号名是给原来那家的
-    const patch = k === "provider" ? { provider: e.target.value, model: "" } : { [k]: e.target.value };
-    try { const r = await jsend("/api/projects/" + encodeURIComponent(p.id), patch, "PATCH"); Object.assign(p, r.project); toast(t("已保存")); loadProjects(); if (k === "provider") renderProject($("tab-projects")); }
-    catch (err) { e.target.value = p[k] || ""; toast(err.message, true); }   // 没存上：下拉框回到真正存着的值（审查 E11）
+    const patch = cxkey ? {codex:{[k]:e.target.value}} : k === "provider" ? { provider: e.target.value, model: "" } : { [k]: e.target.value };
+    try { const r = await jsend("/api/projects/" + encodeURIComponent(p.id), patch, "PATCH"); Object.assign(p, r.project); toast(t("已保存")); loadProjects(); if (k === "provider"||cxkey) {renderProject($("tab-projects"));if(view.projectId===p.id)refreshSessModel();} }
+    catch (err) { e.target.value = cxkey ? (p.codex?.[k] || "") : (p[k] || ""); toast(err.message, true); }
   });
   function openProject(id) { PJ.cur = id; PJ.detail = null; if (curPage !== "projects") openPage("projects"); else { renderProjects(); $("page-body").scrollTop = 0; } }
   /** 在项目里开新对话：换到空白会话，记下项目，发第一条时网关在项目目录里跑 */
@@ -292,6 +343,7 @@
   function curProject() { return view.sessionId ? pjOfSession(view.sessionId) : pjById(view.projectId); }
   let projForModel;
   function paintProjChip() {
+    updateCodexCapabilityProject();
     // 新会话换了项目：项目可能指定了自己的接口 / 型号，模型标签跟着换
     if (!view.sessionId && projForModel !== (view.projectId || null)) { projForModel = view.projectId || null; refreshSessModel(); }
     const el = $("proj-chip"); if (!el) return;
@@ -314,10 +366,11 @@
     const cur = pjOfSession(id);
     const run = (srv.runs || []).some((r) => r.sessionId === id);
     if (run) return toast(t("这个会话还在跑，等它停下再挪"), true);
-    popMenu(anchor, [{ head: t("移到项目（会话记录跟着挪到项目目录）") }, { label: t("不放进项目"), icon: cur ? "" : PI.check, fn: () => mv(null) },
+    const codex=((state.sessions||[]).find(s=>s.id===id)||(sess.hits||[]).find(s=>s.id===id))?.backend==="codex";
+    popMenu(anchor, [{ head: codex?t("移到项目（切换工作目录，保留对话上下文）"):t("移到项目（会话记录跟着挪到项目目录）") }, { label: t("不放进项目"), icon: cur ? "" : PI.check, fn: () => mv(null) },
       ...PJ.list.map((p) => ({ label: p.name, icon: cur && cur.id === p.id ? PI.check : PI.folder, fn: () => mv(p.id) }))]);
     async function mv(pid) {
-      try { await jsend(`/api/sessions/${encodeURIComponent(id)}/move`, { projectId: pid }); toast(pid ? t("已移到「{n}」", { n: pjById(pid).name }) : t("已移出项目")); PJ.detail = null; if (curPage === "projects" && PJ.cur) renderProjects(); loadSessions(); loadProjects(); }
+      try { await jsend(`/api/sessions/${encodeURIComponent(id)}/move`, { projectId: pid }); toast(pid ? t("已移到「{n}」", { n: pjById(pid).name }) : t("已移出项目")); await loadSessions(); await loadProjects(); }
       catch (err) { toast(err.message, true); }
     }
   }
@@ -342,21 +395,21 @@
     const row = (x) => {
       const p = x.projectId && pjById(x.projectId);
       const last = running.has(x.id) ? `<span class="pill acc">${esc(t("在跑"))}</span>` : x.last ? `<span class="pill ${x.last.st === "ok" ? "ok" : x.last.st === "err" ? "err" : ""}">${x.last.st === "ok" ? pi("check") : x.last.st === "err" ? pi("x") : ""}${esc(whenText(x.last.at))}</span>` : `<span class="pill">${esc(t("没跑过"))}</span>`;
-      const lk = blocked.has(x.id) ? `<span class="pill err">${esc(t("订阅账户 · 不会跑"))}</span>` : x.projectId && !p && PJ.list.length ? `<span class="pill err">${esc(t("项目已删除 · 不会跑"))}</span>` : "";
-      return `<div class="row pj-row" data-task="${esc(x.id)}"><div class="grow"><div class="t1">${esc(x.name)}</div>
+      const lk = blocked.has(x.id) ? `<span class="pill err">${esc(t("订阅账户 · 不会跑"))}</span>` : "";
+      return `<div class="row pj-row" data-task="${esc(x.id)}"><div class="grow"><div class="t1">${esc(x.name)} <span class="pill">${x.backend==="codex"?"Codex":"Claude"}</span></div>
         <div class="muted pj-sub">${esc(freqText(x.freq))}${p ? " · " + pjMark(p) : ""} · ${esc(x.on ? (x.nextAt ? t("下次 {w}", { w: whenText(x.nextAt) }) : t("不会再跑")) : t("已关"))}</div></div>${lk}${last}${swHtml(x.on, `data-sw="${esc(x.id)}" aria-label="${esc(t("开关"))}"`)}</div>`;
     };
     const b = D.budget || {}, daily = b.daily || 0, today = b.today || 0, m = b.month || {};
     const pct = daily ? Math.min(100, today / daily * 100) : 0;
     box.innerHTML = pageHead(esc(t("定时任务")), `<button class="btn sm pj-primary" data-a="new">${pi("plus")}${esc(t("新建"))}</button>`) + missed + (SC.err ? staleRow(SC.err, "sc-retry") : "") +
-      `<div class="sc-note">${esc(t("到点在本机跑一次 Claude，在指定目录里；跑完按设置通知你，结果存成一个对话。没人在旁边：要问你的操作一律当拒绝。错过的不会偷偷补跑，按每个任务的设置来。"))}</div>` +
+      `<div class="sc-note">${esc(t("到点用选定的核心在指定目录里运行；跑完通知你，结果存成一个对话。没人值守时按任务权限执行，需要提问的操作会拒绝。错过后按任务设置处理。"))}</div>` +
       (tasks.length ? `<div class="seg-scroll">${segOf("flt", [["all", t("全部")], ["on", t("开着的")], ["off", t("关着的")]], SC.flt)}</div>` : "") +
       `<div class="panel">${list.length ? list.map(row).join("") : emptyRow(tasks.length ? t("没有") : t("还没有定时任务。比如每天早上让它看一眼 CI。"))}</div>
       <div class="pj-sec"><span class="grow">${esc(t("花费与额度"))}</span></div>
       <div class="panel"><div class="row"><div class="grow"><b>${esc(daily ? t("今天 {a} / 每日上限 {b}", { a: costText(today), b: costText(daily) }) : t("今天 {a} · 不设每日上限", { a: costText(today) }))}</b>
-          ${daily ? `<div class="bar-mini"><i style="width:${pct.toFixed(1)}%"></i></div>` : ""}<div class="muted pj-sub">${esc(t("到上限后当天其余任务跳过，并通知你。只算官方接口的花费：第三方端口不计花费，每日上限对它不生效。"))}</div></div><button class="btn sm ghost" data-a="budget">${esc(t("改上限"))}</button></div>
+          ${daily ? `<div class="bar-mini"><i style="width:${pct.toFixed(1)}%"></i></div>` : ""}<div class="muted pj-sub">${esc(t("花费只统计已报告金额。Codex 花费未知，设有花费上限时不会运行。"))}</div></div><button class="btn sm ghost" data-a="budget">${esc(t("改上限"))}</button></div>
         <div class="row"><div class="grow"><b>${esc(t("本月 {c} · 跑了 {n} 次", { c: costText(m.cost || 0), n: m.runs || 0 }))}</b><div class="muted pj-sub">${esc(t("成功 {a} · 失败 {b} · 跳过 {c}", { a: m.ok || 0, b: m.err || 0, c: m.skip || 0 }))}</div></div></div></div>
-      <div class="pj-sec"><span class="grow">${esc(t("订阅账户"))}</span></div>
+      <div class="pj-sec"><span class="grow">${esc(t("Claude 订阅账户"))}</span></div>
       <div class="panel"><div class="row"><div class="grow"><b>${esc(t("允许用订阅账户跑"))}</b><div class="muted pj-sub">${esc(t("官方登录的订阅账户默认不跑定时任务。打开前请自己确认：无人值守使用以 Anthropic 条款为准。用 API Key 的接口不受影响。"))}</div>
           ${blocked.size ? `<div class="muted pj-sub warn">${esc(t("{n} 个任务会用订阅账户，现在不会跑", { n: blocked.size }))}</div>` : ""}</div>${swHtml(!!D.allowLogin, `data-swlogin="1" aria-label="${esc(t("允许用订阅账户跑"))}"`)}</div></div>
       <div class="pj-sec"><span class="grow">${esc(t("叫醒"))}</span></div>
@@ -380,10 +433,9 @@
     const pauseNow = x.skipNext ? "skip" : x.pausedUntil > Date.now() ? "until" : "none";
     const yes = (b) => b ? t("是") : t("否");
     const kv = [
-      // 项目删了不能显示成「工作区」：任务到点会跳过，要重新选项目（#178-7）
-      [t("在哪"), p ? pjMark(p) : x.projectId ? `<span class="pj-gone">${esc(t("项目已删除：到点会跳过，编辑任务重新选个项目"))}</span>` : esc(t("工作区"))],
-      [t("会话"), esc(x.session === "same" ? t("接着同一个对话（带着上次的上下文）") : t("每次新开一个对话"))
-        + (x.session === "same" && x.lostSid ? ` <span class="pj-gone">${esc(t("原来接着的对话已经删了，下次新开一个"))}</span>` : "")],
+      [t("核心"),x.backend==="codex"?"Codex":"Claude"],
+      [t("在哪"), p ? pjMark(p) : esc(t("工作区"))],
+      [t("会话"), esc(x.session === "same" ? t("接着同一个对话（带着上次的上下文）") : t("每次新开一个对话"))],
       [t("型号"), esc([x.model ? prettyModel(x.model) : t("跟随项目 / 全局"), x.effort].filter(Boolean).join(" · "))],
       [t("权限"), esc((x.perm === "proj" ? t("可以改项目目录里的文件") : x.perm === "custom" ? t("只允许：{l}", { l: x.tools || "—" }) : t("只读")) + t("；要问你的操作一律当作拒绝"))],
       [t("条件"), esc([x.cond && x.cond.wifi ? t("只在 Wi-Fi 下") : "", x.cond && x.cond.charging ? t("只在充电时") : "", x.cond && x.cond.battery ? t("电量低于 {p}% 跳过", { p: x.cond.battery }) : ""].filter(Boolean).join(" · ") || t("连着网就跑"))],
@@ -404,7 +456,7 @@
       <div class="pj-sec"><span class="grow">${esc(t("怎么跑"))}</span></div>
       <div class="panel sc-kvp"><dl class="sc-kv">${kv.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("")}</dl></div>
       <div class="pj-sec"><span class="grow">${esc(t("运行记录"))}</span>${segOf("rflt", [["all", t("全部")], ["bad", t("没成的")]], SC.rflt)}<button class="btn sm" data-a="run"${d.running ? " disabled" : ""}>${pi("play")}${esc(d.running ? t("在跑…") : t("立刻跑一次"))}</button></div>
-      <div class="panel">${runs.length ? runs.map((r, i) => `<div class="row pj-row"${r.sid && !r.trial ? ` data-sid="${esc(r.sid)}"` : r.full ? ` data-full="${i}"` : ""}>${stIcon(r.st)}<div class="grow"><div class="t1">${esc(r.msg || "—")}</div><div class="muted pj-sub">${esc([whenText(r.at), r.dur ? durText(r.dur) : "", r.st !== "skip" ? costText(r.cost || 0) : "", r.trial ? t("试跑") : "", r.attempt ? t("第 {n} 次重试", { n: r.attempt }) : ""].filter(Boolean).join(" · "))}</div></div>${r.sid ? pi("chev", "pj-go") : ""}</div>`).join("") : emptyRow(t("还没跑过"))}${d.runsTotal > (d.runs || []).length ? `<div class="row muted pj-sub">${esc(t("只列出最近 {n} 次，一共跑过 {m} 次", { n: (d.runs || []).length, m: d.runsTotal }))}</div>` : ""}</div>`;
+      <div class="panel">${runs.length ? runs.map((r) => `<div class="row pj-row"${r.sid && !r.trial ? ` data-sid="${esc(r.sid)}"` : ""}>${stIcon(r.st)}<div class="grow"><div class="t1">${esc(r.msg || "—")}</div><div class="muted pj-sub">${esc([whenText(r.at), r.dur ? durText(r.dur) : "", r.st !== "skip" ? (r.costKnown===false?t("花费未知"):costText(r.cost || 0)) : "", r.trial ? t("试跑") : "", r.attempt ? t("第 {n} 次重试", { n: r.attempt }) : ""].filter(Boolean).join(" · "))}</div></div>${r.sid ? pi("chev", "pj-go") : ""}</div>`).join("") : emptyRow(t("还没跑过"))}</div>`;
   }
   $("tab-sched").addEventListener("click", async (e) => {
     if (e.target.closest("input.sw")) return;       // 开关走 change
@@ -494,9 +546,11 @@
   }
 
   // ── 新建 / 编辑定时任务 ──
-  function taskDlg(x, preset) {
+  let taskDlgSeq=0;
+  async function taskDlg(x, preset) {
+    const my=++taskDlgSeq,origin=curPage;
     const edit = !!(x && x.id);
-    const v = Object.assign({ name: "", prompt: "", projectId: null, freq: { kind: "daily", time: "09:00" }, session: "new", perm: "ro", tools: "", model: "", effort: "",
+    const v = Object.assign({ backend:currentBackend(),name: "", prompt: "", projectId: null, freq: { kind: "daily", time: "09:00" }, session: "new", perm: "ro", tools: "", model: "", effort: "",
       cond: { wifi: false, charging: false, battery: 0 }, busy: "queue", limitCost: 0, limitMin: 15, retry: 0, missed: "ask", notify: "all", quiet: "", saveSession: true, carryLast: false, until: { kind: "ever" } }, x || {}, preset || {});
     // 「仅一次」的默认日期是本地日历的明天：toISOString() 是 UTC，东八区凌晨会算成今天（0.6.10 审计 197-5.12）
     const dtm = new Date(); dtm.setDate(dtm.getDate() + 1);
@@ -517,22 +571,25 @@
       once: () => `<div class="pj-inline"><input class="pj-field pj-date" type="date" id="f-date" value="${esc(f.date)}"> ${tm("f-time", f.time)}</div><div class="pj-hint">${esc(t("跑完自动关掉。"))}</div>`,
       cron: () => `<div class="pj-inline"><input class="pj-field mono" id="f-cron" value="${esc(f.cron)}" spellcheck="false" style="width:13em"></div><div class="pj-hint">${esc(t("标准五段式 cron：分 时 日 月 周。"))}</div>`,
     };
-    const models = MODELS.length ? MODELS : [];
-    const effs = PJ.effLevels && PJ.effLevels.length ? PJ.effLevels : ["low", "medium", "high", "xhigh", "max"];
+    let initialCatalog={};try{initialCatalog=await api("/api/models?backend="+v.backend);}catch{}
+    if(my!==taskDlgSeq||origin!==curPage)return;
+    const models = initialCatalog.models || [];
+    const effs = initialCatalog.effortLevels?.length ? initialCatalog.effortLevels : ["low","medium","high","xhigh"];
     const cost = [0, 0.1, 0.3, 0.5, 1, 2, 5];
     // 任务所属项目被删了：下拉里补一条，保存时别把 projectId 悄悄清成 null 改成工作区跑（195-K.2）
     const projOpts = [["", t("工作区")], ...PJ.list.map((p) => [p.id, t("项目：{n}", { n: p.name })])];
     if (v.projectId && !PJ.list.some((p) => p.id === v.projectId)) projOpts.push([v.projectId, t("已删除的项目（{id}）", { id: v.projectId })]);
     const body = frow(t("名称"), `<input class="pj-field" id="t-name" value="${esc(v.name)}" placeholder="${esc(t("比如：每天早上看 CI"))}" autocomplete="off">`) +
-      frow(t("要 Claude 做什么"), `<textarea class="pj-field" id="t-prompt" placeholder="${esc(t("写清楚做什么、做完怎么交代。没人在旁边：它不能问你问题。"))}">${esc(v.prompt)}</textarea>`,
+      frow(t("要做什么"), `<textarea class="pj-field" id="t-prompt" placeholder="${esc(t("写清楚做什么、做完怎么交代。没人在旁边：它不能问你问题。"))}">${esc(v.prompt)}</textarea>`,
         esc(t("想「没事就别吵我」：让它没发现时只回一句固定的话（比如「全绿」），下面的通知选「只在有发现时」。"))) +
+      frow(t("核心"),sel("t-backend",[["claude","Claude"],["codex","Codex"]],v.backend)+`<div class="pj-hint" id="t-backend-note"></div>`) +
       frow(t("在哪跑"), sel("t-proj", projOpts, v.projectId || "")) +
       frow(t("什么时候"), `<div class="seg-scroll">${segOf("kind", [["daily", t("每天")], ["weekly", t("每周")], ["monthly", t("每月")], ["every", t("每隔几小时")], ["once", t("仅一次")], ["cron", t("自定义")]], f.kind)}</div><div class="pj-sub-form" id="t-freq">${FREQ[f.kind]()}</div><div class="pj-hint" id="t-next"></div>`) +
       frow(t("会话"), rcards("session", [["new", t("每次新开一个对话"), esc(t("互不干扰；结果一次一个，好翻"))], ["same", t("接着同一个对话"), esc(t("带着上次的上下文（适合「和上次比有什么变化」）；越跑越长，会自动压缩"))]], v.session)) +
       frow(t("权限"), rcards("perm", [["ro", t("只读"), esc(t("能看文件、跑查询类命令，不改任何东西（先这样试几天）"))], ["proj", t("可以改项目目录里的文件"), esc(t("目录外的写入、安装软件、删除等一律当作拒绝"))], ["custom", t("自己挑允许的工具"), esc(t("比如只允许 Bash(git *) 和 WebFetch；其余一律拒绝"))]], v.perm) +
         `<input class="pj-field mono${v.perm === "custom" ? "" : " hidden"}" id="t-tools" value="${esc(v.tools || "")}" placeholder="Bash(git *),WebFetch,Read" spellcheck="false">`) +
       `<button type="button" class="pj-col" data-col aria-expanded="false">${pi("chev")}${esc(t("更多设置"))}</button><div class="pj-colbody hidden">` +
-      frow(t("型号"), `<div class="panel">${usableProvs().length > 1 || v.provider ? line(t("接口"), sel("t-prov", provChoices(t("跟随项目 / 全局"), v.provider), v.provider || "")) : ""}${line(t("型号"), sel("t-model", [["", t("跟随项目 / 全局")], ...models.map((m) => [m.id, prettyModel(m.id)]), ...(v.model && !models.some((m) => m.id === v.model) ? [[v.model, prettyModel(v.model)]] : [])], v.model || ""))}${line(t("思考强度"), sel("t-effort", [["", t("跟随项目 / 全局")], ...effs.map((e) => [e, e])], v.effort || ""))}</div>`) +
+      frow(t("型号"), `<div class="panel"><div id="t-prov-row">${line(t("接口"), sel("t-prov", provChoices(t("跟随项目 / 全局"), v.provider), v.provider || ""))}</div>${line(t("型号"), sel("t-model", [["", t("跟随项目 / 全局")], ...models.map((m) => [m.id, prettyModel(m.id)]), ...(v.model && !models.some((m) => m.id === v.model) ? [[v.model, prettyModel(v.model)]] : [])], v.model || ""))}${line(t("思考强度"), sel("t-effort", [["", t("跟随项目 / 全局")], ...effs.map((e) => [e, e])], v.effort || ""))}</div>`) +
       frow(t("条件（不满足就跳过这次，记一笔）"), `<div class="panel">${line(t("只在 Wi-Fi 下"), swHtml(v.cond.wifi, 'id="t-wifi"'))}${line(t("只在充电时"), swHtml(v.cond.charging, 'id="t-chg"'))}${line(t("电量低于多少就跳过"), sel("t-bat", [[0, t("不管")], [15, "15%"], [30, "30%"], [50, "50%"]], v.cond.battery || 0))}</div>`) +
       frow(t("到点时有别的对话在跑"), segOf("busy", [["queue", t("排队等它跑完")], ["skip", t("跳过这次")], ["run", t("照跑")]], v.busy), esc(t("「照跑」占一个并行名额（设置 → 后台与并行）；排队最多等 30 分钟，等不到算跳过。"))) +
       frow(t("限制"), `<div class="panel">${line(t("单次花费上限"), sel("t-cost", cost.map((c) => [c, c ? costText(c) : t("不限")]).concat(cost.includes(+v.limitCost) ? [] : [[v.limitCost, costText(v.limitCost)]]), v.limitCost || 0), t("超了就停，记成失败；只对官方接口生效"))}<div class="muted pj-sub hidden" id="t-costnote">${esc(t("这个任务用的是第三方端口：不计花费，单次花费上限和每日上限对它都不生效，靠时长上限兜底。"))}</div>${line(t("单次时长上限"), sel("t-min", [5, 15, 30, 60, 90, 180].map((n) => [n, n < 60 ? t("{n} 分钟", { n }) : t("{n} 小时", { n: n / 60 })]), v.limitMin || 15))}${line(t("失败了"), sel("t-retry", [[0, t("不重试")], [1, t("重试 1 次")], [2, t("重试 2 次")]], v.retry || 0), t("网络断、接口报错、超上限"))}${line(t("错过了"), sel("t-missed", [["ask", t("下次打开问我")], ["run", t("开机后立刻补跑一次")], ["skip", t("跳过")]], v.missed), t("关机、被系统冻结、没网"))}</div>`) +
@@ -581,7 +638,7 @@
       if (e.target.id === "t-notify") q("#t-quiet-row").classList.toggle("hidden", e.target.value !== "found");
     });
     const collect = () => ({
-      name: q("#t-name").value.trim(), prompt: q("#t-prompt").value.trim(), projectId: q("#t-proj").value || null, freq: readFreq(),
+      backend:q("#t-backend").value,name: q("#t-name").value.trim(), prompt: q("#t-prompt").value.trim(), projectId: q("#t-proj").value || null, freq: readFreq(),
       session: picked(o, "session"), perm: picked(o, "perm"), tools: q("#t-tools").value.trim(), model: q("#t-model").value, effort: q("#t-effort").value, provider: q("#t-prov") ? q("#t-prov").value : "",
       cond: { wifi: q("#t-wifi").checked, charging: q("#t-chg").checked, battery: +q("#t-bat").value }, busy: picked(o, "busy"),
       limitCost: +q("#t-cost").value, limitMin: +q("#t-min").value, retry: +q("#t-retry").value, missed: q("#t-missed").value,
@@ -597,58 +654,58 @@
       if (q("#t-model").disabled) return toast(t("型号清单还在加载，稍等再保存"), true);
       if (b.freq.kind === "weekly" && !b.freq.days.length) return toast(t("每周至少挑一天"), true);
       if (b.notify === "found" && !b.quiet) return toast(t("「只在有发现时」要填没发现时它回的那句话"), true);
-      btn.disabled = true;
+      const button=e.currentTarget;button.disabled = true;
       try {
         const r = edit ? await jsend("/api/sched/" + encodeURIComponent(x.id), b, "PATCH") : await jsend("/api/sched", b);
         OV.close(o); toast(edit ? t("已保存") : t("已创建：{f}", { f: freqText(r.task.freq) }));
         SC.cur = r.task.id; SC.detail = null; await loadSched();
         if (curPage !== "sched") openPage("sched"); else renderSched();
-      } catch (err) { btn.disabled = false; toast(err.message, true); }
+      } catch (err) { button.disabled = false; toast(err.message, true); }
     });
-    // 试跑按网关里已保存的任务跑：改了没保存就先说清，别拿旧配置的结果冒充新改的（#178-6）
-    let touched = false;
-    for (const ev of ["input", "change", "pick"]) o.addEventListener(ev, (e) => { if (e.type === "pick" || e.isTrusted) touched = true; });
-    o.addEventListener("click", (e) => { if (e.target.closest("[data-day]")) touched = true; });
-    q("#t-try")?.addEventListener("click", () => {
-      if (touched) return toast(t("改动还没保存：试跑跑的是已保存的版本，先点「保存」再试跑"), true);
-      runTaskNow(x, true);
-    });
-    // 换接口：型号下拉换成那家的清单（旧型号名是给原来那家的，清掉）
-    let fmN = 0, fmPid = "";
-    // 这个任务真用哪家：接口留空（跟随）时和网关一样先看所选项目指定的那家，再落到全局（#143-1：以前空接口一律当全局，列出的是全局那家的型号）
-    const effProv = () => (q("#t-prov") ? q("#t-prov").value : "") || (PJ.list.find((p) => p.id === q("#t-proj").value) || {}).provider || "";
-    const fillModels = async (keep) => {
-      // 快速连换接口：慢的那家清单迟到不许盖掉现在这家的（审查 E04）
-      const n = ++fmN, pid = effProv(), msel = q("#t-model");
-      fmPid = pid;
-      if (!msel) return;
-      // 清单回来之前型号框锁住、旧型号先清掉：否则这时点保存会存成「新接口 + 旧型号」（审查 #52 E04）
-      const cur = keep ? msel.value : "";
-      if (!keep) msel.innerHTML = `<option value="" selected>${esc(t("跟随项目 / 全局"))}</option>`;
-      msel.disabled = true;
-      const ms = await provModelsOf(pid);
-      if (n !== fmN || !msel.isConnected) return;
-      costNote();   // 接口清单这时才可能到齐
-      msel.disabled = false;
-      msel.innerHTML = [["", t("跟随项目 / 全局")], ...ms.map((m) => [m.id, prettyModel(m.id)]), ...(cur && !ms.some((m) => m.id === cur) ? [[cur, prettyModel(cur)]] : [])]
-        .map(([a, b]) => `<option value="${esc(a)}"${a === cur ? " selected" : ""}>${esc(b)}</option>`).join("");
-    };
-    // 第三方端口不计花费（195-U.3 用户定）：用的不是官方那家就把金额上限不生效写在旁边
+    q("#t-try")?.addEventListener("click", () => runTaskNow(x, true));
+    const effProv = () => q("#t-prov").value || (PJ.list.find(p => p.id === q("#t-proj").value) || {}).provider || "";
     const costNote = () => {
-      const pid = effProv() || globalProv(), pv = (state.provList || []).find((x) => x.id === pid);
-      q("#t-costnote")?.classList.toggle("hidden", !pv || !!pv.nativeModels);
+      const pid = effProv() || globalProv(), pv = (state.provList || []).find(x => x.id === pid);
+      q("#t-costnote")?.classList.toggle("hidden", q("#t-backend").value === "codex" || !pv || !!pv.nativeModels);
     };
-    q("#t-prov")?.addEventListener("change", costNote);
-    q("#t-proj").addEventListener("change", costNote);
-    costNote();
-    q("#t-prov")?.addEventListener("change", () => fillModels(false));
-    // 接口跟随项目时换了项目：有效那家可能变了，型号清单跟着换（同一家就不动，免得清掉已选的）
-    q("#t-proj").addEventListener("change", () => { if (!(q("#t-prov") ? q("#t-prov").value : "") && effProv() !== fmPid) fillModels(false); });
-    if (effProv() && effProv() !== globalProv()) fillModels(true);
-    if (!MODELS.length && !PJ.mLoaded) api("/api/models").then((r) => {
-      MODELS = r.models || []; PJ.mLoaded = true; PJ.effLevels = r.effortLevels || [];
-      if (o.isConnected && q("#t-model")) fillModels(true);   // 清单晚到：把已经打开的对话框下拉补上（195-K.6）
-    }).catch(() => {});
+    q("#t-proj").addEventListener("change", () => { costNote(); fillModels(false); });
+    let modelSeq=0;
+    const fillModels=async keep=>{
+      const seq=++modelSeq,be=q("#t-backend").value,pid=effProv();
+      let r;try{r=await api("/api/models?backend="+be+(be==="claude"&&pid?"&browse="+encodeURIComponent(pid):""));}catch{return;}
+      if(seq!==modelSeq||!o.isConnected||q("#t-backend").value!==be)return;
+      if (be === "claude" && r.providers) state.provList = r.providers;
+      costNote();
+      const ms=r.models||[],cur=keep?q("#t-model").value:"";
+      q("#t-model").innerHTML=[["",t("跟随项目 / 全局")],...ms.map(m=>[m.id,m.name||m.id]),...(cur&&!ms.some(m=>m.id===cur)?[[cur,cur]]:[])].map(([a,b])=>opt(a,b,cur)).join("");
+      const eff=q("#t-effort").value,levels=r.effortLevels||["low","medium","high","xhigh"];
+      q("#t-effort").innerHTML=[["",t("跟随项目 / 全局")],...[...new Set([...levels,...(eff?[eff]:[])])].map(e=>[e,e])].map(([a,b])=>opt(a,b,eff)).join("");
+    };
+    const syncBackend=changed=>{
+      const cx=q("#t-backend").value==="codex";
+      q("#t-prov-row").classList.toggle("hidden",cx);
+      if(changed){
+        q("#t-prov").value="";q("#t-model").value="";q("#t-effort").value="";q("#t-tools").value="";
+        for(const el of o.querySelectorAll('[data-name="perm"] > .pj-rc'))el.classList.toggle("on",el.dataset.v==="ro");
+        q("#t-tools").classList.add("hidden");
+      }
+      q("#t-cost").disabled=cx;if(cx)q("#t-cost").value="0";
+      q("#t-save").disabled=cx;if(cx)q("#t-save").checked=true;
+      q("#t-tools").placeholder=cx?"cccodroid_read_file,cccodroid_search":"Bash(git *),WebFetch,Read";
+      const descriptions=cx?{
+        ro:t("只使用宿主只读工具，不写文件、不执行脚本。"),
+        proj:t("允许宿主编辑工作目录内的文件；命令执行仍拒绝。"),
+        custom:t("填写完整 Codex 工具名。允许执行工具后，命令可能访问目录外的内容。"),
+      }:{ro:t("能看文件、跑查询类命令，不改任何东西（先这样试几天）"),proj:t("目录外的写入、安装软件、删除等一律当作拒绝"),custom:t("比如只允许 Bash(git *) 和 WebFetch；其余一律拒绝")};
+      for(const el of o.querySelectorAll('[data-name="perm"] > .pj-rc'))el.querySelector("small").textContent=descriptions[el.dataset.v];
+      q("#t-backend-note").textContent=cx?t("Codex 按任务权限运行，保留结果会话；花费未知，设有花费上限时不会运行。切换核心或项目后会另开会话。"):t("切换核心或项目后会另开会话，原会话保留。");
+      if(cx)q("#t-prov").value="";
+      costNote();
+    };
+    q("#t-backend").addEventListener("change",()=>{syncBackend(true);fillModels(false);});
+    q("#t-prov").addEventListener("change",()=>fillModels(false));
+    syncBackend(false);
+    if(v.provider&&v.provider!==globalProv())fillModels(true);
     setTimeout(() => (edit ? null : q("#t-name").focus()), 50);
   }
 
@@ -700,8 +757,8 @@
     closeDrawer();
     renderSideNav();
     refreshStatus();
-    if (name === "sessions") { loadSessions(); if (sess.mode === "trash") loadTrash(); }   // 回收站视图重进也要重读，别接着画上回的（#178-5）
-    if (name === "caps") loadCaps();
+    if (name === "sessions") loadSessions();
+    if (name === "caps") showCapabilitiesCore(["claude","codex"].includes(cat)?cat:currentBackend());
     if (name === "ext") loadExt();
     if (SUBNAVS[name]) paintSubnav(name);
     if (name === "help") loadHelp();

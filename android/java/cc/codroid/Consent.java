@@ -36,15 +36,18 @@ import java.util.concurrent.ConcurrentHashMap;
  *   · 验签用的公钥不信 entry 上的证书（同 uid 能 setKeyEntry 换成自己的，11-04 报告 A1），只信硬件密钥认证链：
  *     链到 Google 认证根、扩展里写明每次验证 / 本机生成 / 本应用 / challenge 对得上，规则见 KeyAttest；
  *   · 关掉 = 删掉这条的钥匙，之前留下的签名一起作废：旧链和旧签名放回新生成的 entry 上，创建时间对不上，翻不了案。
+ * 默认以普通应用设置持久保存，恢复无锁屏设备的使用体验。用户可在设备与权限中选择强认证保存。
+ * 普通保存与同 uid 工具脚本共享文件权限，不提供防同 uid 篡改保证。强认证模式下：
  * 安卓 11 以下、没设锁屏、或这台设备做不了硬件密钥认证（没有 Google 根、KeyMint 以前的老硬件）：
  * 签不了，只在本次运行有效。以前存的同意没有认证链，升级后要重新打开一次。
  */
 final class Consent {
     static final String TAG = "cccodroid-consent";
-    static final String NOASK = "noask", KEEPALIVE = "keepalive", DEV_ON = "dev.on", DEV_A11Y = "dev.a11y", WEBDEBUG = "webdebug", SHZ_AUTO = "shz.autostart";
+    static final String NOASK = "noask", NOASK_SELF = "noask.self", NOASK_SCREEN = "noask.screen", KEEPALIVE = "keepalive", DEV_ON = "dev.on", DEV_A11Y = "dev.a11y", WEBDEBUG = "webdebug", SHZ_AUTO = "shz.autostart";
     private static final String PREFS = "consent", ALIAS = "cc_consent_";
     /** 本次运行确认过或验过签的：名字 → 值 */
     private static final Map<String, String> MEM = new ConcurrentHashMap<>();
+    private static final Map<String, Long> REVISIONS = new ConcurrentHashMap<>();
     /** 等着弹锁屏验证去签名的（只由 grant 放进来，外面没法塞） */
     private static final ArrayDeque<String[]> PENDING = new ArrayDeque<>();
     private static final Object LOCK = new Object();
@@ -86,6 +89,10 @@ final class Consent {
             if (v != null) return v;
             SharedPreferences p = sp(c);
             String val = p.getString("v." + name, null), sig = p.getString("s." + name, null);
+            if (!strong(c)) {
+                String local = p.getString("local." + name, null);
+                if (local != null) { MEM.put(name, local); return local; }
+            }
             if (val == null || sig == null) return null;
             if (!verify(c, name, val, sig)) { Log.w(TAG, name + " 的签名验不过，当作没同意"); return null; }
             MEM.put(name, val);
@@ -94,7 +101,38 @@ final class Consent {
     }
     static boolean on(Context c, String name) { return get(c, name) != null; }
 
-    /** 能不能存到下次启动：安卓 11+（每次验证的钥匙 + 锁屏密码验证）且设了锁屏 */
+    static boolean strong(Context c) { return sp(c).getBoolean("strong", false); }
+
+    /** Only called after the native confirmation dialog. Never migrate legacy prefs automatically. */
+    static void setStrong(Context c, boolean enabled) {
+        synchronized (LOCK) {
+            for (String name : new String[]{NOASK, NOASK_SELF, NOASK_SCREEN, KEEPALIVE, DEV_ON, DEV_A11Y, WEBDEBUG, SHZ_AUTO}) get(c, name);
+            if (!sp(c).edit().putBoolean("strong", enabled).commit())
+                throw new IllegalStateException("保存验证方式失败");
+            PENDING.clear();
+            // Preserve the user's active choices; re-save them using the selected protection.
+            for (Map.Entry<String, String> e : new java.util.HashMap<>(MEM).entrySet())
+                grant(c, e.getKey(), e.getValue());
+        }
+    }
+
+    static org.json.JSONObject status(Context c) throws Exception {
+        org.json.JSONArray saved = new org.json.JSONArray(), temporary = new org.json.JSONArray();
+        for (String name : new String[]{NOASK, NOASK_SELF, NOASK_SCREEN, KEEPALIVE, DEV_ON, DEV_A11Y, WEBDEBUG, SHZ_AUTO}) {
+            String value = get(c, name);
+            if (value == null) continue;
+            boolean stored = !strong(c) && value.equals(sp(c).getString("local." + name, null));
+            if (!stored && value.equals(sp(c).getString("v." + name, null))) {
+                String sig = sp(c).getString("s." + name, null);
+                stored = sig != null && verify(c, name, value, sig);
+            }
+            (stored ? saved : temporary).put(label(name, value));
+        }
+        return new org.json.JSONObject().put("strong", strong(c)).put("canAuthenticate", persistable(c))
+            .put("saved", saved).put("temporary", temporary);
+    }
+
+    /** 强认证保存需要安卓 11+ 且设了安全锁屏。普通保存不受此限制。 */
     static boolean persistable(Context c) {
         if (Build.VERSION.SDK_INT < 30) return false;
         KeyguardManager km = c.getSystemService(KeyguardManager.class);
@@ -108,11 +146,24 @@ final class Consent {
     static void grant(Context c, String name, String value) {
         synchronized (LOCK) {
             MEM.put(name, value);
+            long revision = REVISIONS.getOrDefault(name, 0L) + 1;
+            REVISIONS.put(name, revision);
+            PENDING.removeIf((x) -> x[0].equals(name));
             // 旧签名先作废：值变了（读屏 自动 → 常开）不能让旧的那份还验得过
             dropSaved(c, name);
-            if (!persistable(c)) return;
+            if (!strong(c)) {
+                if (!sp(c).edit().putString("local." + name, value).commit())
+                    new android.os.Handler(c.getMainLooper()).post(() ->
+                        android.widget.Toast.makeText(c, "保存失败，只在这次运行有效", android.widget.Toast.LENGTH_LONG).show());
+                return;
+            }
+            if (!persistable(c)) {
+                new android.os.Handler(c.getMainLooper()).post(() ->
+                    android.widget.Toast.makeText(c, "未设置可用的安全锁屏：此设置只在本次运行有效，可关闭保存时验证身份", android.widget.Toast.LENGTH_LONG).show());
+                return;
+            }
             PENDING.removeIf((x) -> x[0].equals(name));
-            PENDING.add(new String[]{name, value});
+            PENDING.add(new String[]{name, value, String.valueOf(revision)});
         }
         try { c.startActivity(MainActivity.internal(c, MainActivity.ACTION_CONSENT).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)); }
         catch (Exception e) { Log.w(TAG, "弹不出锁屏验证", e); }
@@ -122,13 +173,14 @@ final class Consent {
     static void revoke(Context c, String name) {
         synchronized (LOCK) {
             MEM.remove(name);
+            REVISIONS.put(name, REVISIONS.getOrDefault(name, 0L) + 1);
             PENDING.removeIf((x) -> x[0].equals(name));
             dropSaved(c, name);
         }
     }
 
     private static void dropSaved(Context c, String name) {
-        sp(c).edit().remove("v." + name).remove("s." + name).commit();
+        sp(c).edit().remove("v." + name).remove("s." + name).remove("local." + name).commit();
         try { KeyStore ks = KeyStore.getInstance("AndroidKeyStore"); ks.load(null); ks.deleteEntry(ALIAS + name); }
         catch (Exception e) { Log.w(TAG, "删钥匙失败 " + name, e); }
     }
@@ -145,6 +197,9 @@ final class Consent {
 
     private static String label(String name, String value) {
         switch (name) {
+            case SHZ_AUTO: return "重启手机后自动重新激活";
+            case NOASK_SCREEN: return "屏幕工具免确认";
+            case NOASK_SELF: return "涉及自身的特权命令也免确认";
             case NOASK: return Tr.t("特权命令不再逐条确认");
             case KEEPALIVE: return Tr.t("后台保活增强");
             case DEV_ON: return Tr.t("设备工具");
@@ -166,7 +221,7 @@ final class Consent {
     private static void runNext0(Activity a) {
         String[] job;
         synchronized (LOCK) {
-            if (running) return;
+            if (running || !strong(a)) return;
             // 界面正在关：留着等下次界面起来（MainActivity 收到 ACTION_CONSENT 或重新打开时）再问
             if (a.isDestroyed() || a.isFinishing()) return;
             job = PENDING.poll();
@@ -176,6 +231,7 @@ final class Consent {
             running = true;
         }
         final String name = job[0], value = job[1];
+        final long revision = Long.parseLong(job[2]);
         Signature s;
         try {
             KeyPairGenerator g = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore");
@@ -201,13 +257,13 @@ final class Consent {
             done(a, Tr.f("没能保存「{0}」，只在这次运行有效：", label(name, value)) + e.getMessage());
             return;
         }
-        BiometricPrompt bp = new BiometricPrompt.Builder(a)
+        try {
+            BiometricPrompt bp = new BiometricPrompt.Builder(a)
             .setTitle(Tr.t("用锁屏验证保存这项设置"))
             .setSubtitle(label(name, value))
-            .setDescription(Tr.t("验证后，重启 cccodroid 也会保持打开。不验证的话只在这次运行有效。这样别的程序就改不了这项设置。"))
+            .setDescription(Tr.t("验证后用认证密钥签名保存，重启 cccodroid 仍有效。不验证只在本次运行有效。应用和工具共享权限，签名验证不能替代进程隔离。"))
             .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG | BiometricManager.Authenticators.DEVICE_CREDENTIAL)
             .build();
-        try {
             bp.authenticate(new BiometricPrompt.CryptoObject(s), new CancellationSignal(), a.getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
                 @Override public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult r) {
                     try {
@@ -216,7 +272,9 @@ final class Consent {
                         String sig = Base64.encodeToString(sg.sign(), Base64.NO_WRAP);
                         synchronized (LOCK) {
                             // 验证期间用户又把它关了：别存
-                            if (value.equals(MEM.get(name))) sp(a).edit().putString("v." + name, value).putString("s." + name, sig).commit();
+                            if (!strong(a) || !value.equals(MEM.get(name)) || REVISIONS.getOrDefault(name, 0L) != revision) { done(a, "设置已关闭，没有保存"); return; }
+                            if (!sp(a).edit().putString("v." + name, value).putString("s." + name, sig).commit())
+                                throw new java.io.IOException("写入授权设置失败");
                         }
                         Log.i(TAG, "已保存 " + name);
                         done(a, Tr.f("已保存：{0}", label(name, value)));

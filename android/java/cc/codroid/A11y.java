@@ -131,55 +131,92 @@ public class A11y extends AccessibilityService {
     }
 
     // ── 读屏 ─────────────────────────────────────────────────────────────
+    private static final class ReadSnapshot {
+        final A11y owner;
+        final AccessibilityNodeInfo root;
+        final List<AccessibilityNodeInfo> found = new ArrayList<>(), emptyWebViews = new ArrayList<>();
+        final List<String> signatures = new ArrayList<>();
+        final StringBuilder out = new StringBuilder();
+        int meaningful;
+        ReadSnapshot(A11y owner, AccessibilityNodeInfo root) { this.owner = owner; this.root = root; }
+    }
+    private static boolean readBlocked() { return Priv.asking() || MainActivity.guarding(); }
+    private static JSONObject unreadable() throws Exception {
+        synchronized (LOCK) { nodes.clear(); sigs.clear(); }
+        return new JSONObject().put("ok", false).put("message", Tr.t("拿不到当前界面（锁屏、或者是不让读的安全界面）"));
+    }
     static JSONObject read(boolean all) throws Exception {
-        A11y s = self;
         touch();
-        AccessibilityNodeInfo root = s.getRootInActiveWindow();
-        JSONObject r = new JSONObject().put("ok", true);
-        if (root == null) return r.put("ok", false).put("message", Tr.t("拿不到当前界面（锁屏、或者是不让读的安全界面）"));
-        r.put("package", String.valueOf(root.getPackageName()));
-        for (AccessibilityWindowInfo w : s.getWindows())
-            if (w.isActive() && w.getTitle() != null) { r.put("window", w.getTitle().toString()); break; }
-        StringBuilder out = new StringBuilder();
-        synchronized (LOCK) {
-            nodes.clear(); sigs.clear();
-            walk(root, 0, all, out);
-        }
-        // 网页（WebView / 浏览器）在无障碍刚打开时还没生成内容树，只露出一个空壳：等一下再读一次
-        if (nodes.size() <= 2 && out.indexOf("WebView") >= 0) {
-            Thread.sleep(800);
-            root.refresh();
-            out.setLength(0);
-            synchronized (LOCK) { nodes.clear(); sigs.clear(); walk(root, 0, all, out); }
-        }
+        final ReadSnapshot[] latest = {null};
+        ReadSnapshot ready = AwaitValue.poll(() -> {
+            A11y current = self;
+            if (current == null) { latest[0] = null; return null; }
+            ReadSnapshot previous = latest[0];
+            if (previous != null && previous.owner == current && !previous.emptyWebViews.isEmpty()) {
+                // Only invalidate the incomplete active subtree, never restart a service or replay an action.
+                try {
+                    boolean cleared = android.os.Build.VERSION.SDK_INT >= 33 && current.clearCachedSubtree(previous.root);
+                    if (!cleared) {
+                        previous.root.refresh();
+                        for (AccessibilityNodeInfo web : previous.emptyWebViews) if (web != previous.root) web.refresh();
+                    }
+                } catch (RuntimeException e) { Log.w(TAG, "read cache refresh", e); }
+            }
+            if (readBlocked()) return null;
+            // Always request the current root again; an obsolete previous root is never walked.
+            AccessibilityNodeInfo root = current.getRootInActiveWindow();
+            if (root == null || current != self) { latest[0] = null; return null; }
+            ReadSnapshot snapshot = new ReadSnapshot(current, root);
+            walk(root, 0, all, snapshot);
+            latest[0] = snapshot;
+            return snapshot.emptyWebViews.isEmpty() ? snapshot : null;
+        }, A11y::readBlocked, 2500, 100, android.os.SystemClock::uptimeMillis, Thread::sleep);
+        ReadSnapshot snapshot = ready != null ? ready : latest[0];
+        if (readBlocked() || snapshot == null || snapshot.owner != self) return unreadable();
+        AccessibilityNodeInfo root = snapshot.root;
+        JSONObject r = new JSONObject().put("ok", true).put("package", String.valueOf(root.getPackageName()));
+        for (AccessibilityWindowInfo w : snapshot.owner.getWindows())
+            if (w.isActive() && w.getId() == root.getWindowId() && w.getTitle() != null) { r.put("window", w.getTitle().toString()); break; }
         Rect sc = new Rect(); root.getBoundsInScreen(sc);
-        r.put("screen", sc.width() + "x" + sc.height());
-        r.put("count", nodes.size());
-        String txt = out.toString();
+        r.put("screen", sc.width() + "x" + sc.height()).put("count", snapshot.found.size());
+        String txt = snapshot.out.toString();
         if (txt.length() > 60000) txt = txt.substring(0, 60000) + "\n…(" + Tr.t("太长，截断了") + ")";
-        return r.put("tree", txt);
+        r.put("tree", txt);
+        if (!snapshot.emptyWebViews.isEmpty()) r.put("screen_partial", true).put("screen_warning",
+            "WebView only exposes a container; content may not be ready or accessible. Read again or use a screenshot if needed. Do not repeat a completed action solely because this screen is partial.");
+        synchronized (LOCK) {
+            if (readBlocked() || snapshot.owner != self) return unreadable();
+            // Publish only the final snapshot: intermediate retries never replace the public node numbers.
+            nodes.clear(); nodes.addAll(snapshot.found);
+            sigs.clear(); sigs.addAll(snapshot.signatures);
+        }
+        return r;
     }
 
-    private static void walk(AccessibilityNodeInfo n, int depth, boolean all, StringBuilder out) {
-        if (n == null || nodes.size() >= 800) return;
+    private static void walk(AccessibilityNodeInfo n, int depth, boolean all, ReadSnapshot snapshot) {
+        if (n == null || snapshot.found.size() >= 800) return;
+        StringBuilder out = snapshot.out;
         if (!n.isVisibleToUser()) return;
+        String cls = String.valueOf(n.getClassName());
+        boolean web = cls.equals("android.webkit.WebView") || cls.endsWith(".WebView");
         CharSequence text = n.getText(), desc = n.getContentDescription();
         // 密码框的内容不交给模型：有的应用 getText 给的是明文，不是圆点，也有把明文放进描述的，两样都不读
         // （框本身照样列出，标 password，还能填）
         boolean pw = n.isPassword();
         if (pw) { text = null; desc = null; }
         boolean click = n.isClickable() || n.isLongClickable(), edit = n.isEditable(), scroll = n.isScrollable();
-        boolean useful = all || pw || click || edit || scroll || n.isCheckable()
+        boolean semantic = pw || click || edit || scroll || n.isCheckable()
             || (text != null && text.length() > 0) || (desc != null && desc.length() > 0);
+        if (semantic && !web) snapshot.meaningful++;
+        boolean useful = all || semantic;
         int nextDepth = depth;
         if (useful) {
-            int id = nodes.size();
-            nodes.add(n);
-            sigs.add(sig(n));
+            int id = snapshot.found.size();
+            snapshot.found.add(n);
+            snapshot.signatures.add(sig(n));
             Rect b = new Rect(); n.getBoundsInScreen(b);
             for (int i = Math.min(depth, 12); i > 0; i--) out.append("  ");
             out.append('[').append(id).append("] ");
-            String cls = String.valueOf(n.getClassName());
             out.append(cls.substring(cls.lastIndexOf('.') + 1));
             if (text != null && text.length() > 0) out.append(" \"").append(clip(text)).append('"');
             if (desc != null && desc.length() > 0 && !String.valueOf(desc).equals(String.valueOf(text))) out.append(" (").append(clip(desc)).append(')');
@@ -197,7 +234,11 @@ public class A11y extends AccessibilityService {
             out.append('\n');
             nextDepth = depth + 1;
         }
-        for (int i = 0; i < n.getChildCount(); i++) walk(n.getChild(i), nextDepth, all, out);
+        int beforeChildren = snapshot.meaningful;
+        for (int i = 0; i < n.getChildCount(); i++) walk(n.getChild(i), nextDepth, all, snapshot);
+        // Layout-only wrappers (including all=true output) do not prove that web content is ready.
+        if (web && snapshot.meaningful == beforeChildren
+                && (text == null || text.length() == 0) && (desc == null || desc.length() == 0)) snapshot.emptyWebViews.add(n);
     }
 
     /** 编号的指纹：模型从屏幕树里认这个元素靠的那几样。输入框的文字会随输入变，不算；密码框的内容本来就不读 */
@@ -273,7 +314,7 @@ public class A11y extends AccessibilityService {
         JSONObject sc;
         try { sc = read(false); } catch (Throwable t) { return res; }
         if (!sc.optBoolean("ok")) return res.put("screen_error", sc.optString("message"));
-        for (String k : new String[] { "package", "window", "screen", "count", "tree" }) if (sc.has(k)) res.put(k, sc.get(k));
+        for (String k : new String[] { "package", "window", "screen", "count", "tree", "screen_partial", "screen_warning" }) if (sc.has(k)) res.put(k, sc.get(k));
         return res;
     }
 

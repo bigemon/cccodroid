@@ -184,7 +184,7 @@ test("L.2/L.3/L.4/L.6/L.9/L.11/12-10：样式修补都在 0.6.10 f1 追加块里
     "#chat pre code{font-size:calc(var(--fs-chat)*.862)}",
     ":root{--fg3:#8a857a}",
     "#ctxbar::after",
-    'html[dir="rtl"] #ctxbar:is(.warn,.danger) #ctxtxt',
+    "#ctxtxt,#ctxtxt *,#ctxtxt *::before{color:var(--fg);-webkit-text-stroke:1px var(--bg)",
     ".sr-only",
   ]) assert.ok(css.includes(s), "缺少样式：" + s);
 });

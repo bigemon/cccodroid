@@ -440,6 +440,7 @@ final class Updater {
     // ── 检查 ───────────────────────────────────────────────────────────
     /** 后台线程里跑。manual=true：用户点的"检查更新"——只查不自动装大件；auto 模式下顺带按规则自动下载/安装 */
     void checkAsync(boolean manual) {
+        if(FullBackupController.active()||FullBackupController.restartRequired())return;
         if (checking) return;
         checking = true;
         new Thread(() -> {
@@ -849,7 +850,7 @@ final class Updater {
         loopThread = new Thread(() -> {
             sleep(20_000);
             while (true) {
-                if (loopOn && auto() && System.currentTimeMillis() - prefs().getLong("lastCheck", 0) > AUTO_EVERY) checkAsync(false);
+                if (loopOn && !FullBackupController.active() && auto() && System.currentTimeMillis() - prefs().getLong("lastCheck", 0) > AUTO_EVERY) checkAsync(false);
                 sleep(30 * 60_000L);
             }
         }, "upd-loop");
@@ -880,6 +881,7 @@ final class Updater {
         Item it = id.equals("app") ? app : id.equals("devkit") ? devkit : id.equals("claude") ? claude : null;
         JSONObject r = new JSONObject();
         try {
+            if(FullBackupController.active()||FullBackupController.restartRequired())return r.put("ok",false).put("message","正在处理完整备份，暂不能更新环境");
             if (it == null) return r.put("ok", false).put("message", Tr.t("未知项 ") + id);
             if ("downloading".equals(it.state) || "installing".equals(it.state)) return r.put("ok", true).put("message", Tr.t("进行中"));
             if (it == claude) {
@@ -1010,6 +1012,7 @@ final class Updater {
     }
 
     /** 工具包正在下载 / 替换：这时装 APK 会把它拦腰截断 */
+    synchronized boolean backupBusy(){return checking||devkitMoving()||"installing".equals(claude.state)||"downloading".equals(claude.state)||"installing".equals(app.state)||"downloading".equals(app.state);}
     boolean devkitMoving() { return "downloading".equals(devkit.state) || "installing".equals(devkit.state); }
 
     /** 推迟 APK，等工具包这一步走完 */
@@ -1030,6 +1033,7 @@ final class Updater {
     }
 
     void installApp() {
+        if(FullBackupController.active()||FullBackupController.restartRequired())return;
         if (app.file == null || !app.file.isFile()) { app.set("error", Tr.t("安装包不见了，重新检查更新")); return; }
         if (deferApp(true)) return;
         // 冷启动从磁盘恢复的待装包可能已被换掉 / 已经装上了：安装前按包名、签名、targetSdk 方案和版本重核一遍（#123-2）

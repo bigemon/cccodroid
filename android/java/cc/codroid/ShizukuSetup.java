@@ -71,9 +71,7 @@ final class ShizukuSetup {
     private ShizukuSetup(Context c) {
         ctx = c;
         env = new Env(c);
-        NotificationChannel ch = new NotificationChannel(CH, Tr.t("Shizuku 激活"), NotificationManager.IMPORTANCE_HIGH);
-        ch.setDescription(Tr.t("无线调试配对码输入框、激活结果"));
-        c.getSystemService(NotificationManager.class).createNotificationChannel(ch);
+        ensureNotificationChannel(c);
         flushStaleNote(c);
         new Thread(this::sweepLegacyAdb, "shz-sweep").start();
     }
@@ -164,6 +162,7 @@ final class ShizukuSetup {
             && bootAt > sp.getLong("pairedAt", Long.MAX_VALUE) && sp.getLong("bootSeen", 0) < bootAt);
         o.put("bootAt", bootAt / 60000);                     // 本次开机的分钟数：前端据此把「我已允许」记到下次开机
         o.put("wireless", Build.VERSION.SDK_INT >= 30);
+        o.put("splitPairing", MainActivity.splitPairingStatus());
     }
 
     private void set(String p, String m) {
@@ -531,14 +530,16 @@ final class ShizukuSetup {
      * 重启后、或 Shizuku 被杀后自动重新激活。条件：用户没关这个开关、配对过、有 WRITE_SECURE_SETTINGS。
      * 开机时 Wi‑Fi 可能还没连上，最多等 3 分钟。
      */
+    boolean backupBusy(){return busy;}
     void reactivateAsync(boolean boot) {
+        if(FullBackupController.maintenance())return;
         if (!autostart() || !prefs().getBoolean("paired", false) || !hasWss()) return;
         if (Build.VERSION.SDK_INT < 30 || !Priv.installed() || Priv.sui()) return;   // Sui 随系统起，不用无线调试拉
         new Thread(() -> {
             try {
                 if (boot) Thread.sleep(10_000);
                 for (int i = 0; i < 18 && !onWifi(); i++) Thread.sleep(10_000);
-                if (Priv.running() || busy) return;
+                if (FullBackupController.maintenance() || Priv.running() || busy) return;
                 busy = true;
                 wifiOrig = wirelessOn();
                 try {
@@ -814,6 +815,13 @@ final class ShizukuSetup {
     }
 
     // ── 通知 ───────────────────────────────────────────────────────────
+    /** Also used by split reminders; creating the channel must not initialize activation / ADB. */
+    static void ensureNotificationChannel(Context c) {
+        NotificationChannel ch = new NotificationChannel(CH, Tr.t("Shizuku 激活"), NotificationManager.IMPORTANCE_HIGH);
+        ch.setDescription(Tr.t("无线调试配对码输入框、激活结果"));
+        c.getSystemService(NotificationManager.class).createNotificationChannel(ch);
+    }
+
     private void pairNote(String text, boolean withInput) {
         Notification.Builder b = new Notification.Builder(ctx, CH)
             .setSmallIcon(android.R.drawable.ic_secure)

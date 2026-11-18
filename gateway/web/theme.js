@@ -23,11 +23,19 @@
   try { if (k) sessionStorage.setItem("cc.bk", k); else k = sessionStorage.getItem("cc.bk") || ""; } catch {}
   const PLAIN = ["hasPane", "paneCanBack", "whatsNew", "nightMode", "keyed", "wallColor"];
   const KEYED = ["privShot", "openUrl", "paneOpen", "paneBounds", "paneGoBack", "paneClose", "openBrowser", "shareText", "copyText",
-    "pickDevkit", "uninstall", "unfreeze", "ensureGateway", "whatsNewSeen", "setBars", "skinPref", "accentPref", "langPref", "themePref", "saveAs", "previewNet", "skinPal", "gcPal", "shareDone", "inputFocus"];
+    "fullBackup", "fullBackupUi", "pickDevkit", "uninstall", "unfreeze", "ensureGateway", "whatsNewSeen", "setBars", "skinPref", "accentPref", "langPref", "themePref", "saveAs", "previewNet", "skinPal", "gcPal", "shareDone", "inputFocus"];
   const w = {};
   for (const m of PLAIN) if (typeof raw[m] === "function") w[m] = (...a) => raw[m](...a);
   for (const m of KEYED) if (typeof raw[m] === "function") w[m] = (...a) => raw[m](k, ...a);
   window.CCApp = w;
+  try{
+    const rawUi=w.fullBackupUi&&w.fullBackupUi();
+    if(rawUi){
+      const values=JSON.parse(rawUi);
+      for(const key of Object.keys(localStorage))if(key.startsWith("cc.")||key.startsWith("ccapp."))localStorage.removeItem(key);
+      for(const [key,value]of Object.entries(values))if((key.startsWith("cc.")||key.startsWith("ccapp."))&&typeof value==="string")localStorage.setItem(key,value);
+    }
+  }catch(e){console.warn("Backup UI state could not be restored");}
 })();
 
 (function () {

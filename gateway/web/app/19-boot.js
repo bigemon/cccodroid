@@ -184,6 +184,28 @@
       setStatus(t("正在连接网关…")); refreshStatus();
     };
   }
+  function paintSessionStatus() {
+    const s = state.serverStatus;
+    if (!s) return;
+    const pending = sessionBackendPending(), codex = currentBackend() === "codex";
+    paintAcct(s);
+    paintModel(curModel() || (codex || pending ? "" : s.model) || "—");
+      const auth = s.keyMode === "login" ? s.auth : null;
+      const credTxt = s.keyMode !== "login" ? (s.hasKey ? t("已配置密钥") : t("未配置"))
+        : !auth ? t("官方登录态")
+        : auth.unknown ? t("官方登录态 · 问不出登录状态")
+        : auth.stale ? (auth.loggedIn ? t("官方登录态 · 上次问到时已登录") : t("官方登录态 · 上次问到时未登录"))
+        : auth.loggedIn ? t("官方登录态 · 已登录") : t("官方登录态 · 未登录");
+    const detail = codex || pending ? "" :
+      `${t("运行时")}   ${s.ready ? t("就绪") : t("缺失")}\n${t("上游")}     ${s.upstream}\n${t("凭据")}     ${credTxt}\n`;
+    $("status-box").textContent =
+      `${t("网关")}     ${s.version} (pid ${s.pid})\n` +
+      `${t("当前会话的后端")}   ${pending ? t("读取中…") : codex ? "Codex" : "Claude"}\n` +
+      `${t("厂商")}     ${pending ? t("读取中…") : provLabel(curProv()) || provName(s)}\n` +
+      detail +
+      `${t("模型")}     ${pending ? t("读取中…") : curModel() || t("默认")}\n` +
+      `${t("生成")}     ${s.busy ? t("进行中") : t("空闲")}\n${t("工作区")}   ${s.workspace}`;
+  }
   async function refreshStatus() {
     const ok = latest("status");   // 迟到的旧快照不许把厂商 / 安全模式 / 状态文字画回去（0.6.9 审计 195-BB.3）
     try {
@@ -198,48 +220,25 @@
       }
       if (s.uiTag) uiTag = s.uiTag;
       if (s.product && document.title !== s.product) document.title = s.product;
-      // 接口换了（或第一次拿到状态）：顶栏的额度 / 余额跟着换
-      if (!QB.cur || QB.cur.id !== s.provider || QB.cur.login !== (s.keyMode === "login")) {
-        if ((QB.cur ? QB.cur.id : qbLast && qbLast.id) !== s.provider) qbPaint({ text: "", lvl: 0 });   // 先画的是别家的：撤掉，等新的
-        state.serverStatus = s; qbLoad(false).catch(() => {});
-      }
       state.serverStatus = s;
-      state.safeMode = !!s.safeMode;      // 权限下拉按它算实际生效的那档（0.6.9 审计 P1-12 前端半）
-      paintAcct(s);
-      paintSafeMode(s.safeMode);
+      state.safeMode = !!s.safeMode;
       recheckSetup();
-      // 日志分享靠安卓壳（cccodroid）打包、弹分享面板；旧版应用没有
-      // 打包诊断、到 GitHub 反馈只有 cccodroid 有：整行藏起来
+      paintSessionStatus();
+      const pid = curProv();
+      if (currentBackend() === "codex" || !QB.cur || QB.cur.id !== pid || (!QB.cur.codex && QB.cur.login !== (provOf(pid)?.keyMode === "login" || pid === s.provider && s.keyMode === "login"))) qbLoad(false).catch(() => {});
+      paintSafeMode(s.safeMode);
       $("btn-share-logs").closest(".srow").classList.toggle("hidden", s.product !== "cccodroid");
       $("btn-issue").closest(".srow").classList.toggle("hidden", s.product !== "cccodroid");
       $("btn-ledger").classList.toggle("hidden", !s.hasLedger);
-      paintModel(curModel() || s.model || "—");
       state.model = s.model;
-      // 登录态以 /api/status 的 auth 为准：配了「官方账户」不等于真的还登着；问不出（unknown）不算未登录，
-      // stale 是沿用上次问到的结果，要标出来（0.6.9 审计 195-G.3）
-      const auth = s.keyMode === "login" ? s.auth : null;
-      const credTxt = s.keyMode !== "login" ? (s.hasKey ? t("已配置密钥") : t("未配置"))
-        : !auth ? t("官方登录态")
-        : auth.unknown ? t("官方登录态 · 问不出登录状态")
-        : auth.stale ? (auth.loggedIn ? t("官方登录态 · 上次问到时已登录") : t("官方登录态 · 上次问到时未登录"))
-        : auth.loggedIn ? t("官方登录态 · 已登录") : t("官方登录态 · 未登录");
-      const needLogin = !!auth && auth.loggedIn === false && !auth.unknown;
-      $("status-box").textContent =
-                `${t("网关")}     ${s.version} (pid ${s.pid})\n` +
-        `${t("运行时")}   ${s.ready ? t("就绪") : t("缺失")}\n` +
-        `${t("厂商")}     ${provName(s)}\n` +
-        `${t("上游")}     ${s.upstream}\n` +
-        `${t("凭据")}     ${credTxt}\n` +
-        `${t("DNS 桥")}   ${s.bridge ? t("已连接") : t("未启动")}\n` +
-        `${t("模型")}     ${s.model || t("(由 claude 决定)")}\n` +
-        `${t("生成")}     ${s.busy ? t("进行中") : t("空闲")}${s.queued ? t(" · 排队 {n} 条", { n: s.queued }) : ""}\n` +
-        `${t("工作区")}   ${s.workspace}`;
+      const needLogin = s.keyMode === "login" && s.auth?.loggedIn === false && !s.auth.unknown;
       if (es && !srv.connected) {
         // SSE 断了但 HTTP 还通：这里以前画成「就绪」，把「正在重连」盖掉（0.6.9 审计 195-BB.2）。
         // 同时用 /api/state 补一份快照，别让徽标、权限条、工具卡冻结在断线前
         setStatus(t("与网关断开，正在重连…（生成不受影响）"), "warn");
         api("/api/state").then(applyState).catch(() => {});
       } else if (!s.busy) {
+        if (currentBackend() === "codex" || sessionBackendPending()) { setStatus(srv.connected ? t("就绪") : t("已连接网关"), "ok"); return; }
         // 官方账户实际没登录（或上次问到时没登）就别再说「就绪」：一发消息就失败（0.6.9 审计 195-G.3）
         setStatus(needLogin ? t("需要登录账户") : s.ready && s.hasKey ? t("就绪") : s.hasKey ? t("运行时缺失") : t("需要配置密钥"),
           s.ready && s.hasKey && !needLogin ? "ok" : "warn");

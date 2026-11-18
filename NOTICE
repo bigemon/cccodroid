@@ -9,6 +9,8 @@ this product. It is downloaded by the user from Anthropic's official channel and
 run unmodified, subject to Anthropic's terms.
 
 Bundled third-party components:
+  - Nayuki QR Code generator 1.8.0 (MIT) — gateway/gw/remote/qrcodegen.js
+    (license included in source; provenance: third_party/qrcodegen/README.md)
   - Shizuku-API 13.1.5 (MIT) — third_party/shizuku/LICENSE
   - xz-decompress 0.2.3 (MIT) — devkit/vendor/xz-decompress (build-time only)
   - node-forge 1.4.0 (BSD-3-Clause OR GPL-2.0, used under BSD-3-Clause) —

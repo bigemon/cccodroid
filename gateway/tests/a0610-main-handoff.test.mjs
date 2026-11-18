@@ -12,7 +12,7 @@ import { NEXT } from "../gw/http.mjs";
 const stream = await import("../gw/stream.mjs");
 const { SKILLS_DIR, routeExtensions } = await import("../gw/extensions.mjs");
 const { QUEUE, RUN_LANE, enqueue, snapshot } = await import("../gw/queue.mjs");
-const { RUNS, maxParallel } = await import("../gw/runs.mjs");
+const { RUNS, SESSIONS, maxParallel } = await import("../gw/runs.mjs");
 
 test("订阅额度：utilization 一律按比例换成百分数，超额度显示 120 而不是 1.2", () => {
   const ev = (u5, u7) => ({ type: "rate_limit_event", rate_limit_info: { status: "allowed", unifiedWindows: {
@@ -51,6 +51,7 @@ test("队列快照：定时任务条目带 sched，普通消息不带", () => {
   const fake = [];
   while (RUNS.size < maxParallel()) { const id = "a0610h-busy" + fake.length; fake.push(id); RUNS.set(id, { id, text: "", startedAt: Date.now(), log: [], idle: false, ended: false, lane: "x:" + id }); }
   const sid = crypto.randomUUID();
+  SESSIONS.set(sid, Date.now()); // The dual-backend router requires an existing session owner.
   const a = enqueue({ message: "任务", sessionId: sid, internal: true, sched: { taskId: "t1", name: "x" } });
   const b = enqueue({ message: "普通", sessionId: sid });
   try {
@@ -60,6 +61,7 @@ test("队列快照：定时任务条目带 sched，普通消息不带", () => {
     assert.equal(qa.sched, true);
     assert.equal(qb.sched, undefined);
   } finally {
+    SESSIONS.delete(sid);
     for (const id of fake) { RUNS.delete(id); RUN_LANE.delete(id); } for (const it of [a, b]) { const i = QUEUE.indexOf(it); if (i >= 0) QUEUE.splice(i, 1); } }
 });
 

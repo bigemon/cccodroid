@@ -9,6 +9,7 @@ import { PATHS } from "../gw/config.mjs";
 import { listSessions, sessionMisc, PINS, NAMES } from "../gw/sessions.mjs";
 import { noteManaged, managedSince } from "../gw/sessmanaged.mjs";
 import { archiveDb } from "../gw/archive-store.mjs";
+import { upsertCodexSession, removeCodexSession } from "../gw/codex/store.mjs";
 import { forkSession } from "../gw/sessionops.mjs";
 
 const dir = path.join(PATHS.projects, "zz-misc-external-test");
@@ -71,4 +72,14 @@ test("分叉 / 回退出来的新会话记账，不会被当成外部会话", ()
   assert.ok(r.ok, JSON.stringify(r));
   delete NAMES[r.id];   // 分叉会自动起名；去掉名字，确认靠的是记账而不是改名豁免
   assert.equal(row(r.id).misc, false);
+});
+
+test("外部 Claude 杂项归类不隐藏或误分类 Codex，混合列表总数保持", () => {
+  const sid=id(500),before=listSessions(500).total;
+  try {
+    upsertCodexSession({id:sid,cwd:"/tmp",title:"Codex mixed-index fixture",createdAt:new Date(later).toISOString()});
+    const all=listSessions(500),rec=all.find(x=>x.id===sid);
+    assert.equal(rec.backend,"codex");assert.notEqual(rec.misc,true);
+    assert.equal(all.total,before+1);assert.equal(row(id(1)).misc,true);
+  } finally { removeCodexSession(sid); }
 });

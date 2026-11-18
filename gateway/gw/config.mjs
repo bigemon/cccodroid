@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+import crypto from "node:crypto";
 
 // 测试绕过 scripts/test.mjs 直接跑（node --test / node xx.test.mjs）时环境里是真 home：
 // 一导入网关模块就会读写真的会话、运行标记、定时任务。没有 CCAPP_TEST 一律不让起（#49 P2-18）
@@ -55,6 +56,17 @@ export const PATHS = {
 
 // 给 glibc 程序 --preload 的库（冒号分隔）。经加载器时 Env.java 给的是 seccomp-enosys.so + exec-shim.so
 export const GLIBC_PRELOAD = process.env.CCAPP_GLIBC_PRELOAD || (PATHS.preload && fs.existsSync(PATHS.preload) ? PATHS.preload : "");
+
+// ── 实例身份（P6-B2）────────────────────────────────────────────────
+// 同一台设备可能同时跑多个网关（正式 8791 / 开发 8795）。子进程归属靠这三样区分：
+//   HOME_ID      = home 路径的短哈希（同一 home 的多个实例共享）
+//   INSTANCE_ID  = 本次启动唯一（写进子进程环境，子孙继承）
+//   children 表  = 本实例登记过的 pid + 启动时间，下次启动据此清理
+export const HOME_ID = crypto.createHash("sha256").update(CFG.home).digest("hex").slice(0, 12);
+export const INSTANCE_ID = `${HOME_ID}-${process.pid}-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
+export const INSTANCE_FILE = path.join(CFG.home, ".ccapp-instance.json");
+export const CHILDREN_FILE = path.join(CFG.home, ".ccapp-children.json");
+export const CHILD_ENV_KEY = "CCAPP_INSTANCE_ID";
 /** glibc 进程的环境：摘掉 LD_PRELOAD —— 经加载器时网关环境里挂着 termux-exec（bionic 库），glibc 的 ld.so 读到直接报 invalid ELF header */
 export function glibcEnv(env = process.env) {
   const e = { ...env };

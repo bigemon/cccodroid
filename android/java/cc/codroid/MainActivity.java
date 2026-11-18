@@ -44,23 +44,44 @@ public class MainActivity extends Activity {
     static final String ACTION_APPLY_DEVKIT = "cc.codroid.APPLY_DEVKIT";
     // 内部动作的口令：MainActivity 是导出的（启动器、分享要用），别的应用也能发这些 action 让我们去下 650MB 工具包、
     // 重装 APK（审查 v0.5.5 Android-M2）。我们自己发的 Intent / PendingIntent 都带上这个口令，对不上的一律不理。
-    // 口令不再明文落盘（0.6.10 审计 200-1-06）：由 Android Keystore 里不可导出的 HMAC 密钥派生，跨进程重启 / 应用更新都不变
-    // （通知里的 PendingIntent 才一直有效）。Keystore 用不了就退回「本次启动随机、只放内存」—— 那种情况下旧通知点了不响应，
-    // 但口令无论如何不写回磁盘。旧版本存在 shared_prefs 里的明文 k 启动时删掉
+    // Keystore 可能在冷启动时阻塞数秒：只能在后台派生。预热期间使用进程随机口令；
+    // 预热后发出的通知使用持久口令。两者在本进程都有效，口令仍不落盘。
     static final String IK = "cc.ik";
     private static final String IK_ALIAS = "cc-ik";
-    private static volatile String ikCache;
+    private static final IntentKeys intentKeys = new IntentKeys();
+    static void warmIntentKey(android.content.Context c) {
+        android.content.Context app = c.getApplicationContext();
+        intentKeys.start(() -> {
+            android.content.SharedPreferences sp = app.getSharedPreferences("intent", MODE_PRIVATE);
+            if (sp.contains("k")) sp.edit().remove("k").commit();
+            return ikFromKeystore();
+        }, work -> {
+            Thread t = new Thread(() -> {
+                long at = android.os.SystemClock.elapsedRealtime();
+                work.run();
+                android.util.Log.i("cccodroid", "内部动作密钥后台预热完成，耗时 "
+                    + (android.os.SystemClock.elapsedRealtime() - at) + "ms");
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    Thread refresh = new Thread(GatewayService::refreshIntentNotification, "intent-note");
+                    refresh.setDaemon(true); refresh.start();
+                });
+            }, "intent-key");
+            t.setDaemon(true); t.start();
+        });
+    }
     static String intentKey(android.content.Context c) {
-        if (ikCache != null) return ikCache;
-        android.content.SharedPreferences sp = c.getSharedPreferences("intent", MODE_PRIVATE);
-        if (sp.contains("k")) sp.edit().remove("k").commit();   // 旧版的明文口令作废
-        String k = ikFromKeystore();
-        if (k == null) {
-            byte[] b = new byte[24]; new java.security.SecureRandom().nextBytes(b);
-            StringBuilder h = new StringBuilder(); for (byte x : b) h.append(String.format("%02x", x & 0xff));
-            k = h.toString();
-        }
-        return ikCache = k;
+        warmIntentKey(c);
+        return intentKeys.current();
+    }
+    static void checkInternal(android.content.Context c, Intent i, java.util.function.Consumer<Boolean> answer) {
+        warmIntentKey(c);
+        Handler main = new Handler(Looper.getMainLooper());
+        intentKeys.check(i == null ? null : i.getStringExtra(IK),
+            (task, delay) -> main.postDelayed(task, delay),
+            ok -> main.post(() -> answer.accept(ok)));
+    }
+    static boolean internalMatches(Intent i) {
+        return i != null && intentKeys.matches(i.getStringExtra(IK));
     }
     /** 从 Keystore 的 HMAC 密钥派生口令；设备不支持 / 密钥损坏时返回 null，由调用方退回内存随机 */
     private static String ikFromKeystore() {
@@ -86,10 +107,6 @@ public class MainActivity extends Activity {
     static Intent internal(android.content.Context c, String action) {
         return new Intent(c, MainActivity.class).setAction(action).putExtra(IK, intentKey(c));
     }
-    private boolean fromUs(Intent i) {
-        String k = i.getStringExtra(IK);
-        return k != null && java.security.MessageDigest.isEqual(k.getBytes(), intentKey(this).getBytes());
-    }
     static final String ACTION_UPDATE = "cc.codroid.UPDATE";
     /** 设置页「恢复初始设置」：网关只能请求弹框（Priv 的 factory_reset），执行要用户在这里点 */
     static final String ACTION_FACTORY_RESET = "cc.codroid.FACTORY_RESET";
@@ -101,8 +118,55 @@ public class MainActivity extends Activity {
     static final String ACTION_SHIZUKU_NOOP = "cc.codroid.SHIZUKU_NOOP";
     /** 主界面（聊天）在前台吗：通知只在用户没盯着聊天时发 */
     static volatile boolean visible;
+    private static volatile java.lang.ref.WeakReference<MainActivity> foregroundOwner;
     /** 本应用有界面在前台吗（主界面或独立浏览器）：静默更新、读剪贴板这类按「用户在不在用本应用」判断（11-04 报告 A4） */
     static boolean appForeground() { return visible || BrowserActivity.visible; }
+
+    private static final SplitPairing splitPairing = new SplitPairing();
+
+    static org.json.JSONObject splitPairingStatus() throws org.json.JSONException {
+        SplitPairing.Result r=splitPairing.snapshot();
+        return new org.json.JSONObject().put("supported",SplitPairing.supported(Build.VERSION.SDK_INT))
+            .put("sdk",Build.VERSION.SDK_INT).put("phase",r.phase).put("path",r.path).put("message",Tr.t(r.message()));
+    }
+
+    /** Socket worker delegates to the actual foreground Activity; no background task launch. */
+    static org.json.JSONObject requestSplitPairing() throws Exception {
+        if(!SplitPairing.supported(Build.VERSION.SDK_INT))
+            return splitPairingStatus().put("ok",false).put("message",Tr.t("此 Android 版本不支持分屏。"));
+        MainActivity a=foregroundOwner==null?null:foregroundOwner.get();
+        if(a==null||!visible||a.isFinishing()||a.isDestroyed())
+            return splitPairingStatus().put("ok",false).put("message",Tr.t("请先回到 cccodroid 前台，再尝试分屏打开设置。"));
+        java.util.concurrent.FutureTask<SplitPairing.Result> work=new java.util.concurrent.FutureTask<>(()->splitPairing.start(new SplitPairing.Host(){
+            public int sdk(){return Build.VERSION.SDK_INT;}
+            public boolean foreground(){return visible&&!a.isFinishing()&&!a.isDestroyed()&&a.hasWindowFocus()&&!guarding()&&!FullBackupController.maintenance();}
+            public boolean visibleInMultiWindow(){return !a.isFinishing()&&!a.isDestroyed()&&visible&&a.isInMultiWindowMode();}
+            public void openAdjacent(){
+                SplitPairingNotice.dismiss(a);
+                Intent target=new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+                Bundle args=new Bundle();args.putString(":settings:fragment_args_key","toggle_adb_wireless");
+                target.putExtra(":settings:fragment_args_key","toggle_adb_wireless");
+                target.putExtra(":settings:show_fragment_args",args);
+                target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT);
+                a.startActivity(target);
+            }
+            public void later(Runnable task,int delay){a.ui.postDelayed(task,delay);}
+            public void showManualHint(){
+                SplitPairing.Result result=splitPairing.snapshot();
+                String message=Tr.t(result.message());
+                android.widget.Toast.makeText(a.getApplicationContext(),message,android.widget.Toast.LENGTH_LONG).show();
+                SplitPairingNotice.show(a,message,()->splitPairing.snapshot()==result);
+            }
+        }));
+        a.ui.post(work);
+        try {
+            SplitPairing.Result r=work.get(3,java.util.concurrent.TimeUnit.SECONDS);
+            return splitPairingStatus().put("ok",r.ok()).put("message",Tr.t(r.message()));
+        }catch(Exception e){
+            work.cancel(false);
+            return splitPairingStatus().put("ok",false).put("message",Tr.t("分屏请求未完成，请回到应用后重试。"));
+        }
+    }
 
     private Env env;
     private volatile boolean booted;
@@ -201,6 +265,8 @@ public class MainActivity extends Activity {
     }
 
     private void boot() {
+        if(FullBackupController.active()||FullBackupController.restartRequired()){ui.post(this::showBackupUi);return;}
+        if(BackupApplication.recoveryError!=null){say("✗ "+BackupApplication.recoveryError);return;}
         if (secondaryUser(this)) {
             say(Tr.t("✗ cccodroid 只能装在手机的主空间里。"));
             say(Tr.t("分身、第二空间、安全文件夹、工作资料里的应用目录路径不同，开发工具包跑不起来（Termux 也有同样的限制）。请卸载这里的 cccodroid，在主空间安装。"));
@@ -270,6 +336,7 @@ public class MainActivity extends Activity {
                 // 后台快速自检：只看文件在不在，缺了就提示修复
                 if (!upd.devkitMoving() && !upd.devkitStaged()) upd.verifyAsync(false);
             } catch (Exception e) {
+                if(e instanceof BackupHandoff)return;
                 android.util.Log.e("cccodroid-setup", "安装失败", e);
                 say("✗ " + humanize(e));
                 say(Tr.t("（下载过的部分都留着。处理好之后点「重试」，会从这一步接着来）"));
@@ -340,10 +407,10 @@ public class MainActivity extends Activity {
         @Override public void run() { FrameRate.apply(MainActivity.this); ui.postDelayed(this, 30000); }
     };
 
-    @Override protected void onResume() { super.onResume(); visible = true; applyLandBars(); Battery.foreground(true); FrameRate.apply(this);
+    @Override protected void onResume() { super.onResume(); visible = true; foregroundOwner = new java.lang.ref.WeakReference<>(this); applyLandBars(); Battery.foreground(true); FrameRate.apply(this);
         // 在后台从常驻通知点了「停止」、界面还活着：回来时把网关服务拉起来（审查 #105 06-007）。以前只有 boot 起服务，回来只能对着连不上的页面
         if (booted && !GatewayService.serviceUp()) GatewayService.start(this);
-        Consent.runNext(this);   // 上次排着的锁屏签名（界面当时正在关、没问成）
+        if(!FullBackupController.maintenance())Consent.runNext(this);   // 上次排着的锁屏签名（界面当时正在关、没问成）
         ui.removeCallbacks(fpsBeat); ui.postDelayed(fpsBeat, 30000);
         if (pane != null) pane.resume();
         pushWall();
@@ -408,6 +475,7 @@ public class MainActivity extends Activity {
     }
     @Override public void onMultiWindowModeChanged(boolean on, android.content.res.Configuration cfg) {
         super.onMultiWindowModeChanged(on, cfg);
+        if (on && splitPairing.multiWindowDetected()) SplitPairingNotice.dismiss(this);
         applyLandBars();
     }
     /** 壁纸主色（安卓 12+ 的动态取色，系统 system_accent1_500）；更早的系统没有，返回空串。
@@ -449,36 +517,68 @@ public class MainActivity extends Activity {
     }
 
     /** 第一次开读屏 / 点按前问一句（审查 v0.5.9 B4）：系统那套「此应用将能读取屏幕」的提示被我们写系统设置绕过了，这里补上 */
-    /** 确认框正显示着：同一时刻只弹一个。以前用 20 秒时间窗，开完总开关马上切读屏模式，
-     *  后一次请求会被静默吞掉（页面上还提示「请在弹出的对话框里确认」，框却不会出来）。 */
     private android.app.AlertDialog a11yDialog;
-    private void confirmA11y(String mode, boolean on) {
+    private String a11yDialogKey;
+
+    /** Called by the socket worker: acknowledge only after the foreground UI actually shows the dialog. */
+    static String requestA11yConfirmation(String mode, boolean on) {
+        MainActivity a = foregroundOwner == null ? null : foregroundOwner.get();
+        if (a == null || !visible || a.isFinishing() || a.isDestroyed()) return "请先回到 cccodroid 前台再设置读屏和点按";
+        java.util.concurrent.FutureTask<String> task = new java.util.concurrent.FutureTask<>(() -> a.confirmA11y(mode, on));
+        a.ui.post(task);
+        try { return task.get(3, java.util.concurrent.TimeUnit.SECONDS); }
+        catch (Exception e) { task.cancel(false); return "确认窗口未能显示，请回到应用前台后重试"; }
+    }
+
+    private String confirmA11y(String mode, boolean on) {
         boolean screen = "auto".equals(mode) || "on".equals(mode);
-        if (!screen && !on) return;
-        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) { ui.post(() -> confirmA11y(mode, on)); return; }
-        if (isFinishing() || isDestroyed()) return;
-        if (a11yDialog != null) { android.util.Log.i("cccodroid", "无障碍确认框正在显示，忽略重复请求"); return; }
-        final android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
+        if (!screen && !on) return "没有需要确认的设置";
+        if (!visible || isFinishing() || isDestroyed()) return "请先回到 cccodroid 前台再设置读屏和点按";
+        String key = (screen ? mode : "device") + ":" + on;
+        if (a11yDialog != null && a11yDialog.isShowing())
+            return key.equals(a11yDialogKey) ? null : "请先完成当前设备权限确认，再选择读屏模式";
+        android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
             .setTitle(screen ? Tr.t("允许 Claude 读屏和点按？") : Tr.t("打开设备工具？"))
-            .setMessage(screen ? Tr.t("打开后，Claude 能看到屏幕上的内容（包括别的应用里的），也能替你点按、输入。cccodroid 会直接打开无障碍服务，系统不会再提示。\n\n随时可以在 设置 → 设备工具 里关掉。")
+            .setMessage(screen ? Tr.t("打开后，Claude 能看到屏幕上的内容（包括别的应用里的），也能替你点按、输入。允许后 cccodroid 会尝试连接无障碍服务；如被系统限制，将引导你到系统设置启用。\n\n随时可以在 设置 → 设备工具 里关掉。")
                 : Tr.t("打开后，Claude 能读写剪贴板、发通知、打开应用、列出已装应用、分享文件。\n\n随时可以在 设置 → 设备工具 里关掉。"))
-            .setPositiveButton(Tr.t("允许"), (x, w) -> DeviceTools.a11yConfirmed(this, screen ? mode : "", on))
+            .setPositiveButton(Tr.t("允许"), (x, w) -> {
+                DeviceTools.a11yConfirmed(this, screen ? mode : "", on);
+                if (screen) connectA11yAfterConfirmation();
+            })
             .setNegativeButton(Tr.t("取消"), null)
             .create();
         a11yDialog = d;
-        d.setOnDismissListener((x) -> { if (a11yDialog == d) a11yDialog = null; });
-        try {
-            if (!guard(d, android.content.DialogInterface.BUTTON_POSITIVE)) { if (a11yDialog == d) a11yDialog = null; }
-        } catch (RuntimeException ex) {
-            if (a11yDialog == d) a11yDialog = null;
-            throw ex;
+        a11yDialogKey = key;
+        return guard(d, android.content.DialogInterface.BUTTON_POSITIVE) ? null : "确认窗口未能显示，请稍后重试";
+    }
+
+    private void connectA11yAfterConfirmation() {
+        if (!A11y.canToggle(this)) {
+            try { startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
+            catch (Exception e) { android.widget.Toast.makeText(this, "请在系统无障碍设置中启用 cccodroid", android.widget.Toast.LENGTH_LONG).show(); }
+            return;
         }
+        new Thread(() -> {
+            String why = A11y.enable(this, 4000);
+            if (why == null) return;
+            ui.post(() -> {
+                if (isFinishing() || isDestroyed() || !visible) return;
+                new android.app.AlertDialog.Builder(this)
+                    .setTitle("无障碍服务尚未连接")
+                    .setMessage(why + "\n\n请在系统无障碍设置中启用 cccodroid；如有“允许受限设置”，请先允许后再返回。")
+                    .setPositiveButton("去系统设置", (d, w) -> {
+                        try { startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
+                        catch (Exception e) { android.widget.Toast.makeText(this, "无法打开系统设置，请手动进入无障碍设置", android.widget.Toast.LENGTH_LONG).show(); }
+                    }).setNegativeButton("稍后", null).show();
+            });
+        }, "a11y-connect").start();
     }
 
     // ── 敏感确认框：显示期间设备工具不许动屏幕（DeviceTools.call），按钮一秒后才能点、被别的窗口盖住时不收触摸 ──
     private static final java.util.concurrent.atomic.AtomicInteger GUARDED = new java.util.concurrent.atomic.AtomicInteger();
     static boolean guarding() { return GUARDED.get() > 0; }
-    private boolean guard(android.app.AlertDialog d, int... buttons) {
+    private boolean guard(android.app.AlertDialog d, int... buttons) { return guardFor(d, 1000, buttons); }
+    private boolean guardFor(android.app.AlertDialog d, long waitMs, int... buttons) {
         GUARDED.incrementAndGet();
         final boolean[] gone = { false };
         d.setOnShowListener((x) -> {
@@ -487,7 +587,20 @@ public class MainActivity extends Activity {
                 if (btn == null) continue;
                 btn.setFilterTouchesWhenObscured(true);
                 btn.setEnabled(false);
-                ui.postDelayed(() -> btn.setEnabled(true), 1000);
+                if (waitMs <= 1000) ui.postDelayed(() -> btn.setEnabled(true), waitMs);
+                else {
+                    CharSequence label = btn.getText();
+                    final ConfirmationCountdown gate = new ConfirmationCountdown(waitMs, android.os.SystemClock.elapsedRealtime());
+                    Runnable tick = new Runnable() {
+                        @Override public void run() {
+                            if (!d.isShowing()) return;
+                            long left = gate.remaining(android.os.SystemClock.elapsedRealtime(), visible && d.getWindow().getDecorView().hasWindowFocus());
+                            if (left == 0) { btn.setText(label); btn.setEnabled(true); }
+                            else { btn.setText(label + "（" + ((left + 999) / 1000) + " 秒）"); ui.postDelayed(this, Math.min(left, 1000)); }
+                        }
+                    };
+                    tick.run();
+                }
             }
         });
         // 监听挂在 show 之前（getDecorView 会先把窗口内容建出来），关得再快也不会漏掉这次减计数
@@ -514,35 +627,45 @@ public class MainActivity extends Activity {
 
     /** 白名单以外的特权命令执行前问一句（见 Priv.ask / PrivRules）：关掉、按返回都算拒绝。
      *  按钮一秒后才能点，盖在上面的窗口挡着时不收触摸 —— 防止脚本抢在用户前面把「允许」点掉 */
-    private void confirmPriv(String id, String cmd, String who, boolean trustable, boolean sess, boolean noAskBox, boolean apk) {
+    private void confirmPriv(String id, String cmd, String who, boolean trustable, boolean sess, boolean noAskBox, boolean apk, boolean permanentWarning, boolean screenBox) {
         if (id == null) return;
         boolean clip = Tr.t("设备工具：读取剪贴板").equals(cmd);
         // 发起方是按对方进程的环境变量认的，对方能伪造：只作参考
         String by = "claude".equals(who) ? "Claude" : "terminal".equals(who) ? Tr.t("终端") : "cc-mem".equals(who) ? "cc-mem" : "gateway".equals(who) ? Tr.t("cccodroid 网关接口（Claude 也能调用）") : Tr.t("不明程序");
         // 设置页打开「特权命令免确认」：整段是免责说明，标题和按钮换成对应的说法。按 Priv 给的来路认，不看正文（审查 0601 高-2）；
         // 也写上是谁要打开的 —— 设置页之外的程序也能发这个请求，用户没在设置里点就该拒（低-8）
-        String noAskHead = Tr.t("特权命令不再逐条确认（风险自负）");
+        String noAskHead = !permanentWarning && cmd != null && cmd.startsWith("屏幕工具免确认（高风险）\n\n") ? "屏幕工具免确认（高风险）" : permanentWarning ? "永久关闭特权命令确认（极高风险）" : cmd != null && cmd.startsWith("涉及自身的特权命令也免确认（高风险）\n\n")
+            ? "涉及自身的特权命令也免确认（高风险）" : Tr.t("特权命令不再逐条确认（风险自负）");
         if (noAskBox && cmd != null && cmd.startsWith(noAskHead + "\n\n")) {
-            final boolean[] said0 = { false };
+            final ConfirmationAnswer answer0 = new ConfirmationAnswer(how -> Priv.answer(id, how));
             android.app.AlertDialog d0 = new android.app.AlertDialog.Builder(this)
                 .setTitle(noAskHead)
                 .setMessage(Tr.t("发起方（自报，仅供参考）：") + by + "\n\n" + cmd.substring(noAskHead.length() + 2))
-                .setPositiveButton(Tr.t("我了解风险，打开"), (x, w) -> { said0[0] = true; Priv.answer(id, 1); })
-                .setNegativeButton(Tr.t("不打开"), (x, w) -> { said0[0] = true; Priv.answer(id, 0); })
+                .setPositiveButton(permanentWarning ? "我了解风险，永久开启" : Tr.t("我了解风险，打开"), (x, w) -> answer0.choose(1))
+                .setNegativeButton(Tr.t("不打开"), (x, w) -> answer0.choose(0))
                 .create();
-            d0.setOnDismissListener((x) -> { PRIV_DLG.remove(id); if (!said0[0]) Priv.answer(id, 0); });
+            d0.setOnDismissListener((x) -> { PRIV_DLG.remove(id); answer0.dismiss(); });
             PRIV_DLG.put(id, d0);
-            if (!guard(d0, android.content.DialogInterface.BUTTON_POSITIVE)) { PRIV_DLG.remove(id); Priv.answer(id, 0); }
+            if (permanentWarning) {
+                android.text.SpannableString title = new android.text.SpannableString(noAskHead);
+                title.setSpan(new android.text.style.ForegroundColorSpan(android.graphics.Color.RED), 0, title.length(), 0);
+                d0.setTitle(title);
+            }
+            boolean shown = guardFor(d0, permanentWarning ? 10000 : 1000, android.content.DialogInterface.BUTTON_POSITIVE);
+            if (shown && permanentWarning) {
+                d0.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setTextColor(android.graphics.Color.RED);
+            }
+            if (!shown) { PRIV_DLG.remove(id); Priv.answer(id, 0); }
             return;
         }
-        final boolean[] said = { false };
+        final ConfirmationAnswer answer = new ConfirmationAnswer(how -> Priv.answer(id, how));
         android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
-            .setTitle(clip ? Tr.t("允许读取剪贴板？") : apk ? Tr.t("安装这个应用？") : Tr.t("允许执行这条特权命令？"))
+            .setTitle(screenBox ? Tr.t("设备工具：读屏和点按") : clip ? Tr.t("允许读取剪贴板？") : apk ? Tr.t("安装这个应用？") : Tr.t("允许执行这条特权命令？"))
             .setMessage(Tr.t("发起方（自报，仅供参考）：") + by + "\n\n" + (clip ? Tr.t("剪贴板里可能有你从别的应用复制的密码、验证码。不是你让 Claude 读的就拒绝。")
                 // 装 APK：正文是 Priv 从安装包里读出的应用名、包名、版本和文件位置
-                : apk ? cmd + "\n\n" + Tr.t("点「允许」后还会弹出系统的安装确认。不是你自己点的「安装」、或者不认识这个安装包，就拒绝。")
+                : screenBox ? cmd : apk ? cmd + "\n\n" + Tr.t("点「允许」后还会弹出系统的安装确认。不是你自己点的「安装」、或者不认识这个安装包，就拒绝。")
                 : cmd + "\n\n" + Tr.t("它会以 Shizuku（shell）身份运行，能装卸应用、改权限或系统设置。不认识这条命令就拒绝。")))
-            .setNegativeButton(Tr.t("拒绝"), (x, w) -> { said[0] = true; Priv.answer(id, 0); });
+            .setNegativeButton(Tr.t("拒绝"), (x, w) -> answer.choose(0));
         // 这个会话后面的都允许（Claude 发来的才有）：勾上再点「允许」。只在内存里，应用重启就失效
         final android.widget.CheckBox all = sess && !clip ? new android.widget.CheckBox(this) : null;
         if (all != null) {
@@ -553,11 +676,12 @@ public class MainActivity extends Activity {
             box.addView(all);
             b.setView(box);
         }
-        b.setPositiveButton(Tr.t("允许"), (x, w) -> { said[0] = true; Priv.answer(id, all != null && all.isChecked() ? 3 : 1); });
+        b.setPositiveButton(Tr.t("允许"), (x, w) -> answer.choose(all != null && all.isChecked() ? 3 : 1));
         // 命令里引用了文件的，不给「不再问」：信任的是文字，文件内容随时能换（见 Priv.trustable）
-        if (trustable) b.setNeutralButton(Tr.t("允许，这条命令 10 分钟内不再问"), (x, w) -> { said[0] = true; Priv.answer(id, 2); });
+        if (trustable) b.setNeutralButton(Tr.t("允许，这条命令 10 分钟内不再问"), (x, w) -> answer.choose(2));
         android.app.AlertDialog d = b.create();
-        d.setOnDismissListener((x) -> { PRIV_DLG.remove(id); if (!said[0]) Priv.answer(id, 0); });
+        // Dialog dismissal removes the guarded window before delivering authorization to the socket worker.
+        d.setOnDismissListener((x) -> { PRIV_DLG.remove(id); answer.dismiss(); });
         PRIV_DLG.put(id, d);
         if (!guard(d, android.content.DialogInterface.BUTTON_POSITIVE, android.content.DialogInterface.BUTTON_NEUTRAL)) { PRIV_DLG.remove(id); Priv.answer(id, 0); }
     }
@@ -572,7 +696,19 @@ public class MainActivity extends Activity {
         String a = i == null ? null : i.getAction();
         if (a == null) return;
         if (Intent.ACTION_SEND.equals(a) || Intent.ACTION_SEND_MULTIPLE.equals(a)) { receiveShare(i); return; }
-        if (a.startsWith("cc.codroid.") && !fromUs(i)) { android.util.Log.w("cccodroid", "忽略外来的内部动作 " + a); return; }
+        if (a.startsWith("cc.codroid.") && !internalMatches(i)) {
+            // 旧通知可能带持久口令：异步验证后再执行，不让系统密钥服务卡住主线程。
+            checkInternal(this, i, ok -> {
+                if (isDestroyed() || isFinishing()) return;
+                if (ok) handleTrusted(i);
+                else android.util.Log.w("cccodroid", "内部动作校验失败或超时 " + a);
+            });
+            return;
+        }
+        handleTrusted(i);
+    }
+    private void handleTrusted(Intent i) {
+        String a = i.getAction();
         if (ACTION_APPLY_DEVKIT.equals(a) || ACTION_UPDATE.equals(a) && "devkit".equals(i.getStringExtra("item"))) applyDevkitUi();
         else if (ACTION_UPDATE.equals(a)) {
             // 通知点进来的安装请求没接住（文件没了、状态对不上）：至少给一句提示，不再静默返回（#123-2）
@@ -581,11 +717,12 @@ public class MainActivity extends Activity {
             if (r != null && !r.optBoolean("ok", true) && !msg.isEmpty())
                 android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show();
         }
+        else if (SplitPairingNotice.ACTION_ACK.equals(a)) SplitPairingNotice.dismiss(this);
         else if (ACTION_SHIZUKU.equals(a)) ShizukuSetup.get(this).activate();
         else if (ACTION_FACTORY_RESET.equals(a)) askFactoryReset();
         else if (ACTION_A11Y_OK.equals(a)) confirmA11y(i.getStringExtra("mode"), i.getBooleanExtra("on", false));
         else if (ACTION_CONSENT.equals(a)) Consent.runNext(this);
-        else if (ACTION_PRIV_OK.equals(a)) confirmPriv(i.getStringExtra("id"), i.getStringExtra("cmd"), i.getStringExtra("who"), i.getBooleanExtra("trust", false), i.getBooleanExtra("sess", false), "noask".equals(i.getStringExtra("kind")), "apk".equals(i.getStringExtra("kind")));
+        else if (ACTION_PRIV_OK.equals(a)) confirmPriv(i.getStringExtra("id"), i.getStringExtra("cmd"), i.getStringExtra("who"), i.getBooleanExtra("trust", false), i.getBooleanExtra("sess", false), ("noask".equals(i.getStringExtra("kind")) || "noask_permanent".equals(i.getStringExtra("kind"))), "apk".equals(i.getStringExtra("kind")), "noask_permanent".equals(i.getStringExtra("kind")), "screen".equals(i.getStringExtra("kind")));
         else if (Notify.ACTION_OPEN.equals(a)) openSession(i.getStringExtra("session"));
     }
 
@@ -918,6 +1055,7 @@ public class MainActivity extends Activity {
         String local = null;
         while (true) {
             String c = chooseDevkitSource(pin, local);
+            if("backup".equals(c)){ui.post(()->requestFullBackup("import","{}"));throw new BackupHandoff();}
             if ("github".equals(c) || "mirror".equals(c)) {
                 boolean m = "mirror".equals(c);
                 // 模块化工具包（钉子里有 modules.json）：取清单、按钉子核 sha256，让用户勾模块，再按块装
@@ -966,6 +1104,7 @@ public class MainActivity extends Activity {
             q.setText(txt);
             chooser.addView(q);
             String[][] opts = {
+                {"backup", "导入完整备份", "恢复之前导出的工具包、内部工作区、会话、环境配置与登录文件；校验通过后再次确认覆盖"},
                 {"github", Tr.t("从 GitHub 下载"), Tr.t("海外网络一般最快")},
                 {"mirror", Tr.t("从 cccodroid.net 镜像下载"), Tr.t("GitHub 慢或连不上时用；文件与 GitHub 上的一致，照样核对 sha256")},
                 {"local", Tr.t("选择本地文件…"), Tr.t("已经下好的 devkit-cc.codroid.tar.gz（或 .tar）；装之前核对是不是发布版")},
@@ -1264,6 +1403,7 @@ public class MainActivity extends Activity {
     // 已经在替换了：再来的请求（连点「安装」、两条 Priv 连接）不另起一份（审查 #105 05-007）
     private static final java.util.concurrent.atomic.AtomicBoolean DEVKIT_APPLYING = new java.util.concurrent.atomic.AtomicBoolean();
     private void applyDevkitUi() {
+        if(FullBackupController.active()||FullBackupController.restartRequired())return;
         Updater upd = Updater.get(this);
         if (!upd.devkitStaged()) { upd.apply("devkit", true); return; }     // 还没下：先下，下完会再走到这里
         if (!DEVKIT_APPLYING.compareAndSet(false, true)) return;
@@ -1900,6 +2040,8 @@ public class MainActivity extends Activity {
             }
             /** 冻结脱困：WebView 偶发把这个文档的触摸滚动整个吞掉，同站重载不好，跨站跳一次再回来才好。见 bounce() */
             /** 更新卡片的「从本地文件安装」：弹系统文件选择器，选好后由 applyLocalDevkitUi 接手 */
+            @android.webkit.JavascriptInterface public void fullBackup(String k,String action,String snapshot){if(!Env.bridgeOk(k))return;ui.post(()->requestFullBackup(action,snapshot));}
+            @android.webkit.JavascriptInterface public String fullBackupUi(String k){if(!Env.bridgeOk(k))return "";return FullBackupController.takeUi(MainActivity.this);}
             @android.webkit.JavascriptInterface public void pickDevkit(String k) { if (!Env.bridgeOk(k)) return;
                 ui.post(() -> { pickWait = null; try { startActivityForResult(devkitPickIntent(), REQ_DEVKIT); } catch (Exception ignored) {} });
             }
@@ -2127,6 +2269,7 @@ public class MainActivity extends Activity {
     private volatile boolean recovering;
     private final long[] recoverAt = new long[3];   // 最近三次自动重新载入的时刻
     private void recoverGateway(boolean reload) {
+        if(FullBackupController.active()||FullBackupController.restartRequired())return;
         if (!booted || isFinishing()) return;
         if (!GatewayService.serviceUp()) { android.util.Log.i("cccodroid", "界面要用网关，服务不在：拉起来"); GatewayService.start(this); }
         if (!reload || recovering) return;
@@ -2154,6 +2297,7 @@ public class MainActivity extends Activity {
     }
     private int bounceStage = 0;   // 0 没在脱困 · 1 正跳出去 · 2 正跳回来
     private void bounce() {
+        if(FullBackupController.active()||FullBackupController.restartRequired())return;
         if (web == null || bounceStage != 0) return;
         bounceStage = 1;
         web.setVisibility(View.INVISIBLE);
@@ -2218,6 +2362,103 @@ public class MainActivity extends Activity {
     }
     private boolean squatShown;
 
+    // ── 完整备份：原生文件选择、两次确认、离线数据库恢复 ──
+    private static final int REQ_BACKUP_EXPORT=30,REQ_BACKUP_IMPORT=31;
+    private static String backupUiJson;
+    private boolean backupScreen,backupConfirmShowing;
+    private android.widget.Button backupCancel;
+    private final Runnable backupTick=new Runnable(){public void run(){
+        if(!backupScreen||isDestroyed())return;
+        paintBackup();
+        ui.postDelayed(this,250);
+    }};
+    private void requestFullBackup(String action,String uiJson){
+        if(FullBackupController.active()||FullBackupController.restartRequired()){showBackupUi();return;}
+        if(isFinishing()||!visible)return;
+        if(DEVKIT_APPLYING.get()||Updater.get(this).backupBusy()){toast("正在更新工具包或应用，完成后再操作完整备份");return;}
+        final boolean importing="import".equals(action);
+        if(!importing&&!"export".equals(action))return;
+        backupUiJson=uiJson==null?"{}":uiJson;
+        android.app.AlertDialog d=new android.app.AlertDialog.Builder(this)
+            .setTitle(importing?"导入完整备份？":"导出完整备份？")
+            .setMessage(importing
+                ?"完整导入会覆盖当前内部工作区、会话数据库、配置、环境变量启动文件和 auth 登录文件，备份中的脚本也可能自动执行。\n\n先选择备份并校验，校验通过后会对照备份与当前版本，并经倒计时再次确认；第二次确认前不会覆盖当前数据。请只导入可信来源的备份，建议先导出当前环境。\n\n系统权限、硬件 Keystore 和高风险授权需要重新确认。"
+                :"备份包含应用内工具包、内部工作区、会话数据库、配置、环境启动文件与 auth 文件，以及当前界面状态，并记录应用版本、导出时间、包名和架构。\n\n为保证一致性，将暂停网关并结束正在运行的任务。备份以 ZIP64 流式写入所选位置，不需要先在内部存储再复制一整包。\n\n备份未加密，含登录凭据、API Key、SSH 密钥等敏感内容，请妥善保存。APK、系统授权、WebView 缓存、工具临时文件和共享存储中的文件不在备份范围内。")
+            .setPositiveButton(importing?"选择备份并校验":"选择保存位置",(x,w)->{
+                try{
+                    Intent i=new Intent(importing?Intent.ACTION_OPEN_DOCUMENT:Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(importing?"*/*":"application/zip");
+                    if(!importing)i.putExtra(Intent.EXTRA_TITLE,"cccodroid-full-"+new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",java.util.Locale.ROOT).format(new java.util.Date())+".zip");
+                    startActivityForResult(i,importing?REQ_BACKUP_IMPORT:REQ_BACKUP_EXPORT);
+                }catch(Exception e){toast("无法打开系统文件选择器："+e.getMessage());}
+            }).setNegativeButton("取消",(x,w)->{if(web==null&&!booted)boot();}).create();
+        d.setOnCancelListener(x->{if(web==null&&!booted)boot();});
+        guard(d,android.content.DialogInterface.BUTTON_POSITIVE);
+    }
+    private void showBackupUi(){
+        ui.removeCallbacks(backupTick);backupScreen=true;
+        if(web!=null){closePane(false);web.destroy();web=null;}
+        buildSetupUi(false);
+        retry.setVisibility(View.GONE);stuck.setVisibility(View.GONE);
+        backupCancel=new android.widget.Button(this);
+        backupCancel.setText("取消");backupCancel.setAllCaps(false);
+        backupCancel.setTextColor(BrowserPane.pal(this,uiDark(),"accent"));
+        android.graphics.drawable.GradientDrawable cancelBg=new android.graphics.drawable.GradientDrawable();
+        cancelBg.setCornerRadius(dp(10));cancelBg.setStroke(dp(1),BrowserPane.pal(this,uiDark(),"line"));cancelBg.setColor(Color.TRANSPARENT);
+        backupCancel.setBackground(cancelBg);
+        backupCancel.setOnClickListener(v->{
+            if(FullBackupController.active())FullBackupController.cancel();
+            else if(FullBackupController.restartRequired())restartAfterBackup();
+            else leaveBackupUi();
+        });
+        setupCol.addView(backupCancel,new LinearLayout.LayoutParams(-1,-2));
+        ui.post(backupTick);
+    }
+    private void paintBackup(){
+        try{
+            org.json.JSONObject s=new org.json.JSONObject(FullBackupController.snapshot());
+            String phase=s.optString("phase"),op=s.optString("operation");long done=s.optLong("done"),total=s.optLong("total");
+            int pct=BackupUi.percent(op,phase,done,total);
+            // Unknown work uses an activity indicator; never invent a byte count or ETA.
+            bar.setIndeterminate(pct<0);if(pct>=0){bar.setMax(100);bar.setProgress(pct);}
+            stat.setText(s.optString("message")+(pct>=0?" · "+pct+"%":"")+(phase.equals("applying")&&total>0?"\n已替换 "+done+" / "+total+" 个目录":total>0?"\n"+BackupUi.bytes(done)+" / "+BackupUi.bytes(total):phase.equals("scanning")?"\n已扫描 "+done+" 项":phase.equals("cleaning")?"\n已清理 "+done+" 项":""));
+            String space=s.optLong("estimated")>0?"预计需要 "+BackupUi.bytes(s.optLong("estimated"))+" · 目标可用 "+(s.optLong("available")>=0?BackupUi.bytes(s.optLong("available")):"未知")+" · 预留 "+(s.optLong("reserve")>0?BackupUi.bytes(s.optLong("reserve")):"尚未确定")+"\n按未压缩数据与元数据保守估算，实际压缩包可能更小。\n\n":"";
+            String p=s.optString("path");if(!p.isEmpty())log.setText(space+p);
+            else log.setText(space+(phase.equals("applying")?"备份校验已完成，正在替换目录。此阶段不可取消；若进程退出，下次启动会先恢复事务。":"系统权限、Keystore 授权与共享存储中的文件不会迁移。"));
+            backupCancel.setEnabled(!s.optBoolean("active")||s.optBoolean("canCancel"));
+            backupCancel.setText(s.optBoolean("active")?"取消":s.optBoolean("restartRequired")?"重启应用":"返回");
+            if(FullBackupController.awaiting()&&!backupConfirmShowing&&visible&&!isFinishing())confirmFullBackupImport(s);
+        }catch(Exception e){stat.setText("读取备份进度失败："+e.getMessage());}
+    }
+    private void confirmFullBackupImport(org.json.JSONObject s){
+        backupConfirmShowing=true;
+        String time=new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",java.util.Locale.ROOT).format(new java.util.Date(s.optLong("created")));
+        int backupVersion=s.optInt("version"),currentVersion=s.optInt("currentVersion");
+        String backupName=s.optString("versionName"),currentName=s.optString("currentVersionName");
+        boolean mismatch=BackupUi.versionMismatch(backupVersion,backupName,currentVersion,currentName);
+        long waitMs=BackupUi.importWaitMillis(backupVersion,backupName,currentVersion,currentName);
+        android.app.AlertDialog d=new android.app.AlertDialog.Builder(this)
+            .setTitle(mismatch?"版本不一致，仍要覆盖导入？":"覆盖当前数据并导入（高风险）")
+            .setMessage(BackupUi.importWarning(backupVersion,backupName,currentVersion,currentName)
+                +"\n\n备份时间："+time+"\n文件数："+s.optInt("entries")+"\n恢复大小："+BackupUi.bytes(s.optLong("total"))+"\n逐文件 SHA-256 与 ZIP CRC 校验已通过。")
+            .setPositiveButton("我了解风险，覆盖并导入",(x,w)->FullBackupController.approveImport())
+            .setNegativeButton("取消",(x,w)->FullBackupController.cancel()).create();
+        d.setOnDismissListener(x->{backupConfirmShowing=false;if(FullBackupController.awaiting()&&!isChangingConfigurations()&&!isDestroyed())FullBackupController.cancel();});
+        if(guardFor(d,waitMs,android.content.DialogInterface.BUTTON_POSITIVE))
+            d.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setTextColor(Color.RED);
+        else {backupConfirmShowing=false;FullBackupController.cancel();}
+    }
+    private void leaveBackupUi(){
+        backupScreen=false;ui.removeCallbacks(backupTick);
+        if(booted&&env.devkitReady()){
+            new Thread(()->{try{waitGateway(false);}catch(Exception ignored){}ui.post(()->{if(!isDestroyed())showWeb();});},"backup-return").start();
+        }else{buildSetupUi(false);boot();}
+    }
+    private void restartAfterBackup(){
+        // A separate process performs the relaunch; no exact-alarm permission is needed.
+        startActivity(new Intent(this,BackupRestartActivity.class).putExtra("previousPid",android.os.Process.myPid()));
+    }
+    private static final class BackupHandoff extends Exception {}
+
     // ── 恢复初始设置（FactoryReset）：入口在设置页排障栏、启动页「我卡住了」、网关起不来时的等待页 ──
     private static final String RESCUE_RESET = "cccodroid-rescue:reset", RESCUE_LOGS = "cccodroid-rescue:logs";
     private static String rescueLinks(String color) {
@@ -2228,6 +2469,7 @@ public class MainActivity extends Activity {
     private volatile boolean resetting;
     /** 原生确认框：说清会挪走什么、留什么、留底在哪；勾上才连厂商配置和密钥一起挪。按钮一秒后才能点（guard） */
     void askFactoryReset() {
+        if(FullBackupController.active()||FullBackupController.restartRequired())return;
         if (resetting || isFinishing()) return;
         android.widget.CheckBox keys = new android.widget.CheckBox(this);
         keys.setText(Tr.t("同时清除厂商配置和密钥（恢复后要重新填）"));
@@ -2486,6 +2728,15 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onActivityResult(int req, int res, Intent data) {
+        if(req==REQ_BACKUP_EXPORT||req==REQ_BACKUP_IMPORT){
+            Uri u=res==RESULT_OK&&data!=null?data.getData():null;
+            if(u==null){if(web==null&&!booted)boot();return;}
+            if(req==REQ_BACKUP_EXPORT&&backupUiJson==null){toast("界面状态已丢失，请返回存储设置重新导出");return;}
+            boolean ok=req==REQ_BACKUP_EXPORT?FullBackupController.export(this,u,backupUiJson):FullBackupController.importFile(this,u);
+            backupUiJson=null;
+            if(ok)showBackupUi();else toast("已有完整备份任务正在进行");
+            return;
+        }
         if (req == 9) { if (pane != null) pane.onResult(res, data); return; }
         if (req == REQ_DEVKIT) {
             Uri u = res == RESULT_OK && data != null ? data.getData() : null;
@@ -2703,6 +2954,7 @@ public class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
+        if(backupScreen){if(FullBackupController.active())toast("完整备份正在进行，可使用页面上的取消按钮；应用到后台后仍会继续");else if(FullBackupController.restartRequired())restartAfterBackup();else leaveBackupUi();return;}
         if (web == null) { moveTaskToBack(true); return; }
         // 先让页面关最上层的浮层（侧栏 / 查看器 / 终端 / 弹窗…，见 app.js __ccBack），都没开才退
         web.evaluateJavascript(guarded("__ccBack", "window.__ccBack?__ccBack():false"), v -> {

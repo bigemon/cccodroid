@@ -5,6 +5,9 @@
   // 存坏了（手改、截断）别让整个型号弹层画不出来（审查 v0.5.5 W-L5）
   const recentIds = () => { try { const a = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); return Array.isArray(a) ? a.filter((x) => typeof x === "string") : []; } catch { return []; } };
   function prettyModel(name) {
+    // Codex：用目录里的 displayName（如 "GPT-6.1-Sol"），没有就照 id 原样
+    const cx = (state.codexModels || []).find((m) => m.id === name);
+    if (cx && cx.name) return cx.name;
     const m = /^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)/i.exec(name || "");
     return m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() + " " + m[2] + "." + m[3] : name || "";
   }
@@ -16,24 +19,40 @@
   const pickOr = (k) => { const o = own(); return o && o[k] != null ? o[k] : state.settings && state.settings[k]; };
   // state.sessEff：网关算好的「这个会话真跑时用什么」（/api/session-model，含项目默认、按那家换过的思考强度）。
   // 标签、额度都按它；还没回来时按本地记录凑合
-  const curEffort = () => (state.sessEff ? state.sessEff.effortRun || "" : pickOr("effort") || "");
+  const sessionEff = () => state.sessEff && ((state.sessEff.backend === "codex") === (currentBackend() === "codex")) ? state.sessEff : null;
+  const curEffort = () => sessionEff() ? sessionEff().effortRun || "" : currentBackend() === "codex" ? "" : pickOr("effort") || "";
   // 下面几个用函数声明：09 段的额度速览（qbLoad）也要用，声明会提升
   function globalProv() { return (state.serverStatus && state.serverStatus.provider) || ""; }
   /** 这个会话用哪家：单独选过模型就是记下的那家，否则全局生效的那家 */
-  function curProv() { if (state.sessEff && state.sessEff.provider) return state.sessEff.provider; const o = own(); return (o && o.model != null && o.provider) || globalProv(); }
+  function curProv() {
+    if (sessionBackendPending()) return "";
+    if (currentBackend() === "codex") return "codex";
+    if (sessionEff()?.provider) return sessionEff().provider;
+    const o = own();
+    if (o && o.model != null && o.provider) return o.provider;
+    return globalProv();
+  }
   function provOf(id) { return (state.provList || []).find((p) => p.id === id) || null; }
-  function provLabel(id) { const p = provOf(id); return p ? (provEn() && p.labelEn) || p.label : id || ""; }
+  function provLabel(id) {
+    // Codex 不在 Claude 的厂商表里：设置页会把 provList 换成 Claude 那几家，这里给个固定名
+    if (id === "codex") return "Codex";
+    const p = provOf(id); return p ? (provEn() && p.labelEn) || p.label : id || "";
+  }
   /** 模型：钉了就是钉的（"" = 那家的默认）；跟随就是全局默认 */
   function curModel() {
-    if (state.sessEff) return state.sessEff.model || state.sessEff.defaultModel || "";
+    if (sessionBackendPending()) return "";
+    if (sessionEff()) return sessionEff().model || sessionEff().defaultModel || "";
+    if (currentBackend() === "codex") return state.pendingModel?.model || "";
     const o = own();
     if (o && o.model != null) return o.model || (curProv() !== globalProv() && provOf(curProv())?.defaultModel) || "";
     return (state.settings && state.settings.model) || "";
   }
-  const chipName = () => curModel() || state.model || t("默认");
+  const chipName = () => curModel() || ((typeof currentBackend === "function" && currentBackend() === "codex") ? "" : state.model) || t("默认");
   // /api/models 的查询串：老会话给会话号，新会话把暂存的选择带上；extra 是另加的参数（如 browse=）
   const sidQ = (extra) => {
     const q = [];
+    // 后端决定数据源：Codex 走 App Server 的 model/list，Claude 走厂商清单
+    if (typeof currentBackend === "function" && currentBackend() === "codex") q.push("backend=codex");
     if (view.sessionId) q.push("sid=" + encodeURIComponent(view.sessionId));
     else {
       const p = state.pendingModel;
@@ -47,18 +66,34 @@
   };
   let smSeq = 0;
   async function refreshSessModel() {
-    const id = view.sessionId, my = ++smSeq;
+    const id = view.sessionId, backend = currentBackend(), pending = sessionBackendPending(), my = ++smSeq;
     let r = null;
-    try { r = await api("/api/session-model" + (id ? "?id=" + encodeURIComponent(id) : sidQ())); } catch {}
-    if (my !== smSeq) return;               // 切得快：只认最后一次
+    try { r = await api("/api/session-model" + (id ? "?id=" + encodeURIComponent(id) + (currentBackend() === "codex" ? "&backend=codex" : "") : sidQ())); } catch {}
+    if (my !== smSeq || id !== view.sessionId || (!pending && backend !== currentBackend())) return;
+    if (id && r?.provider) view.backend = r.backend === "codex" || r.provider === "codex" ? "codex" : "claude";
+    paintBackend();
     if (id) state.sessModel = (r && r.rec) || null;
+    // 本轮的改道是实时状态：刷新会话信息回来时别把它覆盖掉（索引要到这一轮结束才写）
+    const liveEff = state.rerouteLive && state.sessEff ? state.sessEff.effectiveModel : null;
     state.sessEff = r && r.provider ? r : null;
+    if (setOpen && $("codex-diagnostics")?.open && !$("core-panel-codex").classList.contains("hidden")) loadCodexDiagnostics();
+    paintPermForBackend();
+    if (liveEff && state.sessEff) state.sessEff.effectiveModel = liveEff;
+    paintSessionStatus();
     paintModel(chipName());
+    // Codex：恢复上次可信的上下文状态；没有就显示「等待本轮数据」，不留上一个会话的数
+    if (r && r.backend === "codex") {
+      if (r.usage && r.usage.context_window) updateCtx(r.usage.context_tokens, r.usage.context_window, r.usage.pct_used);
+      else ctxUnknown();
+    }
     loadCtxModel();                          // 上下文刻度跟着这个会话的模型
     provChanged();
   }
   // 会话用的那家变了：顶栏的额度 / 余额跟着换
-  function provChanged() { if (QB.cur && QB.cur.id !== curProv()) qbLoad(false).catch(() => {}); }
+  function provChanged() {
+    paintSessionStatus();
+    if (!QB.cur || QB.cur.id !== curProv()) qbLoad(false).catch(() => {});
+  }
   // 新会话拿到会话号：暂存的选择就是它记下的（网关在 init 时已记上），不必再问一遍
   function adoptPendingModel() {
     if (!state.pendingModel) return;
@@ -86,11 +121,38 @@
   }
   function paintModel(name) {
     state.chipModel = name;
+    // 刚换了后端：新后端的默认模型还在路上，这时候不能把旧后端的名字留在标签上（P6-F2）
+    if (state.modelBusy || sessionBackendPending()) {
+      modelEl.innerHTML = `<span class="chip chip-busy">${esc(t("读取中…"))}</span>`;
+      modelEl.title = t("正在读取这个后端的默认模型");
+      return;
+    }
+    // Codex：标签要用目录里的 displayName。清单可能还没回来（或是别的路径先画的），补拉一次再重画
+    const isCx = curProv() === "codex" || (typeof currentBackend === "function" && currentBackend() === "codex");
+    if (name && isCx && !(state.codexModels || []).some((m) => m.id === name) && !state.codexNameReq) {
+      state.codexNameReq = true;
+      api("/api/models" + sidQ()).then((r) => {
+        state.codexModels = r.models || [];
+        state.codexNameReq = false;
+        if (state.chipModel === name) paintModel(name);
+      }).catch(() => { state.codexNameReq = false; });
+    }
     const eff = curEffort();
     // 照设计稿拆成两片：型号（claude-opus-5-5 显示成 Opus 5.5）、思考强度；会话用的不是全局那家时前面再加一片接口名
-    const pretty = prettyModel(name), pv = curProv(), other = pv && globalProv() && pv !== globalProv();
+    const pretty = prettyModel(name), pv = curProv();
+    // 输入栏左边已经有「Claude / Codex」后端标签；Codex 会话再显示一个同名厂商片就重了
+    const other = pv && globalProv() && pv !== globalProv() && !(pv === "codex" && currentBackend() === "codex");
+    // 服务端改道：标签仍显示用户选的模型，后面补一片实际模型。
+    // 本轮发生 → "→ B"；只是历史记录 → "上一轮实际：B"，避免被当成正在跑的模型。
+    const effM = state.sessEff && state.sessEff.effectiveModel;
+    const rerouted = effM && effM !== name;
+    const rerouteChip = !rerouted ? ""
+      : state.rerouteLive
+        ? `<span class="chip" title="${esc(t("本轮实际使用的模型"))}">→ ${esc(prettyModel(effM))}</span>`
+        : `<span class="chip" title="${esc(t("上一轮实际使用的模型（不是当前轮）"))}">${esc(t("上一轮实际：{m}", { m: prettyModel(effM) }))}</span>`;
     modelEl.innerHTML = (other ? `<span class="chip chip-prov">${esc(provLabel(pv))}</span>` : "") +
-      `<span class="chip">${esc(pretty)}</span>${eff ? `<span class="chip">${esc(eff)}</span>` : ""}`;
+      `<span class="chip">${esc(pretty)}</span>` + rerouteChip +
+      `${eff ? `<span class="chip">${esc(eff)}</span>` : ""}`;
     modelEl.title = (other ? provLabel(pv) + " · " : "") + name;
     // #model-chip 是 display:contents，本身没有盒子，title 落不到实际上屏的 chip 上
     modelEl.querySelectorAll(".chip").forEach((c) => { c.title = modelEl.title; });
@@ -142,6 +204,13 @@
       info = r; ML = r.models || [];
       if (r.providers) state.provList = r.providers;
       if (!browse) browse = r.provider;
+      if (!ML.length) {
+        // Codex 取不到目录时给一句人能看懂的话，别留一个空白面板
+        list.innerHTML = `<div class="tiny">${esc(r.error
+          ? t("模型清单不可用：{msg}", { msg: r.error.message || r.error.code })
+          : t("没有可用的模型"))}</div>`;
+        return false;
+      }
       return true;
     }
     if (!(await load())) return;
@@ -170,7 +239,7 @@
     const paintFollow = () => {
       const usable = (state.provList || []).filter((p) => p.usable && !p.hidden).length;
       const f = followEff();
-      const dm = (usable > 1 ? provLabel(f.prov) + " · " : "") + (prettyModel(f.model) || t("默认")) + (f.effort ? " · " + f.effort : "");
+      const dm = currentBackend() === "codex" ? (prettyModel(info.defaultModel || "") || t("服务端默认")) : (usable > 1 ? provLabel(f.prov) + " · " : "") + (prettyModel(f.model) || t("默认")) + (f.effort ? " · " + f.effort : "");
       followBox.innerHTML = own()
         ? `<button type="button" class="mp-item mp-reset"><span>${esc(t("改回跟随默认"))}</span><small>${esc(dm)}</small></button>`
         : `<div class="tiny">${esc(t("跟随默认：{model}", { model: dm }))}</div>`;
@@ -179,7 +248,7 @@
     followBox.addEventListener("click", async (e) => {
       if (!e.target.closest(".mp-reset")) return;
       const to = followEff().prov;
-      if (curProv() !== to && view.sessionId && !confirm(switchWarn(to))) return;
+      if (curProv() !== to && curProv() !== "codex" && view.sessionId && !confirm(switchWarn(to))) return;
       close();
       try { await pickSessModel(null); } catch (er) { return er.stale || toast(er.message, true); }
       paintModel(chipName());
@@ -218,27 +287,41 @@
       if (await load()) paintList();
     });
 
-    const row = (id, sub) => (sub = typeof sub === "string" ? { text: sub } : sub, `<button type="button" class="mp-item${id === cur() ? " cur" : ""}" data-id="${esc(id)}"><span>${esc(id || t("默认"))}</span>${sub && (sub.text || sub.img) ? `<small>${esc(sub.text || "")}${sub.img ? MM_IMG() : ""}</small>` : ""}</button>`);
+    // Codex 的 displayName 才是给人看的名字：标题用它，副标题放 id + 观察到的窗口
+    const codexList = () => curProv() === "codex";
+    const row = (id, sub, label) => (sub = typeof sub === "string" ? { text: sub } : sub, `<button type="button" class="mp-item${id === cur() ? " cur" : ""}" data-id="${esc(id)}"><span>${esc(label || id || t("默认"))}</span>${sub && (sub.text || sub.img) ? `<small>${esc(sub.text || "")}${sub.img ? MM_IMG() : ""}</small>` : ""}</button>`);
     const meta = (md) => {
       if (!md) return null;
       const ctx = md.context_window ? Math.round(md.context_window / 1024) + "k" : "";
-      return { text: [md.name && md.name !== md.id ? md.name : "", md.configured ? t("接口设置里填的") : "", ctx].filter(Boolean).join(" · "), img: (md.input_modalities || []).includes("image") };
+      return {
+        text: [codexList() ? md.id : (md.name && md.name !== md.id ? md.name : ""), ctx].filter(Boolean).join(" · "),
+        img: (md.input_modalities || []).includes("image"),
+      };
     };
+    const labelOf = (md) => (codexList() && md && md.name ? md.name : null);
     function paintList() {
       const kw = q.value.trim().toLowerCase();
       const all = ML.filter((md) => !kw || md.id.toLowerCase().includes(kw) || String(md.name || "").toLowerCase().includes(kw));
       let html = "";
+      // 目录过期时先给缓存，后台刷新：明确告诉用户，当前这份是可选的
+      if (info && info.refreshing) html += `<div class="tiny mp-refreshing">${t("正在拉取最新模型…（现在显示的是缓存，可以直接选）")}</div>`;
       if (!kw) {
         if (info.nativeModels) html += row("", info.defaultModel ? t("（默认：{model}）", { model: info.defaultModel }) : t("（默认，由 claude 决定）"));
-        // 当前在用的那个总排在「最近用过」头一个：不然清单一长，打开弹层根本看不到现在用的是哪个
-        const rec = [...new Set([cur(), ...recentIds()])].filter((id) => id && ML.some((md) => md.id === id));
-        if (rec.length) html += `<div class="mp-sec">${t("最近用过")}</div>` + rec.map((id) => row(id, meta(ML.find((md) => md.id === id)))).join("") + `<div class="mp-sec">${t("全部 {n} 个", { n: ML.length })}</div>`;
+        const rec = [...new Set([cur(), ...recentIds()])].filter((id) => ML.some((md) => md.id === id));
+        if (rec.length) html += `<div class="mp-sec">${t("最近用过")}</div>` + rec.map((id) => { const md = ML.find((x) => x.id === id); return row(id, meta(md), labelOf(md)); }).join("") + `<div class="mp-sec">${t("全部 {n} 个", { n: ML.length })}</div>`;
       }
-      html += all.slice(0, 300).map((md) => row(md.id, meta(md))).join("");
+      html += all.slice(0, 300).map((md) => row(md.id, meta(md), labelOf(md))).join("");
       if (!all.length) html += `<div class="tiny">${ML.length ? t("没有匹配的模型") : t("（该厂商不提供模型清单）")}</div>`;
       list.innerHTML = html;
     }
     paintList();
+    // 后台刷新完成后自动换上新清单（只补一次，避免轮询）
+    if (info && info.refreshing) {
+      setTimeout(async () => {
+        if (!m.isConnected) return;
+        if (await load()) { paintList(); if (info && info.refreshing) paintList(); }
+      }, 2500);
+    }
     q.addEventListener("input", paintList);
     list.addEventListener("click", async (e) => {
       const b = e.target.closest(".mp-item");
@@ -264,13 +347,19 @@
   const sameAsGlobal = (g) => !own() && !!state.sessEff && state.sessEff.provider === g.provider
     && (state.sessEff.model || state.sessEff.defaultModel || "") === (g.current || g.defaultModel || "");
   async function loadCtxModel(g) {
-    const my = ++ctxSeq;
+    const my = ++ctxSeq, id = view.sessionId, backend = currentBackend();
+    if (sessionBackendPending()) return;
     let r = g;
-    if (!r || !sameAsGlobal(r)) try { r = await api("/api/models" + sidQ()); } catch { return; }
-    if (my !== ctxSeq) return;
-    state.ctxTotal = Number(r.contextWindow) || 0;   // 0 = 这个型号不知道窗口：别沿用上一个型号的分母（#68）
-    state.compactAt = Number(r.compactLine ?? r.autoCompactWindow) || 0;   // 生效的那条（超过模型窗口不算数，#67）
-    updateCtx(state.ctxUsed, state.ctxTotal);
+    if (backend === "codex" || own() || !r) try { r = await api("/api/models" + sidQ()); } catch { return; }
+    if (my !== ctxSeq || id !== view.sessionId || backend !== currentBackend() || ((r.backend === "codex") !== (backend === "codex"))) return;
+    if (r.contextWindow) state.ctxTotal = r.contextWindow;
+    state.compactAt = Number(r.autoCompactWindow) || 0;
+    if (r.backend === "codex") {
+      state.codexModels = r.models || [];
+      paintModel(chipName());               // 标签上显示 displayName，而不是 id
+    }
+    // Codex：目录里的窗口是「观察到过的」；百分比用后端算好的 TUI 口径，别自己再除一次
+    updateCtx(state.ctxUsed, state.ctxTotal, isCodexView() ? state.ctxPct : undefined);
   }
 
   /** 模型与 effort 档位都从厂商的 /models 实时拉。设置页的下拉框是全局默认 */
@@ -431,7 +520,7 @@
       $("set-style").value = state.settings.outputStyle || "";
       // 没指定模型时别把顶栏写成 "—"：init 报过的真实模型更有用
       paintModel(curModel() || state.model || t("默认"));
-      setPermChip(state.settings.permissionMode || "default");
+      paintPermForBackend();
       renderPermBar();
       renderDirs();
       fillMem();
@@ -449,6 +538,7 @@
       $("set-workisland").checked = state.settings.workIsland === true;
       loadWorkIsland();
       loadExecMode();
+      fillCodexSettings();
     } catch {}
   }
 
@@ -501,7 +591,7 @@
       state.settings = { ...state.settings, ...(r.settings || {}) };
       paintModel(curModel() || state.model || t("默认"));
       if ("model" in patch || "effort" in patch) refreshSessModel();   // 跟随默认的会话，标签跟着变
-      setPermChip(state.settings.permissionMode || "default");
+      paintPermForBackend();
       renderDirs();
             toast(t("已保存"));
       return r;
@@ -687,6 +777,57 @@
   });
 
   // ── 能力面板 ──────────────────────────────────────────────────────
+
+  let capabilitiesCore="claude",codexCapabilitiesScope="global",codexCapProjectKey="";
+  function updateCodexCapabilityProject(){
+    const project=curProject(),button=$("codex-cap-tab-project"),key=JSON.stringify([view.sessionId,view.projectId,project?.id,project?.path]);
+    button.disabled=!project;button.setAttribute("aria-disabled",String(!project));
+    $("codex-cap-project-context").textContent=project?project.name+" · "+project.path:t("当前会话未指定项目，请先选择项目。");
+    if(key===codexCapProjectKey)return;
+    codexCapProjectKey=key;$("codex-project-extension-body").textContent="";codexExtensionSeq++;
+    if(!project&&codexCapabilitiesScope==="project")showCodexCapabilitiesScope("global");
+    else if(pageOn("caps")&&capabilitiesCore==="codex"&&codexCapabilitiesScope==="project")loadCodexExtensions("project");
+  }
+  function showCodexCapabilitiesScope(which,focus=false){
+    if(!["global","project"].includes(which)||which==="project"&&!curProject())return;
+    codexCapabilitiesScope=which;
+    document.querySelectorAll("[data-codex-cap-scope]").forEach(button=>{
+      const active=button.dataset.codexCapScope===which;button.classList.toggle("on",active);button.setAttribute("aria-selected",String(active));button.tabIndex=active?0:-1;if(active&&focus)button.focus();
+    });
+    $("codex-cap-panel-global").classList.toggle("hidden",which!=="global");$("codex-cap-panel-project").classList.toggle("hidden",which!=="project");
+    if(pageOn("caps")&&capabilitiesCore==="codex")loadCodexExtensions(which);
+  }
+  document.querySelectorAll("[data-codex-cap-scope]").forEach(button=>{
+    button.addEventListener("click",()=>showCodexCapabilitiesScope(button.dataset.codexCapScope));
+    button.addEventListener("keydown",event=>{
+      const tabs=[...document.querySelectorAll("[data-codex-cap-scope]")].filter(b=>!b.disabled),index=tabs.indexOf(button);let next;
+      if(event.key==="ArrowRight")next=(index+1)%tabs.length;else if(event.key==="ArrowLeft")next=(index+tabs.length-1)%tabs.length;else if(event.key==="Home")next=0;else if(event.key==="End")next=tabs.length-1;else return;
+      event.preventDefault();showCodexCapabilitiesScope(tabs[next].dataset.codexCapScope,true);
+    });
+  });
+  function showCapabilitiesCore(core,focus=false){
+    if(!["claude","codex"].includes(core))return;
+    capabilitiesCore=core;
+    document.querySelectorAll("[data-cap-core]").forEach(button=>{
+      const active=button.dataset.capCore===core;button.classList.toggle("on",active);button.setAttribute("aria-selected",String(active));button.tabIndex=active?0:-1;if(active&&focus)button.focus();
+    });
+    $("caps-panel-claude").classList.toggle("hidden",core!=="claude");$("caps-panel-codex").classList.toggle("hidden",core!=="codex");
+    if(core==="codex"){
+      setPageSub("caps",t("Codex · 技能与工具"));loadClaudeSkillReuse();loadClaudeInstructionReuse();loadProjectAutomation();
+      updateCodexCapabilityProject();showCodexCapabilitiesScope(codexCapabilitiesScope);
+      $("codex-extension-check").open=true;
+      if($("codex-diagnostics").open)loadCodexDiagnostics();
+    }else loadCaps();
+  }
+  document.querySelectorAll("[data-cap-core]").forEach(button=>{
+    button.addEventListener("click",()=>showCapabilitiesCore(button.dataset.capCore));
+    button.addEventListener("keydown",event=>{
+      const tabs=[...document.querySelectorAll("[data-cap-core]")],index=tabs.indexOf(button);let next;
+      if(event.key==="ArrowRight")next=(index+1)%tabs.length;else if(event.key==="ArrowLeft")next=(index+tabs.length-1)%tabs.length;else if(event.key==="Home")next=0;else if(event.key==="End")next=tabs.length-1;else return;
+      event.preventDefault();showCapabilitiesCore(tabs[next].dataset.capCore,true);
+    });
+  });
+
   function cacheCapsFromInit(ev) {
     state.caps = state.caps || {}; state.capsErr = "";
     state.caps.tools = ev.tools || state.caps.tools || [];
@@ -742,7 +883,7 @@
 
   function renderCaps() {
     const c = state.caps || {};
-    setPageSub("caps", c.version ? t("Claude Code {ver} · 这一轮能用的", { ver: c.version }) : t("这一轮 Claude 能用的"));
+    if(capabilitiesCore==="claude")setPageSub("caps", c.version ? t("Claude Code {ver} · 这一轮能用的", { ver: c.version }) : t("这一轮 Claude 能用的"));
     const cmds = c.slashCommands || [];
     const mcp = (c.mcpServers || []).map((m) => typeof m === "string" ? { name: m } : m);
     const mcpOk = mcp.filter((m) => /^connected$/i.test(m.status || "")).length;
@@ -770,7 +911,7 @@
   // 搜索：同时筛命令卡片和各节的标签；一节里一个都不剩就整节先藏起来
   function filterCaps() {
     const q = ($("caps-q").value || "").trim().toLowerCase();
-    for (const sec of document.querySelectorAll("#tab-caps > .ext-sec-plain")) {
+    for (const sec of document.querySelectorAll("#caps-panel-claude > .ext-sec-plain")) {
       let any = !q;
       for (const el of sec.querySelectorAll(".cmd-card, .panel > .row")) {
         const hit = !q || el.textContent.toLowerCase().includes(q);
@@ -782,8 +923,7 @@
   $("caps-q").addEventListener("input", filterCaps);
   $("caps-rules").addEventListener("click", () => openSettings("claude"));
   $("cap-tiles").addEventListener("click", (e) => {
-    const rt = e.target.closest("#caps-retry"); if (rt) { rt.disabled = true; return loadCaps(); }
-    const b = e.target.closest("[data-sec]"), x = b && document.querySelector(`#tab-caps > [data-sec="${b.dataset.sec}"]`); if (!x) return;
+    const b = e.target.closest("[data-sec]"), x = b && document.querySelector(`#caps-panel-claude > [data-sec="${b.dataset.sec}"]`); if (!x) return;
     const body = $("page-body");
     body.scrollTo({ top: body.scrollTop + x.getBoundingClientRect().top - body.getBoundingClientRect().top - 12, behavior: "smooth" });
   });

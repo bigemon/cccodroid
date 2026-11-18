@@ -9,6 +9,7 @@ import { onSealUnknown } from "./claudeseal.mjs";
 import { NEXT, readBody, sendJson } from "./http.mjs";
 import { termEnv } from "./terminal.mjs";
 import { ccMem, privCall } from "./usage.mjs";
+import { activateWithTcp, shizukuTcp } from "./shizuku-tcp.mjs";
 
 // ── 开发端（非 cccodroid 布局）：没有 Java 那一层，更新和 Shizuku 状态由网关自己做 ──────────
 // cccodroid 里这些在 App 进程（Updater / ShizukuSetup）；开发端只有一个 runtime/claude 二进制，priv 走 rish。
@@ -243,6 +244,7 @@ async function claudeVersions(force) {
 
 // /api/app/* 各操作收哪些字段（对照 Priv.java、Updater.set、Notify.set、DeviceTools.set）
 const APP_FIELDS = {
+  consent_set: { strong: "boolean" },
   upd_apply: { item: "string", version: "string" },
   upd_set: { auto: "boolean", channel: "string", version: "string", flavor: "string" },
   upd_verify: { full: "boolean" }, upd_repair: { full: "boolean" },
@@ -264,7 +266,18 @@ export async function routeDevside(req, res, u, p) {
     const b = JSON.parse((await readBody(req)) || "{}");
     return sendJson(res, 200, await ccMem(["clear", "--json", ...(b.hard ? ["--hard"] : []), ...(b.dryRun ? ["--dry-run"] : [])]));
   }
-  if (req.method === "GET" && p === "/api/priv/status") return sendJson(res, 200, await privCall({ op: "status" }));
+  if (req.method === "GET" && p === "/api/priv/status") return sendJson(res, 200, { ...await privCall({ op: "status" }), tcpRecovery: shizukuTcp.snapshot() });
+  if (req.method === "POST" && p === "/api/priv/tcp") {
+    const b = JSON.parse((await readBody(req)) || "{}");
+    if (!["enable", "disable", "close", "recover", "listener"].includes(b.action))
+      return sendJson(res, 400, { ok: false, message: "未知 TCP 恢复操作" });
+    try {
+      const tcpRecovery = b.action === "listener" ? await shizukuTcp.setListener(b.type) : await shizukuTcp[b.action]();
+      if (b.action === "close" && PREFIX) await privCall({ op: "shz_activate" });
+      return sendJson(res, 200, { ok: true, tcpRecovery });
+    }
+    catch (e) { return sendJson(res, 200, { ok: false, message: e.message, tcpRecovery: shizukuTcp.snapshot() }); }
+  }
   if (req.method === "POST" && p === "/api/priv/request") return sendJson(res, 200, await privCall({ op: "request" }));
   if (req.method === "POST" && p === "/api/priv/open") return sendJson(res, 200, await privCall({ op: "open_manager" }));
   // 特权命令记录：cccodroid 的 Priv.java 每执行一条就往 home/priv-audit.jsonl 记一行。最新的在前
@@ -277,11 +290,21 @@ export async function routeDevside(req, res, u, p) {
     }
     return sendJson(res, 200, { ok: true, supported: !!PREFIX, items });
   }
+  if (req.method === "POST" && p === "/api/priv/noask-screen") {
+    const b = JSON.parse((await readBody(req)) || "{}");
+    if (typeof b.enable !== "boolean") return sendJson(res, 400, { ok: false, message: "enable 必须为布尔值" });
+    return sendJson(res, 200, await privCall({ op: "noask_screen", enable: b.enable }, 90000));
+  }
+  if (req.method === "POST" && p === "/api/priv/noask-self") {
+    const b = JSON.parse((await readBody(req)) || "{}");
+    if (typeof b.enable !== "boolean") return sendJson(res, 400, { ok: false, message: "enable 必须为布尔值" });
+    return sendJson(res, 200, await privCall({ op: "noask_self", enable: b.enable }, 90000));
+  }
   if (req.method === "POST" && p === "/api/priv/noask") {
     let b; try { b = JSON.parse((await readBody(req)) || "{}"); } catch { return sendJson(res, 400, { error: "bad json" }); }
-    // 时长只认固定几档（应用侧同样只认这几档，别的按 24 小时），最长一周（11-08 用户定）
-    const hours = [1, 4, 24, 72, 168].includes(+b.hours) ? +b.hours : 24;
-    return sendJson(res, 200, await privCall({ op: "noask", enable: b.enable === true, hours }, 90000));
+    // Fixed native-validated durations; permanent requires an additional timed native warning.
+    const hours = [1, 4, 24, 72, 168, 720, -1].includes(+b.hours) ? +b.hours : 24;
+    return sendJson(res, 200, await privCall({ op: "noask", enable: b.enable === true, hours }, 130000));
   }
   if (req.method === "POST" && p === "/api/priv/keepalive") {
     const b = JSON.parse((await readBody(req)) || "{}");
@@ -290,8 +313,10 @@ export async function routeDevside(req, res, u, p) {
   // 更新（APK / 工具包 / Claude Code）与 Shizuku 一键安装激活：都在应用进程里做，这里只转话
   if (p.startsWith("/api/app/")) {
     const op = p.slice(9);
-    const OPS = ["upd_status", "upd_check", "upd_apply", "upd_set", "upd_verify", "upd_repair", "share_logs", "factory_reset", "share_file", "apk_install", "shz_install", "shz_activate", "shz_pair", "shz_autostart", "shz_repair", "open_app_settings", "freeze_ack", "notify_status", "notify_set", "notify_settings", "dev_status", "dev_set", "a11y_settings"];
+    const OPS = ["consent_set", "upd_status", "upd_check", "upd_apply", "upd_set", "upd_verify", "upd_repair", "share_logs", "factory_reset", "share_file", "apk_install", "shz_install", "shz_activate", "shz_pair", "shz_autostart", "shz_repair", "shz_split_settings", "open_app_settings", "freeze_ack", "notify_status", "notify_set", "notify_settings", "dev_status", "dev_set", "a11y_settings"];
     if (!OPS.includes(op)) return sendJson(res, 404, { ok: false, message: tz("未知操作") });
+    if (op === "shz_split_settings" && req.method !== "POST") return sendJson(res,405,{ok:false,message:"请使用 POST 打开分屏设置"});
+    if (op === "consent_set" && req.method !== "POST") return sendJson(res, 405, { ok: false, message: "请使用 POST 修改保存方式" });
     const raw = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : {};
     // 只转各操作认的字段、认的类型：应用那头也逐项校验，这里再挡一道（11-01 独立审查低-3）
     const b = {};
@@ -301,9 +326,20 @@ export async function routeDevside(req, res, u, p) {
       if (typeof v !== ty || (ty === "string" && v.length > 4096) || (ty === "number" && !Number.isFinite(v))) return sendJson(res, 400, { ok: false, message: tz("请求参数不对") });
       b[k] = v;
     }
-    if (!PREFIX) return sendJson(res, 200, await devApp(op, b));
-    // 激活 / 打开自动激活要等用户在原生对话框里点（最多 60 秒），和 keepalive 一样放长；装 APK 还要先把包拷进暂存再等确认
-    return sendJson(res, 200, await privCall({ ...b, op }, op === "shz_activate" || op === "shz_autostart" ? 65000 : op === "apk_install" ? 120000 : undefined));
+    if(op==="upd_apply"&&b.item==="codex"){
+      if(req.method!=="POST")return sendJson(res,405,{ok:false,message:"请使用 POST 更新 Codex"});
+      const {startCodexRuntimeAction}=await import("./codex/runtime-route.mjs");
+      return sendJson(res,200,startCodexRuntimeAction("install"));
+    }
+    if (!PREFIX) {
+      const result=await devApp(op,b);
+      if(["upd_status","upd_check","upd_set"].includes(op)){const m=await import("./codex/runtime-route.mjs");return sendJson(res,200,m.noteCodexUpdateOperation(op,b,result));}
+      return sendJson(res,200,result);
+    }
+    if (op === "shz_activate" && req.method === "POST") return sendJson(res, 200, await activateWithTcp());
+    const result=await privCall({ ...b, op }, op === "shz_activate" || op === "shz_autostart" || op === "consent_set" ? 65000 : op === "apk_install" ? 120000 : undefined);
+    if(["upd_status","upd_check","upd_set"].includes(op)){const m=await import("./codex/runtime-route.mjs");return sendJson(res,200,m.noteCodexUpdateOperation(op,b,result));}
+    return sendJson(res,200,result);
   }
   return NEXT;
 }

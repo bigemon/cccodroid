@@ -89,3 +89,29 @@ test("没带树的失败、不带屏幕的结果照旧", async () => {
     assert.deepEqual(JSON.parse(b.content[0].text), { via: "back" });
   });
 });
+
+test("空 WebView 的不完整标记交给模型，读屏 IPC 不自行无限重试", async () => {
+  const tree='[0] WebView @100,200 click\n';
+  await withMcp(req=>req.op==='dev_status'?STATUS:{ok:true,count:1,tree,screen_partial:true,screen_warning:'Read again; content is not ready.'},async(rpc,seen)=>{
+    const r=(await rpc('tools/call',{name:'screen_read',arguments:{}})).result;
+    assert.equal(r.isError,undefined);
+    const head=JSON.parse(r.content[0].text.split('\n')[0]);
+    assert.equal(head.screen_partial,true);assert.match(head.screen_warning,/Read again/);
+    assert.equal(seen.filter(x=>x.op==='dev'&&x.tool==='screen_read').length,1);
+  });
+});
+test("动作已成功但附带界面不完整：仍是成功且只执行原动作一次", async () => {
+  await withMcp(req=>req.op==='dev_status'?STATUS:{ok:true,via:'action',count:1,tree:'[0] WebView @1,1 click\n',screen_partial:true,screen_warning:'Do not repeat the completed action.'},async(rpc,seen)=>{
+    const r=(await rpc('tools/call',{name:'screen_tap',arguments:{node:3}})).result;
+    assert.equal(r.isError,undefined);const head=JSON.parse(r.content[0].text.split('\n')[0]);
+    assert.equal(head.via,'action');assert.equal(head.screen_partial,true);
+    const actions=seen.filter(x=>x.op==='dev');assert.equal(actions.length,1);assert.deepEqual(actions[0].args,{node:3});
+  });
+});
+test("动作失败仍保留失败与附带界面的不完整标记", async () => {
+  await withMcp(req=>req.op==='dev_status'?STATUS:{ok:false,message:'stale node',count:1,tree:'[0] WebView @1,1 click\n',screen_partial:true,screen_warning:'partial'},async(rpc,seen)=>{
+    const r=(await rpc('tools/call',{name:'screen_tap',arguments:{node:9}})).result;
+    assert.equal(r.isError,true);assert.match(r.content[0].text,/stale node/);assert.match(r.content[0].text,/"screen_partial":true/);
+    assert.equal(seen.filter(x=>x.op==='dev').length,1);
+  });
+});

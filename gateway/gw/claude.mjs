@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { CFG, GLIBC_PRELOAD, NO_BRIDGE, PATHS, PREFIX, glibcEnv, log, sleep, tz } from "./config.mjs";
+import { CFG, GLIBC_PRELOAD, NO_BRIDGE, PATHS, PREFIX, glibcEnv, log, sleep, tz, CHILD_ENV_KEY, INSTANCE_ID } from "./config.mjs";
 import { SETTINGS, outputStyles } from "./settings-store.mjs";
 import { PROVIDER, keyOf } from "./providers.mjs";
 import { cachedModels, defaultCompactLine } from "./models.mjs";
@@ -252,8 +252,11 @@ export function claudeEnv(o = {}) {
     ].join(":"),
     CCAPP_TOOLCHAIN: PATHS.toolchain,
     CCAPP_PROVIDER: p.id,
-    // 标记：这棵进程树是网关拉起的 claude 运行（子孙都继承）。网关重启时据此认出上一任留下的孤儿，见 reapOrphans
+    // 标记：这棵进程树是网关拉起的 claude 运行（子孙都继承）。
+    // P6-B2 起孤儿清理改用实例登记表，这个标记保留给旧版本与人工排障用
     CCAPP_RUN: "1",
+    // 实例归属：子孙都继承，下一任网关据此判断「这是不是我自己上一任的进程」
+    [CHILD_ENV_KEY]: INSTANCE_ID,
     LD_LIBRARY_PATH: PREFIX ? "" : PATHS.nodeLib,   // 只给 node 用；glibc 走 --library-path
     // 前缀布局下 glibc 的 resolv.conf 是齐的，不需要本地桥：直连厂商
     // 别家（会话钉的不是全局那家）也直连：桥只有一个上游，跟着全局走；claude（Bun）自己解析 DNS，用不着桥
@@ -488,44 +491,10 @@ export function killRunProcs(runId, sinceTicks = null) {
   return victims.length;
 }
 
-/** 网关启动时清掉上一任留下的孤儿（v0.2.0 设计 A3）。
- *  上一任网关被杀 / 崩溃时，它拉起的 claude 和 claude 另开进程组的子 shell 会被 init 收养（PPID=1），
- *  没人读它们的输出却还在干活：推提交、跑构建、占内存。新网关接不回它们，只能清掉。
- *  认法：本 uid、PPID=1，且环境里带 CCAPP_RUN=1（claudeEnv 打的标记，子孙都继承），
- *  或命令行就是我们的 claude（打标记之前的版本留下的）。连子孙一起、按进程组杀（同 killTree）。
- *  环境里的 CCAPP_GW_PID（run.mjs）指向的网关还活着、且比它起得早的不收：那是活网关名下用 setsid 脱出去的，不是上一任留下的。
- *  只在 cccodroid 做：开发端换网关（gw-swap.sh）时上一任的运行还要接着用。 */
+/** 兼容入口：真正的清理逻辑在 gw/instances.mjs（按实例登记表，不按命令行特征）。
+ *  P6-B2 起不再按「PPID=1 + CCAPP_RUN」扫全机进程 —— 那会误杀同机另一个实例的子进程。 */
 export function reapOrphans() {
-  if (!PREFIX) return;
-  const uid = process.getuid(), victims = [];
-  let names = [];
-  try { names = fs.readdirSync("/proc"); } catch { return; }
-  for (const n of names) {
-    if (!/^\d+$/.test(n) || +n === process.pid) continue;
-    try {
-      if (fs.statSync("/proc/" + n).uid !== uid) continue;
-      const st = fs.readFileSync("/proc/" + n + "/stat", "utf8");
-      if (+st.slice(st.lastIndexOf(")") + 2).split(" ")[1] !== 1) continue;
-      const env = "\0" + fs.readFileSync("/proc/" + n + "/environ", "latin1");
-      const cmd = fs.readFileSync("/proc/" + n + "/cmdline", "utf8");
-      if (!(env.includes("\0CCAPP_RUN=1\0") || cmd.includes(PATHS.claude))) continue;
-      // 起它的网关还活着（setsid 脱出去的后台任务，或者测试里另起的网关碰上了真网关的运行）：不是孤儿，不收。
-      // 那个 pid 若被别的进程复用，启动时刻会晚于它，照收
-      const gw = +(/\0CCAPP_GW_PID=(\d+)\0/.exec(env) || [])[1], t0 = gw && gw !== process.pid ? startTicks(gw) : null;
-      if (t0 != null && t0 <= startTicks(+n, st)) continue;
-      victims.push([+n, cmd.replace(/\0/g, " ").trim().slice(0, 80)]);
-    } catch {}
-  }
-  for (const [pid, cmd] of victims) {
-    const tree = descendants(pid);
-    try { process.kill(-pid, "SIGKILL"); } catch {}
-    try { process.kill(pid, "SIGKILL"); } catch {}
-    for (const p of tree) {
-      try { process.kill(-p, "SIGKILL"); } catch {}
-      try { process.kill(p, "SIGKILL"); } catch {}
-    }
-    log(`  清掉上一任留下的孤儿 pid=${pid}（连子孙 ${tree.length} 个）：${cmd}`);
-  }
+  return false;
 }
 
 /** pid 的直接子进程，按 /proc/<pid>/task/<tid>/children 列（看得见 pid 才读得到；列出来的子进程本身看不见也照样列） */

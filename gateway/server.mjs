@@ -45,7 +45,7 @@ import { SETTINGS, routeSettings, saveSettings } from "./gw/settings.mjs";
 import { API_KEY, PROVIDER, routeProviders } from "./gw/providers.mjs";
 import { fetchModels, normEffort, routeModels } from "./gw/models.mjs";
 import { listSessions, routeSessions } from "./gw/sessions.mjs";
-import { bridgeProc, killTree, reapOrphans, routeClaude } from "./gw/claude.mjs";
+import { bridgeProc, killTree, routeClaude } from "./gw/claude.mjs";
 import { expireTrash } from "./gw/sessionops.mjs";
 import { routeCaps, builtinCommands } from "./gw/caps.mjs";
 import { NEXT, sendJson, serveStatic } from "./gw/http.mjs";
@@ -60,7 +60,7 @@ import { routeModules } from "./gw/modules.mjs";
 import { cleanOrphans, routeOrphans } from "./gw/orphans.mjs";
 import { customRefresh, routeCustom } from "./gw/custom.mjs";
 import { routeBus } from "./gw/bus.mjs";
-import { recoverRunMark, routeQueue } from "./gw/queue.mjs";
+import { initQueue, routeQueue } from "./gw/queue.mjs";
 import { sweepTemps } from "./gw/statefile.mjs";
 import { routeLogin } from "./gw/login.mjs";
 import { routeRun } from "./gw/run.mjs";
@@ -68,6 +68,7 @@ import { routeOffice } from "./gw/office.mjs";
 import { routeLocal } from "./gw/local.mjs";
 import { routeUsage } from "./gw/usage.mjs";
 import { routeDevside } from "./gw/devside.mjs";
+import { startShizukuTcp } from "./gw/shizuku-tcp.mjs";
 import { routeFeedback } from "./gw/feedback.mjs";
 import { ensureSessionRetention, migrateHookPause, routeExtensions } from "./gw/extensions.mjs";
 import { routeNotices } from "./gw/notices.mjs";
@@ -85,15 +86,21 @@ import { routeProfile } from "./gw/profile.mjs";
 import { routeBackfill } from "./gw/backfill.mjs";
 import { routeArchive } from "./gw/archive.mjs";
 import { guarded, installCrashGuard, runShutdown } from "./gw/crashguard.mjs";
-import { RUNS } from "./gw/runs.mjs";
 import { syncGitSafe } from "./gw/gitsafe.mjs";
 import { routeArc } from "./gw/archiver.mjs";
 import { routeStorage, startAutoClean } from "./gw/storage.mjs";
 import { COOKIE, SESSION, UI_HOST, cookieHostOk, denyLog, denyReason, localAddr, proofFor, tokenOk } from "./gw/access.mjs";
 import { startWorkIsland, stopWorkIslandSync } from "./gw/work-island.mjs";
+import { clearInstance, initInstance } from "./gw/instances.mjs";
+import { codexStatus, disposeAllCodexSessions, startCodexIdleReaper } from "./gw/codex/run.mjs";
+import {routeCodexRuntime,startCodexAutoUpdates} from "./gw/codex/runtime-route.mjs";
+import { routeCodexAccount } from "./gw/codex/account.mjs";
+import { disposeAgent } from "./gw/codex/agent.mjs";
+import { routeRemote, startManagedRemote } from "./gw/remote.mjs";
+import { RUNS } from "./gw/runs.mjs";
 
 // 各模块的路由函数，按原来分支的先后排；返回 NEXT 表示不归它管
-const ROUTES = [routeClaude, routeFeedback, routeUsage, routeCaps, routeProviders, routeSettings, routeProjects, routeBookmarks, routeFonts, commandRoutes(builtinCommands), routeUi, routeSched, routeSessModel, routeBackfill, routeMerge, routeProfile, routeLineage, routeArchive, routeSessions, routeExtensions, routeModels, routeTerminal, routeComponents, routeModules, routeOrphans, routeStorage, routeCustom, routeGit, routeLocal, routeOffice, routeArc, routeFiles, routePreview, routeBus, routeQueue, routeDevside, routeLogin, routeRun, routeNotices, routeReconcile];
+const ROUTES = [routeRemote, routeCodexRuntime, routeCodexAccount, routeClaude, routeFeedback, routeUsage, routeCaps, routeProviders, routeSettings, routeProjects, routeBookmarks, routeFonts, commandRoutes(builtinCommands), routeUi, routeSched, routeSessModel, routeBackfill, routeMerge, routeProfile, routeLineage, routeArchive, routeSessions, routeExtensions, routeModels, routeTerminal, routeComponents, routeModules, routeOrphans, routeStorage, routeCustom, routeGit, routeLocal, routeOffice, routeArc, routeFiles, routePreview, routeBus, routeQueue, routeDevside, routeLogin, routeRun, routeNotices, routeReconcile];
 
 // ── 路由 ──────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
@@ -142,6 +149,7 @@ const server = http.createServer(async (req, res) => {
   try {
     for (const r of ROUTES) if ((await r(req, res, u, p)) !== NEXT) return;
 
+    if (req.method === "GET" && p === "/api/codex/status") return sendJson(res, 200, { ok: true, ...codexStatus() });
     // HEAD 和 GET 同一条静态分发：头一样（含 content-length），Node 对 HEAD 自动不发正文（195-C.19 后半 / 196）
     if (req.method === "GET" || req.method === "HEAD") return serveStatic(req, res, p);
 
@@ -191,14 +199,13 @@ guardSlots(server); guardSlots(uiServer);
 // 主地址被占（EADDRINUSE 之类）：记一笔再退出，GatewayService 会重拉；以前没挂监听，直接抛成未捕获异常、日志里什么都没有（审查 v0513b 低-9）
 server.on("error", (e) => { log(`⚠️ 主地址 127.0.0.1:${CFG.port} 监听失败：${e.code || e.message}，退出等重拉`); setTimeout(() => process.exit(1), 200); });
 server.listen(CFG.port, "127.0.0.1", () => {
+  startShizukuTcp();
+  startManagedRemote();
   // 上一任留下的运行标记：等所有模块都求值完再收（放在 queue.mjs 顶层会撞循环引用——sessionops 的 SID_RE 还没初始化，带会话的排队消息一恢复网关就崩，11-02 群友日志）。
   // 端口拿到了才收：以前在 listen 之前，旧网关还在跑时重复拉起的这个先改了它的恢复记录，再因 EADDRINUSE 退出（0.6.9 审计 195-T.2）。
   // 'listening' 先于任何连接派发，界面的第一个请求照样看得到恢复出来的队列
-  try { recoverRunMark(); } catch (e) { log("恢复上次的运行标记失败：" + (e.stack || e.message)); }
-  // 界面地址也放到恢复之后：别让界面在队列恢复前先连进来。
-  // App 探测到这台设备上 127.0.0.2 不通、界面改走 127.0.0.1 时（access.mjs 的 UI_HOST），主地址就是界面地址，不再另听一份
   if (UI_HOST !== "127.0.0.1") uiServer.listen(CFG.port, UI_HOST);
-  else log("⚠️ 这台设备上 127.0.0.2 连不通，界面改走 127.0.0.1（应用启动时探测，见 Env.checkHost）");
+  else log("界面回退到 127.0.0.1");
   // 浏览器直接开这个地址只拿得到静态页，/api 按来源校验一律 403；界面要从应用里开（0.6.9 审计 195-G.6）
   log(`claude-apk 网关 v3 已启动  http://127.0.0.1:${CFG.port}（界面请从 cccodroid 应用里打开）`);
   log(`  运行时 ${CFG.runtime}`);
@@ -215,7 +222,20 @@ server.listen(CFG.port, "127.0.0.1", () => {
     log(`  执行方式 经加载器 · ld.so ${same ? "与工具包一致" : "⚠️ 与工具包里的不一致，claude 可能起不来：更新工具包"}`);
   }
   log(`  历史会话 ${listSessions(500).length} 个`);
-  try { reapOrphans(); } catch (e) { log("孤儿进程清理失败: " + e.message); }
+  // P6-B2：只清「本 home 上一任实例登记过」的子进程，跨实例一律不碰（见 gw/instances.mjs）
+  try {
+    const init = initInstance({ port: CFG.port });
+    if (init && init.refused) {
+      log(`已有网关在用这个 HOME（pid=${init.holder.pid}，端口 ${init.holder.port}），本实例退出`);
+      console.error(`cccodroid gateway: another instance is already running with this HOME (pid ${init.holder.pid}, port ${init.holder.port})`);
+      process.exit(1);
+    }
+  } catch (e) { log("实例初始化失败: " + e.message); }
+  // 队列的启动初始化（恢复上一任未完成的轮次）—— 不再挂在 import 上
+  try { initQueue(); } catch (e) { log("队列初始化失败: " + e.message); }
+  try { startCodexAutoUpdates(); } catch(e){log("Codex 自动更新启动失败: "+e.message);}
+  // Codex 会话空闲回收：只收没有正在跑的 run 的会话
+  try { startCodexIdleReaper(() => [...RUNS.values()].map((r) => r.sessionId).filter(Boolean)); } catch (e) { log("Codex 空闲回收启动失败: " + e.message); }
   // 上次被结束时留下的隐藏临时文件（原子写换名前、导入没导完、上传没传完）：清掉一小时前的（FIND-016）
   try { const n = sweepTemps([CFG.home, UPLOAD_DIR]); if (n) log(`清掉 ${n} 个上次留下的临时文件`); } catch (e) { log("临时文件清理失败: " + e.message); }
   try { expireTrash(); } catch (e) { log("回收站清理失败: " + e.message); }
@@ -256,15 +276,19 @@ setTimeout(async () => {
 }, 2500);
 
 // 工作岛的收起放最后：它要同步调 am（最多 3 秒），App 等 5 秒就强杀，先把 claude 和终端收了
-// 正在跑的 claude 一并带走（整个进程组）：以前只收终端，claude 成了孤儿继续写文件、继续计费（0.6.9 审计 P1-3）。
-// 中断记录（run mark）是随时落盘的，重启后照常给「继续」卡
-const shutdown = (sig) => {
-  for (const r of RUNS.values()) if (r.child && !r.ended) { try { killTree(r.child); } catch {} }
-  if (sig === "SIGTERM") for (const t of TERMS.values()) if (t.alive) { try { killTree(t.child); } catch {} }
-  try { bridgeProc?.kill(); } catch {}
+// 退出：先收 Claude 进程树，再收 Codex 的 app-server / 代理，最后抹掉实例登记。
+// Codex 的 dispose 是异步的，最多等 3 秒，不让 App 的强杀先到
+async function shutdown(sig) {
+  log(`收到 ${sig}，正在退出`);
   runShutdown();
+  for (const r of RUNS.values()) if (r.child && !r.ended) { try { killTree(r.child); } catch {} }
+  for (const t of TERMS.values()) if (t.alive) killTree(t.child);
+  try { bridgeProc?.kill(); } catch {}
   try { stopWorkIslandSync(); } catch {}
+  try { await Promise.race([disposeAllCodexSessions(), new Promise((r) => setTimeout(r, 3000))]); } catch {}
+  try { await Promise.race([disposeAgent(), new Promise((r) => setTimeout(r, 2000))]); } catch {}
+  try { clearInstance(); } catch {}
   process.exit(0);
-};
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+}
+process.on("SIGTERM", () => { shutdown("SIGTERM"); });
+process.on("SIGINT", () => { shutdown("SIGINT"); });

@@ -117,10 +117,13 @@ input,textarea,[contenteditable="true"],#composer input,#composer textarea,#comp
 /* 快满 / 满了：不换成纯黄纯红那种跳出来的色块，仍从本主题的强调色渐变过去，终点是按每套主题深浅调过的暖色 / 红色 */
 #ctxbar.warn #ctxfill{background:linear-gradient(90deg,var(--accent-dim),var(--ctx-warn))}
 #ctxbar.danger #ctxfill{background:linear-gradient(90deg,var(--ctx-warn),var(--ctx-err))}
-/* 这时字一半压在暖色 / 红色上、一半落在空白处：不再加描边衬底（观感差，10-28 用户定去掉），
-   改成按进度分界线把同一行字分两色——压在条上的是近黑（各主题暖色 / 红色上对比度都 ≥5:1），空白处是正文色 */
-#ctxbar:is(.warn,.danger) #ctxtxt{background:linear-gradient(90deg,#111 var(--p,0%),var(--fg) var(--p,0%));-webkit-background-clip:text;background-clip:text;color:transparent}
-#ctxbar:is(.warn,.danger) #ctxtxt *,#ctxbar:is(.warn,.danger) #ctxtxt *::before{color:transparent!important}
+/* 还没拿到窗口 / 用量：条留空，只留一句说明，不假装有数 */
+#ctxbar.na #ctxfill{width:0 !important;background:none}
+/* 不能选的后端：灰掉，别只剩一个禁用属性 */
+.mp-item.off{opacity:.45}
+/* 字会跨越进度分界线：实心正文色配反色细描边，所有用量均生效。
+   先画描边再填字，保住 10px 小字的笔画；不加模糊阴影，也不将文字裁成透明渐变。 */
+#ctxtxt,#ctxtxt *,#ctxtxt *::before{color:var(--fg);-webkit-text-stroke:1px var(--bg);paint-order:stroke fill;text-shadow:none}
 :root{--ctx-warn:#c98f4e;--ctx-err:#c95f4a}
 html[data-theme="light"]{--ctx-warn:#dba15c;--ctx-err:#cf6a4c}
 html[data-skin="qiusuo"]{--ctx-warn:#b9955f;--ctx-err:#c46a78}
@@ -131,7 +134,7 @@ html[data-skin="zhuyue"][data-theme="light"]{--ctx-warn:#d9bd8c;--ctx-err:#d98a8
 html[data-skin="zhuyue"] #ctxbar:not(.warn):not(.danger) #ctxfill{background:linear-gradient(90deg,var(--bg4),color-mix(in srgb,var(--accent) 30%,var(--bg4)))}
 #ctxtxt{
   position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-  font-size:10px;color:var(--fg2);letter-spacing:.3px;
+  font-size:10px;letter-spacing:.3px;
 }
 
 /* ── 消息区 ── */
@@ -355,6 +358,9 @@ td{color:var(--fg2)}
 #btn-interject:active{background:var(--bg3)}
 #btn-interject svg{width:17px;height:17px;fill:currentColor;stroke:none}
 #btn-send.busy .ico-send{display:none} #btn-send.busy .ico-stop{display:block}
+/* 输入区图标由 SVG 自绘；清除控件默认留白，避免 Safari 小按钮内容区挤偏。 */
+#composer-inner .mini-btn,#btn-send,#btn-interject{-webkit-appearance:none;appearance:none;padding:0}
+#composer-inner .mini-btn svg,#btn-send svg,#btn-interject svg{display:block}
 #hint-row{display:flex;gap:9px;justify-content:center;max-width:900px;margin:5px auto 0;font-size:10.5px;color:var(--fg3);flex-wrap:wrap}
 #model-chip{color:var(--accent)}
 #perm-chip{color:var(--fg3);cursor:pointer;border-bottom:1px dotted currentColor}
@@ -1642,6 +1648,14 @@ html[data-skin="qiusuo"] #sub-title:is(.warn,.live){
 /* 一类：一张底板，里面一行一项，行间细线 */
 .set-cat{background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);padding:2px 18px}
 .set-cat .set-h{margin:14px 0 2px}
+.core-tabs{margin-top:14px}
+.core-tabs button{min-height:36px;min-width:100px}
+.core-tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.core-settings-note{margin:10px 0;line-height:1.55}
+.codex-advanced{margin-top:14px}
+.codex-advanced summary{cursor:pointer;color:var(--fg2);font-size:13px;padding:8px 0}
+.codex-advanced .row-actions{margin-top:10px}
+[data-core-panel] > .srow:last-child,[data-core-panel] > .sblock:last-child{border-bottom:0}
 .set-cats svg{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 /* 行：左名称 + 说明，右控件 */
 .srow{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--line)}
@@ -1653,6 +1667,10 @@ html[data-skin="qiusuo"] #sub-title:is(.warn,.live){
 .sl p.clamp{max-height:3.1em;overflow:hidden;cursor:pointer;-webkit-mask-image:linear-gradient(#000 55%,transparent);mask-image:linear-gradient(#000 55%,transparent)}
 .sl p.clamp.open{max-height:none;-webkit-mask-image:none;mask-image:none}
 .sl p code{font-size:11.5px}
+#consent-save-state,#priv-field #priv-auto-state{color:var(--warn)}
+/* Keep title and expandable help distinct in this accessibility permission row. */
+#priv-na-screen-row .sl p{color:var(--fg3)}
+#priv-na-hours option[value="-1"],#priv-na-hours.permanent{color:#e05252;font-weight:600}
 .sc{flex:none;display:flex;align-items:center;gap:8px;max-width:58%}
 /* 右格最多 58%：俄语等长文案的按钮在这里允许折成两行，不冲出设置栏（全局 .btn 是 nowrap） */
 #set-ov .sc .btn{white-space:normal;text-align:center;overflow-wrap:anywhere}
@@ -2391,6 +2409,12 @@ body{line-height:var(--phi)}
 .pj-sec .grow{flex:1;min-width:0}
 .pj-sec .seg button{padding:3px 9px;font-size:12.5px}
 .pj-note{font-weight:400;font-size:12.5px}
+/* Keep the instruction title readable; long help text occupies its own line. */
+.pj-instr-head{flex-wrap:wrap}
+.pj-instr-head>.grow{flex:1 1 14em;overflow-wrap:anywhere}
+.pj-instr-head>select{flex:0 1 auto;min-width:0;max-width:100%;box-sizing:border-box;padding:5px 28px 5px 9px;font:inherit;color:var(--fg)}
+.pj-instr-head>.pj-note{flex:0 0 100%;min-width:0;line-height:1.5;overflow-wrap:anywhere}
+
 #pages .panel > .row.pj-row{cursor:pointer}
 #pages .panel > .row b{font-weight:500;font-size:14.5px}
 .pj-sub{font-size:12.5px;line-height:1.5;margin-top:1px;overflow:hidden;text-overflow:ellipsis}
@@ -2522,7 +2546,9 @@ textarea.pj-field{min-height:89px;resize:vertical;line-height:1.618}
 #sheet:not(.pop) .sheet-panel{max-height:min(calc(100% - var(--safe-t, 0px)),80vh)}
 /* 输入框下面一行：回到老版的无框样式（用户定）——纯文字，型号强调色，权限虚线下划线，各项之间隔一个点 */
 #hint-row{gap:0;font-size:11.5px;line-height:1.6;margin-top:var(--g1)}
-#hint-row > *:not(.hidden):not(:empty) ~ *:not(.hidden):not(:empty)::before{content:"·";color:var(--fg3);margin:0 7px;display:inline-block;text-decoration:none}
+#hint-row > *:not(.hidden):not(:empty) ~ *:not(.hidden):not(:empty):not(#model-chip)::before{content:"·";color:var(--fg3);margin:0 7px;display:inline-block;text-decoration:none}
+/* #model-chip 是 display:contents，分隔点画在它自己身上不落地：补到第一片 chip 上（后端名与型号之间） */
+#hint-row #backend-chip:not(.hidden) ~ #model-chip > .chip:first-child::before{content:"·";color:var(--fg3);margin:0 7px;display:inline-block;text-decoration:none}
 #hint-row #model-chip .chip-prov{color:var(--fg2)}
 #hint-row .chip,#hint-row #perm-chip,#hint-row #draft-chip,#hint-row #proj-chip{border:0;border-radius:0;padding:0;background:none;font-size:inherit;line-height:inherit}
 #hint-row #model-chip{color:var(--accent);cursor:pointer}
@@ -2652,8 +2678,10 @@ html .msg.welcome.bot .bubble h1.wl-greet{font-size:clamp(19px,4.2cqi,31px);marg
 html.wel #composer-inner{flex-wrap:wrap;align-items:center;row-gap:2px}
 html.wel #input{order:-1;flex:1 1 100%;padding:6px var(--g1) 4px}
 html.wel #btn-send{margin-inline-start:auto}
-html.wel #hint-row #model-chip > .chip:first-child{margin-inline-start:auto}
-html.wel #hint-row #proj-chip:not(.hidden) ~ #model-chip > .chip:first-child{margin-inline-start:0}
+/* 首屏：左边项目、右边「后端 · 型号 · 强度」一组；自动外边距放在后端标识上，
+   这样后端名和型号始终连在一起（放在 model-chip 的第一片上会把它们拆到两头） */
+html.wel #hint-row #backend-chip{margin-inline-start:auto}
+html.wel #hint-row #proj-chip:not(.hidden) ~ #backend-chip{margin-inline-start:0}
 /* 你发出的附件：气泡上方一排缩略图 / 文件卡片，不再把「@路径」露在正文里 */
 .u-refs{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:var(--g1);max-width:min(85%,680px);margin-bottom:var(--g1)}
 .u-ref{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--bg2);color:var(--fg2);border-radius:12px;padding:7px 11px;font-size:12.5px;line-height:1.3;cursor:pointer;max-width:240px}
@@ -2701,9 +2729,9 @@ html.side-drag .drawer-panel{transition:none}   /* 别写 animation:none：松�
 #ctxbar{cursor:pointer}
 html.pg-on #ctxbar{visibility:hidden}   /* 整页盖着时不露会话的用量条（#39） */
 #ctxq:empty{display:none}
-#ctxctx:not(:empty) + #ctxq::before{content:"·";margin:0 6px;color:var(--fg3)}
-#ctxq.warm{color:color-mix(in srgb,var(--ctx-warn) 70%,var(--fg))}
-#ctxq.hot{color:color-mix(in srgb,var(--ctx-err) 75%,var(--fg));font-weight:600}
+#ctxctx:not(:empty) + #ctxq::before{content:"·";margin:0 6px}
+#ctxq.warm{font-weight:500}
+#ctxq.hot{font-weight:600}
 .qcard{position:fixed;z-index:90;box-sizing:border-box;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:14px;
   box-shadow:0 10px 32px var(--shadow);padding:12px 14px;animation:fade .12s;font-size:13px}
 .qc-h{display:flex;align-items:center;gap:8px;margin-bottom:4px}
@@ -2712,13 +2740,22 @@ html.pg-on #ctxbar{visibility:hidden}   /* 整页盖着时不露会话的用量�
 .qc-foot{display:flex;justify-content:flex-end;margin-top:10px}
 .bill-big.hot b,.bill-big.hot{color:var(--err)}
 #us-acct .sub{font-size:12px;color:var(--fg2);margin:12px 0 4px;font-weight:600}
-.qb-row{border-top:1px solid var(--line)}
-.qb-row summary{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;list-style:none}
+.qb-row{border:1px solid var(--line);border-radius:var(--radius);padding:0 12px;background:var(--bg)}
+#us-acct-others:not(:empty),#us-acct-others .qb-row + .qb-row{margin-top:16px}
+.qb-row summary{display:flex;align-items:center;gap:8px;padding:12px 0;cursor:pointer;list-style:none}
+.qb-name{font-size:15px;font-weight:500;min-width:0;overflow-wrap:anywhere}
+.qb-row .qb-brief{max-width:55%;text-align:end;overflow-wrap:anywhere}
 .qb-row summary::-webkit-details-marker{display:none}
 .qb-row summary::after{content:"";width:6px;height:6px;border:solid var(--fg3);border-width:0 1.5px 1.5px 0;transform:rotate(45deg);margin:0 4px 3px}
 .qb-row[open] summary::after{transform:rotate(-135deg);margin-bottom:-3px}
 .qb-brief.hot{color:var(--err)}
-.qb-detail{padding:0 0 10px}
+.qb-detail{padding:0 0 12px;min-width:0}
+/* Keep platform quota bars legible when card padding narrows the mobile column. */
+#us-acct .quota-row{display:grid;grid-template-columns:minmax(0,4.5em) minmax(24px,1fr) max-content;gap:4px 8px}
+#us-acct .quota-row > .tiny{grid-column:2 / -1;min-width:0}
+#us-acct .quota-bar{width:100%;max-width:none}
+#us-acct .quota-l{min-width:0;overflow-wrap:anywhere}
+#us-acct .qb-detail > .quota{margin-top:0}
 .qb-warn{display:flex;flex-direction:column;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-size:13px;color:var(--fg2)}
 .qb-warn label{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .qb-warn input[type=number]{width:7em;margin:0;padding:4px 8px}
@@ -3157,6 +3194,60 @@ html[data-motion="on"] .lmap.mo-pick .lm-main .dim{animation:mo-dim calc(.32s * 
 html[data-motion="on"] .lmap.mo-pick .lm-cardbox{animation:mo-card var(--mo-snap) linear both}
 html[data-motion="on"] .lmap.mo-pick .t-ch{animation:mo-rise var(--mo-soft) linear both;animation-delay:calc(.08s * var(--mo-x,1))}
 
+/* ── P6-B1：后端标识（Claude / Codex）── */
+#backend-chip{font-weight:600}
+/* 两个后端同一套样式：只在前景色上区分，不画药丸底色（P6-F2） */
+#backend-chip.codex{color:var(--fg2)}
+#backend-chip.locked{opacity:.72}
+.badge.codex{color:var(--strong);background:color-mix(in srgb,var(--accent) 18%,var(--bg3));border-color:color-mix(in srgb,var(--accent) 46%,var(--line))}
+
+/* Codex 的阶段标签与只读诊断，复用现有颜色与字号 */
+.codex-stage{margin:8px 0 2px}
+#codex-diagnostics{margin:12px 0;overflow-wrap:anywhere}
+#codex-diagnostics-body{max-width:100%;overflow-wrap:anywhere}
+.codex-skills>.row{display:flex;align-items:center;gap:12px;padding:10px 0}
+.codex-skills .grow{flex:1;min-width:0}
+.codex-skills .btn{flex:none}
+.codex-skill-path{overflow-wrap:anywhere}
+.codex-project-mode{display:flex;flex-wrap:wrap}
+.codex-project-mode button{flex:1;min-width:max-content}
+
+.codex-command{margin:10px 0;padding:10px;border:1px solid var(--line);border-radius:10px;min-width:0}
+
+.codex-command>summary{display:flex;align-items:center;gap:8px;min-height:28px;list-style:none;cursor:pointer;user-select:none}
+.codex-command>summary::-webkit-details-marker{display:none}
+.codex-command>summary::before{content:"▸";flex:none;color:var(--fg3);transition:transform .15s}
+.codex-command[open]>summary::before{transform:rotate(90deg)}
+.codex-command>summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.codex-command .command-state{flex:none;font-size:12px;font-weight:500;color:var(--fg2)}
+.codex-command .command-preview{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px var(--mono);color:var(--fg3)}
+.codex-command .command-stop{flex:none}
+.codex-command[data-status="completed"] .command-state{color:var(--ok)}
+.tool.managed-command>.tool-body,.tool.managed-command>.codex-command{display:none}
+.tool.managed-command.open>.codex-command{display:block;margin:0;padding:0 10px 10px;border:0;border-radius:0}
+.tool.managed-command>.codex-command>summary{display:none}
+.tool.managed-command .command-stop{margin-inline-start:auto;margin-inline-end:6px;flex:0 0 auto;white-space:nowrap;line-height:1.3}
+.tool.managed-command>.tool-head{min-width:0}
+.tool.managed-command>.tool-head>.tool-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool.managed-command>.tool-head>:is(.chev,.tool-state){flex:none;white-space:nowrap}
+.codex-command pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;font-size:12px}
+.codex-command .command-text{color:var(--fg3)}
+
+.codex-command[data-status="failed"] .command-state,.codex-command[data-status="timeout"] .command-state{color:var(--err)}
+
+.codex-inspection{border:1px solid var(--line);padding:10px;border-radius:10px;margin:10px 0;overflow-wrap:anywhere}
+.codex-inspection pre{white-space:pre-wrap;max-height:360px;overflow:auto;font-size:12px}
+
+
+/* 远程设置占满设置内容区域，滚动交给内嵌文档，避免固定 vh 和双层滚动。 */
+#set-ov #tab-settings.remote-open{display:flex;overflow:hidden}
+#set-ov #tab-settings.remote-open .set-wrap{display:flex;flex:1;min-height:0;align-items:stretch}
+#set-ov #tab-settings.remote-open .set-main{display:flex;flex-direction:column;min-height:0;overflow:hidden;padding:0}
+#set-ov #tab-settings.remote-open .set-cat[data-cat="remote"]{display:flex;flex-direction:column;flex:1;min-height:0;padding:0}
+#set-ov #tab-settings.remote-open .set-cat[data-cat="remote"] > .set-h{flex:none;margin:14px 18px 4px}
+#set-ov #tab-settings.remote-open .set-cat[data-cat="remote"] > .sblock{display:flex;flex:1;min-height:0;padding:0;border:0}
+.remote-settings-frame{display:block;flex:1;width:100%;height:100%;min-height:0;border:0}
+#set-ov.narrow #tab-settings.remote-open .set-wrap{flex-direction:column}
 
 /* 手机上的工具包模块行：命令一长串只露两行（整份在展开里）；右侧大小 + 按钮别把标题挤没 */
 @media (max-width:680px){
@@ -3589,7 +3680,6 @@ html[data-theme="light"]{--fg3:#6f6a60}
 #hint-row #model-chip .chip,#hint-row #perm-chip,#hint-row #draft-chip{position:relative}
 #hint-row #model-chip .chip::after,#hint-row #perm-chip::after,#hint-row #draft-chip::after{content:"";position:absolute;left:-4px;right:-4px;top:50%;height:48px;margin-top:-24px}
 /* 200-12-10 RTL 下上下文进度条的双色文字分界要跟着从右往左，和填充方向一致 */
-html[dir="rtl"] #ctxbar:is(.warn,.danger) #ctxtxt{background:linear-gradient(270deg,#111 var(--p,0%),var(--fg) var(--p,0%))}
 /* 压缩包（06-files.js）：包内顶栏、多选勾、页脚进度、对话框 */
 .fs-arcbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:7px}
 .fs-arcbar .tiny{flex:1;min-width:0;margin:0}
@@ -3688,3 +3778,17 @@ html[dir="rtl"] #ctxbar:is(.warn,.danger) #ctxtxt{background:linear-gradient(270
 /* RTL：命令参数 / 路径按 LTR 排；标题用 start */
 .ts-head,.bubble .hook-ctx{text-align:start}
 html[dir="rtl"] :is(.tool-arg,.perm-path,.missing-img){direction:ltr;text-align:left;unicode-bidi:isolate}
+
+/* Codex 的异步选择与首次环境安装。 */
+.codex-questions{margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:10px;display:grid;gap:10px}
+.codex-questions fieldset{border:0;padding:0;min-width:0;display:flex;flex-wrap:wrap;gap:8px}
+.codex-questions legend{font-weight:600;margin-bottom:8px;white-space:pre-wrap;overflow-wrap:anywhere}
+.codex-questions button{white-space:normal;text-align:left}
+.codex-questions [aria-pressed="true"]{border-color:var(--accent-btn);background:var(--accent-btn);color:var(--on-accent)}
+.codex-questions textarea{width:100%;box-sizing:border-box;resize:vertical;font:inherit;font-size:13px;color:var(--fg);background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:8px}
+.codex-questions textarea:focus{outline:1px solid var(--accent)}
+/* Keep update actions beside the version when status notices wrap. */
+#upd-items .upd-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;margin-bottom:16px}
+#upd-items .upd-info{min-width:0;overflow-wrap:anywhere}
+#upd-items .upd-info .prov-state{display:block}
+#upd-items .upd-actions{justify-content:flex-end;align-self:start;max-width:min(55vw,260px);margin:0}

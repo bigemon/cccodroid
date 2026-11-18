@@ -76,7 +76,9 @@ test("项目指令：读不了（不是「没有」）报 500，不当成空的�
   assert.equal(r.status, 200, await r.clone().text());
   const id = (await r.json()).project.id;
   let g = await (await go(`/api/projects/${id}/instr`)).json();
-  assert.deepEqual(g, { text: "", exists: false });
+  assert.equal(g.text, "");
+  assert.equal(g.exists, false);
+  assert.equal(g.backend, "claude");
   fs.mkdirSync(path.join(dir, "CLAUDE.md"));     // 不是普通文件：和没权限一样是「读不了」（v0513b 起不跟软链、不读目录，报 409）
   const bad = await go(`/api/projects/${id}/instr`);
   assert.ok(bad.status >= 400 && bad.status !== 404, String(bad.status));

@@ -25,7 +25,7 @@ test("整页盖着时来了确认请求：提醒一次，点「查看」打开�
 test("perm_mode 事件：在跑轮次的模式快照跟着改，并重排等着的计划卡", () => {
   const body = take(flow, '      case "perm_mode":', '      case "perm_request":');
   let refreshed = 0;
-  const box = { state: { settings: {} }, setPermChip() {}, $: () => null, srv: { runs: [{ permMode: "default" }, { permMode: null }] }, refreshPlanActs: () => refreshed++ };
+  const box = { codexPermView: () => false, state: { settings: {} }, setPermChip() {}, $: () => null, srv: { runs: [{ permMode: "default" }, { permMode: null }] }, refreshPlanActs: () => refreshed++ };
   vm.runInNewContext(`globalThis.f = (ev) => { switch (ev.type) { ${body} } };`, box);
   box.f({ type: "perm_mode", mode: "auto" });
   assert.equal(box.srv.runs[0].permMode, "auto");

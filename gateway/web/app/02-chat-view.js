@@ -100,7 +100,8 @@
   function mkMsg(role, label, parent) {
     const el = document.createElement("div");
     el.className = `msg ${role}`;
-    const name = label || (role === "user" ? t("你") : role === "sys" ? t("命令") : "Claude");
+    const name = label || (role === "user" ? t("你") : role === "sys" ? t("命令")
+      : (typeof currentBackend === "function" && currentBackend() === "codex" ? "Codex" : "Claude"));
     el.innerHTML = `<div class="who"><span class="dot"></span>${esc(name)}</div><div class="bubble" dir="auto"></div>`;
     (parent || liveEl).appendChild(el);
     return el.querySelector(".bubble");
@@ -184,8 +185,12 @@
     clip: '<rect x="6" y="4.5" width="12" height="16" rx="2"/><path d="M9 4.5V3h6v1.5M9 10h6M9 14h4"/>',
   };
   const uiI = (n, cls) => `<svg class="ui-i${cls ? " " + cls : ""}" viewBox="0 0 24 24" aria-hidden="true">${UI_I[n]}</svg>`;
+  const codexHistoryOf = new WeakMap();
   const userTextOf = new WeakMap();   // 用户气泡 → 原文（分叉时拿它在 transcript 里认出是哪一轮）
   const actBtn = (a, label) => `<button data-a="${a}" title="${esc(label)}" aria-label="${esc(label)}"><svg viewBox="0 0 24 24">${ICONS[a]}</svg></button>`;
+  function deleteActionButton() {
+    return actBtn("del",t("删除"));
+  }
   // 发送时附件以「@路径」接在末尾（claude 靠它读文件）。气泡里不露这串前缀：末尾那段纯 @路径 拆出来，
   // 图片画成缩略图、别的文件画成小卡片；复制 / 重发仍用原文
   const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|avif|heic)$/i;
@@ -210,10 +215,12 @@
       ? `<button class="u-ref img" data-p="${esc(p)}"><img src="${fileUrl(p)}" alt="" loading="lazy"></button>`
       : `<button class="u-ref" data-p="${esc(p)}">${FILE}<span>${esc(p.split("/").pop())}</span></button>`).join("")}</div>`;
   }
-  function renderUser(text, parent, uuid) {
+  function renderUser(text, parent, history) {
+    const uuid = typeof history === "string" ? history : history?.uuid;
     const b = mkMsg("user", null, parent);
     if (uuid) b.parentElement.dataset.uuid = uuid;   // 书签落点
     userTextOf.set(b.parentElement, text);
+    if(history?.historyEpoch)codexHistoryOf.set(b.parentElement,{itemIndex:history.historyIndex,historyEpoch:history.historyEpoch});
     const [body, refs] = splitRefs(text);
     setHtml(b, body ? renderMd(body) : "");
     linRefLinks(b);   // 档号可点（18e-lineage-merge.js）
@@ -229,7 +236,7 @@
     }
     const acts = document.createElement("div");
     acts.className = "msg-acts";
-    acts.innerHTML = actBtn("copy", t("复制")) + actBtn("resend", t("重发")) + actBtn("rewind", t("回退到这里")) + actBtn("mark", t("书签")) + actBtn("del", t("删除"));
+    acts.innerHTML = actBtn("copy", t("复制")) + actBtn("resend", t("重发")) + actBtn("rewind", t("回退到这里")) + (isCodexView()?actBtn("mark", t("书签")):"") + deleteActionButton();
     acts.addEventListener("click", (e) => {
       const a = e.target.closest("button")?.dataset.a;
       // 复制只要说的话：附件那几行 @/data/user/0/…/uploads/… 是给模型读文件用的，粘到别处只是一串长路径（群友 10-31）。
@@ -367,10 +374,10 @@
     };
   }
 
-  function ThinkBlock(parent) {
+  function ThinkBlock(parent, heading = null) {
     const el = document.createElement("details");
     el.className = "think";
-    el.innerHTML = `<summary>${t("思考过程")} <span class="think-size"></span></summary><div class="think-body"></div>`;
+    el.innerHTML = `<summary>${heading || t("思考过程")} <span class="think-size"></span></summary><div class="think-body"></div>`;
     parent.appendChild(el);
     const body = el.querySelector(".think-body"), label = el.querySelector(".think-size");
     let thinking = "", timer = 0, shown = 0, moreBtn = null, done = false;
@@ -474,7 +481,7 @@
       `<div class="tool-body"></div>`;
     parent.appendChild(card);
     const st = card.querySelector(".tool-state"), bodyEl = card.querySelector(".tool-body");
-    let result = null, built = false;
+    let result = null, built = false, managedCommand=null;
     // 子代理（Agent / 旧名 Task）：卡片下面挂一块「子代理过程」，它的每一步是嵌套的工具卡，默认收起
     const isAgent = name === "Agent" || name === "Task";
     let sub = null;
@@ -526,7 +533,7 @@
     };
     const subLabel = () => { sub.label.textContent = t("子代理过程") + (sub.n ? " · " + t("{n} 个步骤", { n: sub.n }) : ""); };
     const build = () => {           // 点开才把参数、结果铺进 DOM
-      if (built) return;
+      if (built || managedCommand) return;
       built = true;
       let html = `<div class="lbl">${t("参数")}</div><pre>${esc(JSON.stringify(input, null, 2))}</pre>`;
       if (result) html += `<div class="lbl">${t("结果")}</div><pre>${esc(result.text)}</pre>`;
@@ -544,6 +551,22 @@
       el: card,
       name, summary: summarizeTool(name, input), state: live ? "run" : "unknown",
       onChange: null,
+      managedCommand(info, box, stop) {
+        const justFinished=managedCommand?.running&&!info.running;managedCommand=info;
+        card.classList.add("managed-command");
+        box.dataset.status=info.status;box.querySelector(".command-output").textContent=info.output||"";
+        box.querySelector(".command-note").textContent=[info.background?t("后台命令 · 跨轮次运行"):"",info.tty?"PTY":"",info.truncated?t("仅显示最近的输出，较早内容已省略"):""].filter(Boolean).join(" · ");
+        stop.hidden=!info.running||(!live&&!info.background);
+        if(box.parentNode!==card)card.appendChild(box);
+        box.open=true;
+        if(stop.parentNode!==st.parentNode)st.before(stop);
+        if(justFinished)card.classList.remove("open");
+        const labels={running:t("运行中"),completed:t("完成"),failed:t("失败"),cancelled:t("命令已停止"),interrupted:t("中断"),timeout:t("命令超时")};
+        api.state=info.running?"run":info.status==="completed"?"ok":"err";
+        st.className="tool-state "+api.state;
+        st.textContent=(labels[info.status]||info.status)+(info.exitCode!=null?" · "+t("退出码 {n}",{n:info.exitCode}):"");
+        api.onChange&&api.onChange();
+      },
       result(ok, text) {
         result = { ok, text: String(text || "") };
         api.state = ok ? "ok" : "err";
@@ -560,6 +583,7 @@
         }
         if (built) { built = false; build(); }
         if (!ok && live) { card.classList.add("open"); build(); }
+        if(managedCommand){api.managedCommand(managedCommand,card.querySelector(".codex-command"),card.querySelector(".command-stop"));return;}
         // 工具产出的图片（渲染结果、截图）直接露出来，不用点开
         if (ok && /\.(png|jpe?g|gif|webp)\b/i.test(result.text)) {
           const peek = card.querySelector(".tool-peek") || document.createElement("div");
@@ -745,6 +769,12 @@
       stop() { for (const m of members) m.stop(); },
       fail() { for (const m of members) m.fail ? m.fail() : m.stop(); refresh(); },
     };
+  }
+  function refreshManagedCommands(commands) {
+    for(const info of commands||[]){
+      const tool=info.toolUseId&&TOOL_CARDS.get(info.toolUseId),box=tool?.el?.querySelector(".codex-command");
+      if(tool?.el?.isConnected&&box?.dataset.commandId===info.id)tool.managedCommand(info,box,tool.el.querySelector(".command-stop"));
+    }
   }
   function toolResult(id, ok, text) {
     if (id) rememberResult(id, ok, text);   // 卡片现在没有、或以后被裁掉重建，结果都还在（#120-4）

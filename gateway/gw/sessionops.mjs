@@ -7,9 +7,14 @@ import { Worker } from "node:worker_threads";
 import { zipReadCore } from "./zipcore.mjs";
 import { CFG, LAST_LANG, PATHS, PREFIX, log, tr, tz } from "./config.mjs";
 import { NAMES, PEEK_CACHE, PINS, findSessionFile, peekSession, saveNames, savePins } from "./sessions.mjs";
-import { claudeBlocked, claudeCmd, claudeEnv, killTree } from "./claude.mjs";
+import { getCodexSession, restoreCodexRecord, codexTrashMeta, listCodexTrash, trashCodexRecord, restoreCodexTrash, purgeCodexTrash } from "./codex/store.mjs";
+import { QUEUE, RUN_SESSIONS } from "./queue.mjs";
+import { CODEX_OPERATIONS } from "./codex/operation-lock.mjs";
+import { hasRunningCommands } from "./codex/commands.mjs";
+import { exportCodexRecord, prepareCodexRecord } from "./codex/record-backup.mjs";
+import { claudeCmd, claudeEnv, killTree, claudeBlocked } from "./claude.mjs";
+import { LAST_SESSION, forgetSession, runOfSession, TRASH_HOOKS } from "./runs.mjs";
 import { sealed } from "./edition.mjs";
-import { LAST_SESSION, TRASH_HOOKS, forgetSession, runOfSession } from "./runs.mjs";
 import { forgetChild, recordPrimary } from "./lineage-store.mjs";
 import { lineageForget } from "./lineage.mjs";
 import { checkSession, neutralizeMarkers, resealAfterEdit, sealSession, isInjected } from "./integrity.mjs";
@@ -432,6 +437,9 @@ export function rewindFixup(sessionFile, sid, uuid, files) {
   return { fixed, failed };
 }
 
+function codexTrashBusy(id) {
+  return hasRunningCommands(id)||runOfSession(id)||CODEX_OPERATIONS.has(id)||QUEUE.some(q=>q.sessionId===id||(q.follow&&RUN_SESSIONS.get(q.follow)===id));
+}
 /** 目录里所有普通文件的大小（不跟软链）：回收站界面按 meta.total 报占用，附件目录以前没算（196-真机.2） */
 function dirBytes(dir) {
   let total = 0, ents = [];
@@ -447,6 +455,17 @@ function dirBytes(dir) {
 }
 
 export function trashSession(id) {
+  if(getCodexSession(id,{includeTrashed:true})) {
+    if(codexTrashBusy(id))return {ok:false,error:"会话正在运行、排队或操作中，请稍后再试。",status:409};
+    if(findSessionFile(id))return {ok:false,error:"会话标识冲突，未删除。",status:409};
+    const r=trashCodexRecord(id,{title:NAMES[id],renamed:!!NAMES[id],pinned:PINS[id]||0});
+    if(r.ok) {
+      delete NAMES[id];saveNames();delete PINS[id];savePins();
+      if(LAST_SESSION?.id===id)forgetSession();
+      for (const f of TRASH_HOOKS) { try { f(id); } catch (e) { log(`回收后续处理出错：${e.message}`); } }
+    }
+    return r;
+  }
   const found = findSessionFile(id);
   if (!found) return { ok: false, error: "not found" };
   const meta = peekSession(found.file);
@@ -479,7 +498,7 @@ export function inTrash(id) { return SID_RE.test(String(id || "")) && fs.existsS
 
 export function listTrash() {
   let ids = [];
-  try { ids = fs.readdirSync(TRASH_DIR); } catch { return []; }
+  try { ids = fs.readdirSync(TRASH_DIR); } catch {}
   const out = [];
   for (const id of ids) {
     if (!fs.existsSync(path.join(TRASH_DIR, id, id + ".jsonl"))) continue;   // 删到一半被打断的空格子
@@ -488,7 +507,7 @@ export function listTrash() {
       if (m && typeof m === "object") out.push({ ...m, size: m.total != null ? m.total : m.size });   // 老条目没有 total，仍报主记录大小
     } catch {}
   }
-  return out.sort((a, b) => b.deletedAt - a.deletedAt);
+  return out.concat(listCodexTrash()).sort((a, b) => b.deletedAt - a.deletedAt);
 }
 
 const isDirPath = (d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } };
@@ -516,6 +535,16 @@ function rewriteCwd(file, cwd, sid) {
 
 export function restoreSession(id) {
   if (!SID_RE.test(id)) return { ok: false, error: "bad id" };
+  if(codexTrashMeta(id)) {
+    if(codexTrashBusy(id))return {ok:false,error:"会话正在操作中，请稍后再试。"};
+    if(findSessionFile(id))return {ok:false,error:"exists"};
+    const r=restoreCodexTrash(id);
+    if(r.ok) {
+      if(r.meta.renamed&&r.meta.title)NAMES[id]=r.meta.title;else delete NAMES[id];saveNames();
+      if(r.meta.pinned)PINS[id]=r.meta.pinned;else delete PINS[id];savePins();
+    }
+    return {ok:r.ok,...(r.error?{error:r.error}:{})};
+  }
   const slot = path.join(TRASH_DIR, id);
   let meta;
   try { meta = JSON.parse(fs.readFileSync(path.join(slot, "meta.json"), "utf8")); } catch { return { ok: false, error: "not found" }; }
@@ -589,6 +618,12 @@ export async function purgeTrash(ids) {
   let n = 0;
   for (const id of ids) {
     if (!SID_RE.test(id)) continue;
+    if(codexTrashMeta(id)) {
+      if(codexTrashBusy(id))continue;
+      try{if(purgeCodexTrash(id)){await import("./bookmarks.mjs").then(m=>m.forgetBookmarks(id,"codex"));delete NAMES[id];saveNames();delete PINS[id];savePins();n++;}}
+      catch(err){log("[codex] 回收站清理失败: "+err.message);}
+      continue;
+    }
     const slot = path.join(TRASH_DIR, id);
     if (!fs.existsSync(slot)) continue;
     let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(slot, "meta.json"), "utf8")); } catch {}
@@ -714,7 +749,13 @@ export async function exportSessions(ids) {
       else if (d.isFile()) entries.push({ name: rel + "/" + d.name, file: f });
     }
   };
-  for (const id of ids) {
+  for (const id of new Set(ids)) {
+    const codex=getCodexSession(id);
+    if(codex){
+      if(runOfSession(id))throw Object.assign(new Error(tz("Codex 会话正在运行，请结束当前任务后再导出。")),{status:409});
+      const bundle=exportCodexRecord(codex,{title:NAMES[id]||codex.title,renamed:!!NAMES[id],pinned:PINS[id]||0});
+      entries.push(...bundle.files);list.push(bundle.entry);continue;
+    }
     const found = findSessionFile(id);
     if (!found) continue;
     const meta = peekSession(found.file);
@@ -726,7 +767,8 @@ export async function exportSessions(ids) {
     list.push({ id, title: NAMES[id] || meta.title, renamed: !!NAMES[id], cwd: meta.cwd, mtime: fs.statSync(found.file).mtimeMs, ...(arch ? { archive: arch } : {}) });
   }
   if (!list.length) throw new Error(tz("没有可导出的会话"));
-  entries.unshift({ name: "manifest.json", data: JSON.stringify({ format: "cccodroid-sessions", version: 1, exportedAt: Date.now(), sessions: list }, null, 1) });
+  const codexCount=list.filter(s=>s.backend==="codex").length;
+  entries.unshift({ name: "manifest.json", data: JSON.stringify({ format: "cccodroid-sessions", version: codexCount?2:1, exportedAt: Date.now(), sessions: list }, null, 1) });
   const base = process.env.CCAPP_SHARED && fs.existsSync(process.env.CCAPP_SHARED) ? process.env.CCAPP_SHARED : CFG.home;
   const dir = path.join(base, "exports");
   fs.mkdirSync(dir, { recursive: true });
@@ -752,7 +794,7 @@ export async function exportSessions(ids) {
     try { fs.rmSync(file, { force: true }); } catch {}
     throw e;
   }
-  return { file, count: list.length, bytes };
+  return { file, count: list.length, bytes, codexCount, codexScope:codexCount?"app-records":null };
 }
 
 // 上次导入的档案没写进磁盘（saveArchive 失败）：同一进程里内存还留着这份，下次导入时顺手再落一次盘，
@@ -762,7 +804,13 @@ let archivePending = false;
 /** 导入：一律落进当前工作区（cwd 改写成本机工作区，--resume 才找得到）；同 id 已有的跳过。
  *  file 是已经落盘的会话包（路由把请求体直接写到盘上）。逐条按字节范围解到目标位置，主记录边解边改 cwd；
  *  解出来的总量不许吃到只剩 512 MB 空间（目录里写的大小可能是假的，按实际解出来的扣） */
-export async function importSessions(file) {
+export async function importSessions(input) {
+  if (typeof input === "string") return importSessionsFile(input);
+  const tmp=path.join(CFG.home,".session-import-"+crypto.randomBytes(12).toString("hex")+".zip");
+  try { fs.writeFileSync(tmp,input,{flag:"wx",mode:0o600});return await importSessionsFile(tmp); }
+  finally { fs.rmSync(tmp,{force:true}); }
+}
+async function importSessionsFile(file) {
   const ents = zipEntries(file);
   const man = ents.find((e) => e.name === "manifest.json");
   let manifest = {};
@@ -774,6 +822,19 @@ export async function importSessions(file) {
   } catch { throw new Error(tz("缺少 manifest.json，不是会话包")); }
   if (manifest.format !== "cccodroid-sessions") throw new Error(tz("不是 cccodroid 会话包"));
   if (!Array.isArray(manifest.sessions) || manifest.sessions.length > 5000) throw new Error(tz("会话包里的会话太多了，分几次导入"));
+  if(![undefined,1,2].includes(manifest.version))throw new Error(tz("会话包版本或目录无效"));
+  const names=new Set();for(const e of ents){if(names.has(e.name))throw new Error(tz("会话包有重复文件，没有导入"));names.add(e.name);}
+  const prepared=new Map(),sessionIds=new Set();
+  for(const s of manifest.sessions){
+    if(!s||typeof s!=="object"||sessionIds.has(s.id))throw new Error(tz("会话包目录无效"));sessionIds.add(s.id);
+    if(s.backend==="codex"){
+      if(manifest.version!==2)throw new Error(tz("会话包版本或目录无效"));
+      const entry=ents.find(e=>e.name===`codex/${s.id}.json`),tmp=file+".codex-record";
+      if(!entry)throw new Error(tz("Codex 会话记录备份格式无效。"));
+      try{await zipExtract(file,entry,tmp,{left:512<<20});prepared.set(s.id,prepareCodexRecord(s,fs.readFileSync(tmp)));}
+      finally{fs.rmSync(tmp,{force:true});}
+    }else if(s.backend&&s.backend!=="claude")throw new Error(tz("不支持此会话核心，没有导入"));
+  }
   // 条目按名字、按会话目录先分好：以前每个会话都把全部条目扫一遍，会话多、条目多时卡住网关（11-03 审查 L-3）
   const byName = new Map(), bySide = new Map();
   for (const e of ents) {
@@ -786,7 +847,7 @@ export async function importSessions(file) {
   fs.mkdirSync(dir, { recursive: true });
   const budget = { left: freeBytes(dir) - (512 << 20) };
   if (budget.left <= 0) throw new Error(tz("存储空间不够了"));
-  const res = { imported: [], skipped: [] };
+  const res = { imported: [], skipped: [], codexRecords:0, codexScope:null };
   const fixCwd = (l) => {
     if (!l.includes('"cwd"')) return l;
     try { const ev = JSON.parse(l); if (ev.cwd) ev.cwd = ws; return JSON.stringify(ev); } catch { return l; }
@@ -803,11 +864,19 @@ export async function importSessions(file) {
   try { for (const s of manifest.sessions || []) {
     const id = String(s.id || "");
     if (!SID_RE.test(id)) continue;
+    if(s.backend==="codex"){
+      if(getCodexSession(id)||findSessionFile(id)||runOfSession(id)||fs.existsSync(path.join(TRASH_DIR,id))){res.skipped.push(id);continue;}
+      const item=prepared.get(id);
+      if(!restoreCodexRecord(item.record,item.data,item.mtime)){res.skipped.push(id);continue;}
+      if(item.renamed&&item.title)NAMES[id]=item.title;else delete NAMES[id];
+      if(item.pinned)PINS[id]=item.pinned;else delete PINS[id];
+      res.imported.push(id);res.codexRecords++;res.codexScope="app-records";continue;
+    }
     const main = byName.get(`sessions/${id}.jsonl`);
     if (!main) continue;
     // 同号的会话在回收站里：先恢复它，再按「已存在」跳过。以前直接跳过，提示已存在、列表里却看不到（195-A.5）
     if (!findSessionFile(id) && fs.existsSync(path.join(TRASH_DIR, id))) { try { restoreSession(id); } catch {} }
-    if (findSessionFile(id)) { absorbMeta(s, id); res.skipped.push(id); continue; }
+    if (getCodexSession(id) || findSessionFile(id)) { absorbMeta(s, id); res.skipped.push(id); continue; }
     const dst = path.join(dir, id + ".jsonl"), side = path.join(dir, id), hadSide = fs.existsSync(side);
     try {
       // 先解到临时名，整条会话（含子代理记录）都解完再改名：中途失败不留半截会话
@@ -837,6 +906,7 @@ export async function importSessions(file) {
   } } catch (e) { e.imported = res.imported; throw e; }
   finally {
     namesSaved = saveNames();
+    if (res.codexRecords) savePins();
     // 档案写错也要如实报（以前只记日志，接口回 200「导入了」但重启后章节档案没了 —— BUG-P03）。
     // 上次没写成的（archivePending）这次一并重试：正文跳过时也得有机会把元数据补上
     if (archDirty || archivePending) {

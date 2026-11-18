@@ -27,6 +27,7 @@ test("删消息：回执到时已切走，B 的节点一个不动，提示说在
   const bMsgs = [{ classList: { contains: (c) => c === "bot" }, dataset: {}, remove() { throw new Error("不该动 B 的节点"); } }];
   const msgEl = { dataset: {}, remove() {}, querySelector: () => null };
   const box = {
+    isCodexView: () => false,
     view: { sessionId: "A", gen: 1, next: null, cursor: null }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 },
     chatEl: { querySelectorAll: (q) => q === ".msg.user" ? [msgEl] : bMsgs }, userTextOf: new Map([[msgEl, "hi"]]),
     histPages: () => [], isBusy: () => false, confirm: () => true, t: T, toast() {}, toastAct: (m) => toasts.push(m),
@@ -46,6 +47,7 @@ test("回退：试算回来已切走，不弹确认框；分叉回执到时已�
   const g = later(), opened = [], toasts = [];
   const msgEl = { dataset: {}, compareDocumentPosition: () => 4 };
   const box = {
+    isCodexView: () => false,
     view: { sessionId: "A", gen: 1 }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 }, chatEl: { querySelectorAll: () => [msgEl] },
     userTextOf: new Map([[msgEl, "hi"]]), isBusy: () => false, t: T, toast: (m) => toasts.push(m), toastAct: (m) => toasts.push("act:" + m),
     api: () => g.p, JSON, encodeURIComponent, openSession: (id) => opened.push(id), loadSessions() {},

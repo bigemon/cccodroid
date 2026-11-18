@@ -67,11 +67,11 @@ test("C27 195-L.10：改强调色后重画月报", () => {
 test("A4 195-K.4：新建项目指令没写进去要提示，并留在指令框里", () => {
   assert.ok(src14.includes("r.instrSkipped ? t(\"项目已创建；目录里已有 CLAUDE.md，填的指令没写进去\")"), "instrSkipped 要提示");
   assert.ok(src14.includes("PJ.instrDraft = { id: r.project.id, text: body.instr.trim() }"), "填的指令先留着");
-  assert.ok(src14.includes("if (PJ.instrDraft && PJ.instrDraft.id === id)"), "项目页把草稿并进指令框");
+  assert.match(src14, /if \(PJ\.instrDraft && PJ\.instrDraft\.id === id && guide\.backend === "claude" && !ta\.disabled\)/, "草稿只合入可编辑的 Claude 指令框");
 });
 
 test("A4 195-N.1：改 / 删项目失败显示网关回的 message，不当成功", () => {
-  assert.ok(src14.includes("catch (err) { e.target.value = p[k] || \"\"; toast(err.message, true); }"), "PATCH 失败显示 message 并回退下拉");
+  assert.ok(src14.includes('e.target.value = cxkey ? (p.codex?.[k] || "") : (p[k] || "")'), "PATCH 失败按核心恢复下拉");
   assert.ok(src14.includes("catch (err) { return toast(err.message, true); }"), "DELETE 失败显示 message");
 });
 

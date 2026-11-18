@@ -25,7 +25,7 @@ async function orphan(extra) {
   return pid;
 }
 
-test("活网关名下脱出去的不收；上一任已退出、没带网关号的照收", async (t) => {
+test("实例隔离：未在本 HOME 登记的进程一律不清理，旧标记也不能作为归属证据", async (t) => {
   if (!process.env.CCAPP_PREFIX) return t.skip("只在 cccodroid 收孤儿");
   const gone = spawnSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).stdout.trim();   // 已经退出的网关
   const live = await orphan({ CCAPP_GW_PID: String(process.ppid) });                    // 起它的「网关」还活着
@@ -36,8 +36,8 @@ test("活网关名下脱出去的不收；上一任已退出、没带网关号�
   reapOrphans();
   await new Promise((r) => setTimeout(r, 200));
   assert.ok(alive(live), "起它的网关还活着，却被收了");
-  assert.ok(!alive(dead), "上一任已退出，留下的没收");
-  assert.ok(!alive(old), "没带网关号的没收");
-  assert.ok(!alive(bogus), "网关号无效的没收");
+  assert.ok(alive(dead), "没有实例登记，不能只按退出的网关号清理");
+  assert.ok(alive(old), "旧版未知归属进程保留");
+  assert.ok(alive(bogus), "无效网关号也不能作为清理凭据");
 });
 

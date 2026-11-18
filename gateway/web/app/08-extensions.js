@@ -1219,8 +1219,16 @@
   // ── MCP 编辑模式：mcpEdit = null 是添加；有值 = 正在编辑这条（名字和点掉的键存这里，表单字段直接读）──
   // 值（令牌等）不回到表单：留空 = 保留原值，要换就填新的；点掉 chip 的键会从配置里删掉。
   let mcpEdit = null;
+  let mcpEditEpoch = 0, mcpEditBusy = false;
+  const setMcpEditBusy = (busy) => {
+    mcpEditBusy = busy;
+    for (const id of ["ext-mcp-name", "ext-mcp-target", "ext-mcp-env", "ext-mcp-tr", "ext-mcp-save", "ext-mcp-add"]) $(id).disabled = busy;
+    for (const button of $("ext-mcp-cur").querySelectorAll("button")) button.disabled = busy;
+  };
   const endMcpEdit = () => {
+    mcpEditEpoch++;
     mcpEdit = null;
+    setMcpEditBusy(false);
     ["ext-mcp-name", "ext-mcp-target", "ext-mcp-env"].forEach((id) => ($(id).value = ""));
     $("ext-mcp-tr").value = "stdio";
     syncMcpHint();
@@ -1242,9 +1250,15 @@
     box.classList.toggle("hidden", !env.length && !hdr.length);
   };
   const openMcpEdit = async (name) => {
-    if (mcpEdit) endMcpEdit();
+    endMcpEdit();
+    const epoch = mcpEditEpoch;
+    setMcpEditBusy(true);
+    $("ext-mcp-addbox").open = true;
+    $("ext-mcp-cancel").classList.remove("hidden");
     const r = await api(`/api/ext/mcp/get?name=${encodeURIComponent(name)}`).catch((e) => ({ ok: false, message: e.message }));
-    if (!r.ok) return toast(t("打不开编辑：{msg}", { msg: r.message || "" }), true);
+    if (epoch !== mcpEditEpoch) return;
+    setMcpEditBusy(false);
+    if (!r.ok) { endMcpEdit(); return toast(t("打不开编辑：{msg}", { msg: r.message || "" }), true); }
     mcpEdit = { name: r.name, fullEnv: r.envNames || [], fullHdr: r.headerNames || [], dropEnv: new Set(), dropHdr: new Set() };
     $("ext-mcp-addbox").open = true;
     $("ext-mcp-name").value = r.name;
@@ -1275,7 +1289,7 @@
   });
   $("ext-mcp-cancel").addEventListener("click", endMcpEdit);
   $("ext-mcp-save").addEventListener("click", async () => {
-    if (!mcpEdit) return;
+    if (!mcpEdit || mcpEditBusy) return;
     const transport = $("ext-mcp-tr").value;
     // 请求头的值本身可能带英文逗号：有换行就按行分（一行一条），没换行才退回逗号（195-J.11）
     const raw = $("ext-mcp-env").value;
@@ -1296,14 +1310,17 @@
     }
     const body = { name: mcpEdit.name, newName: $("ext-mcp-name").value.trim(), transport, target: $("ext-mcp-target").value.trim(),
       env: envLike, headers: hdrLike, dropEnv: [...mcpEdit.dropEnv], dropHeaders: [...mcpEdit.dropHdr] };
-    const btn = $("ext-mcp-save");
-    btn.disabled = true;
+    const epoch = mcpEditEpoch, editing = mcpEdit;
+    setMcpEditBusy(true);
     const r = await post("/api/ext/mcp/edit", body).catch((e) => ({ ok: false, message: e.message }));
-    btn.disabled = false;
+    // A completed write still refreshes the list, but cannot close or unlock a newer editor.
+    if (epoch !== mcpEditEpoch || editing !== mcpEdit) { if (r.ok) loadExtMcp(); return; }
+    setMcpEditBusy(false);
     toast(r.ok ? t("已保存修改 {name}", { name: body.newName }) : t("编辑失败：{msg}", { msg: r.message || "" }), !r.ok);
     if (r.ok) { endMcpEdit(); loadExtMcp(); }
   });
   $("ext-mcp-add").addEventListener("click", async () => {
+    if (mcpEdit || mcpEditBusy) return;
     const transport = $("ext-mcp-tr").value;
     const raw = $("ext-mcp-env").value;
     const extra = (raw.includes("\n") ? raw.split("\n") : raw.split(",")).map((x) => x.trim()).filter(Boolean);
@@ -1317,7 +1334,11 @@
       env: envLike,
       headers: hdrLike,
     };
+    const epoch = mcpEditEpoch;
+    setMcpEditBusy(true);
     const r = await post("/api/ext/mcp/add", body).catch((e) => ({ ok: false, message: e.message }));
+    if (epoch !== mcpEditEpoch || mcpEdit) { if (r.ok) loadExtMcp(); return; }
+    setMcpEditBusy(false);
     toast(r.ok ? t("已添加 {name}", { name: body.name }) : t("添加失败：{msg}", { msg: r.message || "" }), !r.ok);
     if (r.ok) { ["ext-mcp-name", "ext-mcp-target", "ext-mcp-env"].forEach((id) => ($(id).value = "")); loadExtMcp(); }
   });
@@ -1399,7 +1420,7 @@
       return;
     }
     if (x === "mcp-drop") {
-      if (!mcpEdit) return;
+      if (!mcpEdit || mcpEditBusy) return;
       (b.dataset.which === "env" ? mcpEdit.dropEnv : mcpEdit.dropHdr).add(b.dataset.k);
       return renderMcpCur();
     }

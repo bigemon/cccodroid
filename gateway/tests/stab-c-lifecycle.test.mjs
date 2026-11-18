@@ -201,7 +201,7 @@ function loadRunEnd({ runViews = new Map(), perms = new Map(), viewSid = "s-a" }
     parseContextText() {}, loadSettings() {}, refreshSessModel() {}, loadModels() {},
     draftAdopt() {}, adoptPendingModel() {}, saveUiState() {},
     api: () => Promise.resolve({}), send() {}, newCid: () => "c", toast() {},
-    belongs: () => false,
+    belongs: () => false, isCodexView: () => false,
   };
   const h = load(cut(src04, "  function onRunEnd(", "  // ── 忙闲与排队"), box, ["onRunEnd"]);
   return { calls, view, runViews, perms, onRunEnd: h.onRunEnd };

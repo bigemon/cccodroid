@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1f1e1d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<script>(function(){try{if(parent!==window){const sync=()=>{const c=getComputedStyle(parent.document.documentElement);for(const k of ['bg','bg2','bg3','fg','fg2','fg3','line','accent','warn'])document.documentElement.style.setProperty('--'+k,c.getPropertyValue('--'+k));document.documentElement.style.colorScheme=c.colorScheme;};sync();new MutationObserver(sync).observe(parent.document.documentElement,{attributes:true});} }catch(e){} })();</script>
+<script>(function(){try{var c=(window.matchMedia&&matchMedia("(pointer: coarse)").matches)||("ontouchstart" in window);var d=window.devicePixelRatio||1;var w=window.innerWidth||0;if(c&&d<1.6&&w>700&&w<1300)document.documentElement.classList.add("desktop-mode");}catch(e){}})();</script>
+<title>cc-remote 设置</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg,#1f1e1d);color:var(--fg,#eceae6);
+  font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  -webkit-text-size-adjust:100%}
+body{padding:8px 14px calc(20px + env(safe-area-inset-bottom))}header{display:none!important}.card{box-shadow:none!important}.kv b{word-break:normal;overflow-wrap:anywhere}
+main{width:min(860px,100%);margin:0 auto}
+header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:0 2px 16px}
+h1{margin:0;font-size:26px;font-weight:650;color:var(--accent,#d97757);letter-spacing:.2px}
+header p{margin:3px 0 0;color:var(--fg3,#8f8a80);font-size:14px}
+.badge{flex:none;border:1px solid var(--line,#3a3935);border-radius:999px;padding:6px 12px;font-size:13px;color:var(--fg2,#b9b4aa);background:var(--bg2,#262624)}
+.badge.ok{color:#9ccf9c;border-color:#3f5a3f}
+.badge.pause{color:#e0b46a;border-color:#5a4a2f}
+.card{background:var(--bg2,#262624);border:1px solid var(--line,#3a3935);border-radius:16px;padding:20px;margin:0 0 14px;
+  box-shadow:0 10px 32px rgba(0,0,0,.18)}
+.card h2{margin:0 0 13px;font-size:17px;font-weight:600;color:var(--fg,#eceae6)}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:13px}
+.card-head h2{margin:0}
+.enable-control{display:flex;align-items:center;gap:8px;flex:none;color:var(--fg,#eceae6);font-size:14px}
+.service-switch{appearance:none;-webkit-appearance:none;width:42px;height:24px;flex:none;margin:0;border:0;border-radius:999px;position:relative;background:var(--line,#4a4843);cursor:pointer}
+.service-switch::after{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:transform .15s}
+.service-switch:checked{background:var(--accent,#d97757)}
+.service-switch:checked::after{transform:translateX(18px)}
+.service-switch:disabled{opacity:.45;cursor:default}
+.service-switch:focus-visible{outline:2px solid var(--accent,#d97757);outline-offset:3px}
+.auth-head{flex-wrap:wrap}
+.auth-head select{flex:none;max-width:100%;min-height:38px;padding:7px 10px;font:inherit;font-size:13px;border:1px solid var(--line,#4a4843);border-radius:8px;background:var(--bg,#1f1e1d);color:var(--fg,#eceae6)}
+.token-row{display:flex;align-items:center;gap:8px;margin-top:6px;min-width:0}
+.token-row code.pending-token{color:var(--warn,#e0b46a)}
+.token-row code{flex:1;min-width:0;padding:10px;border:1px solid var(--line,#34322e);border-radius:8px;background:var(--bg,#1f1e1d);font:12px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}
+#auth-link[hidden],#auth-password[hidden]{display:none}
+@media(max-width:400px){.token-row{flex-wrap:wrap}.token-row code{flex-basis:100%}}
+.pending-note{color:var(--warn,#e0b46a);font-size:13px;margin:12px 0 0}
+.actions.single{display:flex}
+.actions.single button{width:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+.kv{background:var(--bg,#1f1e1d);border:1px solid var(--line,#34322e);border-radius:10px;padding:11px 13px;min-width:0}
+.kv span{display:block;color:var(--fg3,#8f8a80);font-size:12px;margin-bottom:2px}
+.kv b{display:block;font-weight:550;font-size:15px;word-break:break-all}
+.row{display:flex;align-items:center;gap:9px;margin:8px 0;min-width:0}
+.row .lbl{flex:none;width:88px;color:var(--fg3,#8f8a80);font-size:13px}
+.row code{flex:1;min-width:0;background:var(--bg,#1f1e1d);border:1px solid var(--line,#34322e);border-radius:8px;
+  padding:9px 11px;font-size:13px;color:var(--fg,#cfcac0);word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.address-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0 8px;min-width:0}
+.address-heading{margin:0;font-size:14px;font-weight:600;color:var(--fg2,#a9a49a)}
+.address-filter{flex:none;white-space:nowrap}
+.address-filter[hidden]{display:none}
+.address-filter[aria-pressed=true]{color:var(--accent,#d97757);border-color:var(--accent,#d97757)}
+.row-actions{display:flex;align-items:center;gap:6px;flex:none}
+button.qr-toggle{display:inline-flex;align-items:center;justify-content:center;width:42px;padding:8px;flex:none}
+.qr-toggle svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8}
+.qr-toggle[aria-expanded=true]{color:var(--accent,#d97757);border-color:var(--accent,#d97757)}
+.qr-panel{margin:10px 0 18px;padding:14px;border:1px solid var(--line,#34322e);border-radius:10px;text-align:center;background:var(--bg,#1f1e1d)}
+.qr-title{margin:0 0 10px;font-size:14px;font-weight:600}
+.qr-image{width:min(100%,280px);margin:0 auto;line-height:0;background:#fff;border-radius:6px;overflow:hidden}
+.qr-image svg{display:block;width:100%;height:auto;aspect-ratio:1;shape-rendering:crispEdges}
+button:focus-visible{outline:2px solid var(--accent,#d97757);outline-offset:3px}
+.form{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form .full{grid-column:1/-1}
+label{display:block;color:var(--fg2,#a9a49a);font-size:13px;margin:0}
+label input[type=text],label input[type=number],label input[type=password]{
+  display:block;width:100%;margin-top:6px;padding:12px 13px;border-radius:10px;border:1px solid var(--line,#4a4843);
+  background:var(--bg,#1f1e1d);color:var(--fg,#eceae6);font-size:16px;outline:none}
+label input:focus{border-color:var(--accent,#d97757)}
+label.check{display:flex;align-items:center;gap:9px;grid-column:1/-1;color:var(--fg2,#c9c4ba);font-size:14px;margin-top:2px}
+label.check input{width:18px;height:18px;accent-color:var(--accent,#d97757)}
+label select{display:block;width:100%;margin-top:6px;padding:12px 13px;border-radius:10px;border:1px solid var(--line,#4a4843);
+  background:var(--bg,#1f1e1d);color:var(--fg,#eceae6);font-size:16px;outline:none;min-height:46px}
+label select:focus{border-color:var(--accent,#d97757)}
+label input#f-host{margin-top:10px}
+.warn{grid-column:1/-1;color:#e0b46a;font-size:13px;line-height:1.55;margin:10px 0 0;background:#2a2419;
+  border:1px solid #5a4a2f;border-radius:10px;padding:11px 13px}
+.actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:16px}
+button{font:inherit;border:0;border-radius:10px;padding:11px 16px;background:var(--accent,#d97757);color:var(--bg,#1f1e1d);
+  font-weight:600;font-size:15px;cursor:pointer;min-height:46px}
+button:active{opacity:.85}
+button:disabled{opacity:.45;cursor:default}
+button.ghost{background:var(--bg3,#2f2e2b);color:var(--fg,#eceae6);border:1px solid var(--line,#4a4843)}
+button.danger{color:#e88b7a;border-color:#5a3a34}
+button.sm{padding:8px 12px;min-height:38px;font-size:13px;border-radius:8px}
+.hint{color:var(--fg3,#8f8a80);font-size:13px;margin:10px 0 0;line-height:1.5}
+.hint a{color:var(--accent,#d97757)}
+.err{color:#e88b7a}
+.ok{color:#9ccf9c}
+.logs{margin:0;min-height:100px;max-height:260px;max-height:clamp(160px,30vh,280px);overflow:auto;background:var(--bg,#141312);border:1px solid var(--line,#34322e);
+  border-radius:9px;padding:11px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:var(--fg2,#b9b4aa);white-space:pre-wrap;word-break:break-all}
+.hidden{display:none!important}
+.foot{color:#6f6a62;font-size:12px;text-align:center;margin:18px 6px 0;line-height:1.6}
+.toast{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom));transform:translateX(-50%);
+  max-width:calc(100% - 32px);background:var(--line,#3a3935);color:var(--fg,#eceae6);border:1px solid #55524c;
+  border-radius:10px;padding:11px 15px;font-size:14px;box-shadow:0 8px 30px rgba(0,0,0,.35);z-index:50}
+.toast.bad{background:#4a2f2a;border-color:#7a4a40;color:#f0c0b5}
+@media (max-width:640px){
+  .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;align-items:center}
+  .row .lbl{grid-column:1/-1;width:auto;font-size:13px;margin-bottom:0}
+  .row code{grid-column:1;min-width:0}
+  .row-actions{grid-column:2;align-self:center}
+  .row-actions button{min-height:42px}
+}
+@media (max-width:520px){
+  h1{font-size:24px}
+  .card{padding:16px}
+  .form{grid-template-columns:1fr}
+  .grid{grid-template-columns:1fr 1fr}
+  .actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .actions button{width:100%}
+  .row .lbl{width:auto}
+}
+/* Kiwi 等“桌面版”模式：粗指针 + 低 DPR + 宽布局视口。正常手机/平板不会命中。 */
+html.desktop-mode body{font-size:20px}
+html.desktop-mode main{width:min(94vw,1100px)}
+html.desktop-mode h1{font-size:32px}
+html.desktop-mode header p{font-size:17px}
+html.desktop-mode .badge{font-size:16px;padding:8px 14px}
+html.desktop-mode .card{padding:26px;border-radius:20px}
+html.desktop-mode .card h2{font-size:22px}
+html.desktop-mode .grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+html.desktop-mode .kv{padding:15px 17px}
+html.desktop-mode .kv span{font-size:15px}
+html.desktop-mode .kv b{font-size:20px}
+html.desktop-mode .row .lbl{width:110px;font-size:16px}
+html.desktop-mode .row code{font-size:16px;padding:12px 14px}
+html.desktop-mode .form{gap:16px}
+html.desktop-mode label{font-size:16px}
+html.desktop-mode label input[type=text],html.desktop-mode label input[type=number],html.desktop-mode label input[type=password]{font-size:20px;padding:15px 16px}
+html.desktop-mode label.check{font-size:17px}
+html.desktop-mode button{font-size:19px;min-height:56px;padding:14px 20px}
+html.desktop-mode button.sm{font-size:16px;min-height:46px}
+html.desktop-mode .hint{font-size:16px}
+html.desktop-mode .logs{font-size:15px}
+html.desktop-mode .foot{font-size:14px}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div><h1>远程访问</h1><p>cccodroid 远程访问设置</p></div>
+  <span id="badge" class="badge">…</span>
+</header>
+
+<section class="card">
+  <div class="card-head"><h2>状态</h2><label class="enable-control" for="service-enabled">启用<input id="service-enabled" class="service-switch" type="checkbox" role="switch" disabled></label></div>
+  <div class="grid">
+    <div class="kv"><span>服务</span><b id="s-run">…</b></div>
+    <div class="kv"><span>PID</span><b id="s-pid">…</b></div>
+    <div class="kv"><span>监听</span><b id="s-listen">…</b></div>
+    <div class="kv"><span>认证</span><b id="s-auth">…</b></div>
+    <div class="kv"><span>登录有效期</span><b id="s-cookie">…</b></div>
+    <div class="kv"><span>HTML 预览</span><b id="s-preview">…</b></div>
+  </div>
+  <div class="address-head">
+    <h3 class="address-heading">访问地址</h3>
+    <button id="address-filter" class="ghost sm address-filter" aria-label="显示全部访问地址" aria-pressed="false" aria-controls="access-addresses" hidden>显示全部</button>
+  </div>
+  <div id="access-addresses"></div>
+  <p class="hint" id="address-empty" role="status">读取中…</p>
+</section>
+
+<section class="card" id="logs-card">
+  <h2>日志</h2>
+  <pre id="logs" class="logs" aria-label="远程服务最近日志">读取中…</pre>
+  <p class="hint">显示最近日志；停留在本页时自动刷新。</p>
+</section>
+
+<section class="card" id="auth-settings">
+  <div class="card-head auth-head"><h2>远程访问认证</h2>
+    <select id="auth-mode" aria-label="认证模式" disabled>
+      <option value="password">口令认证</option><option value="rt">链接认证</option>
+    </select>
+  </div>
+  <div id="auth-password" class="form">
+    <label>新口令<input id="f-pw" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false"></label>
+    <label>再输一次<input id="f-pw2" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false"></label>
+  </div>
+  <div id="auth-link" hidden>
+    <label for="auth-token">token</label>
+    <div class="token-row"><code id="auth-token">保存后显示</code><div class="row-actions">
+      <button class="ghost sm" id="auth-copy" disabled>复制</button>
+      <button class="ghost sm" id="auth-rotate" disabled>轮换</button>
+    </div></div>
+    <p class="hint" id="auth-token-note">顶部地址和二维码使用当前有效 token。</p>
+  </div>
+  <p class="pending-note hidden" id="auth-pending" role="status">保存后生效，其他设备需重新登录。</p>
+  <div class="actions">
+    <button id="auth-save" disabled>保存认证</button>
+    <button id="auth-cancel" class="ghost hidden">取消更改</button>
+  </div>
+  <p class="hint" id="auth-help">本机 App 无需远程认证。</p>
+</section>
+
+<section class="card" id="service-settings">
+  <h2>服务设置</h2>
+  <div class="form">
+    <label class="full">监听主机
+      <select id="f-host-mode">
+        <option value="auto">自动：跟随当前 Wi-Fi 地址（推荐）</option>
+        <option value="0.0.0.0">所有接口：IPv4（0.0.0.0）</option>
+        <option value="::">IPv4 / IPv6 双栈（::）</option>
+        <option value="127.0.0.1">仅本机（127.0.0.1）</option>
+        <option value="custom">自定义地址 / 主机名…</option>
+      </select>
+      <input id="f-host" class="hidden" type="text" placeholder="IPv4、IPv6 地址或主机名"
+        autocapitalize="off" autocorrect="off" spellcheck="false">
+    </label>
+    <p class="warn" id="host-warn" hidden></p>
+    <label>端口
+      <input id="f-port" type="number" min="1" max="65535" inputmode="numeric">
+    </label>
+    <label>登录有效天数
+      <input id="f-cookie" type="number" min="0.1" step="0.1" inputmode="decimal">
+    </label>
+    <label>对外主机名（可选）
+      <input id="f-public" type="text" placeholder="留空 = 用监听主机" autocapitalize="off" autocorrect="off" spellcheck="false">
+    </label>
+    <label class="check"><input id="f-preview" type="checkbox"> 打开 HTML 预览（同源预览有风险）</label>
+  </div>
+  <p class="pending-note hidden" id="pending-note" role="status">保存并重启服务后生效。</p>
+  <div class="actions single">
+    <button id="save" disabled>保存</button>
+  </div>
+  <p class="hint" id="save-note">服务关闭时仅保存设置，下次启用时生效。监听主机选“自动”会跟随当前 Wi-Fi 地址。</p>
+</section>
+
+<p class="foot">cccodroid · 本机设置直接使用 App 身份，其他设备仍需远程认证。<br>不要在公共 Wi-Fi 上开；出门建议套 VPN。</p>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script>/*__LOCAL_QR_ENCODER__*/</script>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  let CSRF = "";
+  let STATUS = null, baseline = null, busy = false, refreshing = false;
+  let toastTimer = 0, statusSeq = 0;
+  let authBase = null, tokenDraft = null;
+
+  function toast(msg, bad) {
+    const el = $("toast");
+    el.textContent = String(msg || "");
+    el.className = "toast" + (bad ? " bad" : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.add("hidden"), bad ? 5200 : 3200);
+  }
+  function setText(id, v) { const e = $(id); if (e) e.textContent = v == null ? "—" : String(v); }
+  function setVal(id, v) { const e = $(id); if (e) e.value = v == null ? "" : String(v); }
+  function setCheck(id, v) { const e = $(id); if (e) e.checked = !!v; }
+
+  function normalized(c) {
+    return {host:String(c.host ?? "auto").trim() || "auto",port:Number(c.port),
+      cookieDays:Number(c.cookieDays),publicHost:String(c.publicHost || "").trim(),preview:!!c.preview};
+  }
+  function formConfig() {
+    const mode = $("f-host-mode").value;
+    return normalized({host:mode === "custom" ? $("f-host").value : mode,
+      port:$("f-port").value,cookieDays:$("f-cookie").value,
+      publicHost:$("f-public").value,preview:$("f-preview").checked});
+  }
+  function dirty() { return !!baseline && JSON.stringify(formConfig()) !== JSON.stringify(baseline); }
+  function paintControls() {
+    $("save").disabled = busy || !baseline || !dirty();
+    $("save").textContent = STATUS?.running ? "保存并重启服务" : "保存";
+    $("pending-note").textContent = STATUS?.running ? "保存并重启服务后生效。" : "保存后将在服务启动时生效。";
+    $("pending-note").classList.toggle("hidden", !dirty());
+    $("service-enabled").disabled = busy || !STATUS;
+    paintAuth();
+  }
+  function setBusy(on) {
+    busy = on;
+    if (on) statusSeq++;
+    document.querySelectorAll(".form input,.form select,#auth-mode,#auth-rotate").forEach(e => e.disabled = on);
+    paintControls();
+  }
+  async function api(action, data = {}) {
+    const headers = { "content-type": "application/json" };
+    if (CSRF) headers["x-cc-csrf"] = CSRF;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    let r, j = {};
+    try {
+      r = await fetch("/api/remote/control", {
+        method: "POST", headers, credentials: "same-origin", cache: "no-store",
+        body: JSON.stringify({ action, ...data }), signal: controller.signal,
+      });
+      try { j = await r.json(); } catch (e) { if (controller.signal.aborted) throw e; }
+    } catch (e) {
+      if (controller.signal.aborted) throw new Error("请求超时，请检查服务状态后重试");
+      throw e;
+    } finally { clearTimeout(timer); }
+    if (r.status === 401) {
+      location.href = "/__login?next=" + encodeURIComponent("/__settings");
+      throw new Error("需要登录");
+    }
+    if (r.status === 403 && j.error === "csrf") {
+      await load().catch(() => {});
+      throw new Error("会话已更新，请重试");
+    }
+    if (!r.ok || j.error) throw new Error(j.error || j.message || ("HTTP " + r.status));
+    if (j.csrf) CSRF = j.csrf;
+    return j;
+  }
+
+  const HOST_PRESETS = ["auto", "0.0.0.0", "::", "127.0.0.1"];
+  const HOST_WARN = {
+    "0.0.0.0": "0.0.0.0 会在所有接口上监听：除 Wi-Fi 外还有蜂窝网络、热点、VPN 等。入口仍有口令保护，但任何能连到这些接口的一方都能打开登录页——公共 Wi-Fi、开热点、或运营商没有对入口封端口时风险最大。换网络/换 IP 不用重启是它唯一的便利；网络不可信时请用“自动”。",
+    "127.0.0.1": "只监听本机：iPad 等其它设备将无法访问，只能在当前这台手机上打开设置页和 App。",
+  };
+  HOST_WARN["::"] = "同时监听所有 IPv4 / IPv6 接口，换网不用重启。可连接这些接口的设备都能打开登录页；请仅在可信网络使用，其他设备仍需认证。";
+  function hostModeOf(v) {
+    const s = String(v ?? "auto").trim() || "auto";
+    return HOST_PRESETS.includes(s) ? s : "custom";
+  }
+  function syncHostMode() {
+    const mode = $("f-host-mode").value;
+    const custom = mode === "custom";
+    $("f-host").classList.toggle("hidden", !custom);
+    const v = custom ? $("f-host").value.trim() : mode;
+    const warn = $("host-warn");
+    warn.hidden = !HOST_WARN[v];
+    warn.textContent = HOST_WARN[v] || "";
+  }
+
+  function render(s, resetForm = false) {
+    const keepDraft = !resetForm && dirty();
+    STATUS = s;
+    if (s.csrf) CSRF = s.csrf;
+    const badge = $("badge");
+    badge.textContent = s.running ? "运行中" : "已停止";
+    badge.className = "badge " + (s.paused ? "pause" : "ok");
+    setText("s-run", s.running ? "运行中" : "未运行");
+    setCheck("service-enabled", typeof s.enabled === "boolean" ? s.enabled : s.running);
+    setText("s-pid", s.pid);
+    const listenHost = s.host === "0.0.0.0" ? "所有 IPv4 接口" : s.host === "::" ? "IPv4 / IPv6 双栈" : s.host?.includes(":") ? "[" + s.host + "]" : s.host;
+    setText("s-listen", listenHost + ":" + s.port);
+    setText("s-auth", s.authMode === "password" ? "口令" : "访问链接");
+    setText("s-cookie", s.cookieDays + " 天");
+    setText("s-preview", s.preview ? "开" : "关");
+    renderAddresses(s);
+    renderAuth(s);
+
+    if (!keepDraft) {
+      const hm = hostModeOf(s.config.host);
+      $("f-host-mode").value = hm;
+      setVal("f-host", hm === "custom" ? s.config.host : "");
+      setVal("f-port", s.config.port);
+      setVal("f-cookie", s.config.cookieDays);
+      setVal("f-public", s.config.publicHost || "");
+      setCheck("f-preview", s.config.preview);
+      syncHostMode();
+    }
+    baseline = normalized(s.config);
+    paintControls();
+  }
+
+  async function load(resetForm = false) {
+    const seq = ++statusSeq;
+    const s = await api("status");
+    if (seq === statusSeq) render(s, resetForm);
+    return s;
+  }
+
+
+  async function save() {
+    if (busy || !dirty()) return;
+    for (const input of document.querySelectorAll("#service-settings input"))
+      if (!input.reportValidity()) return;
+    setBusy(true);
+    try {
+      const j = await api("apply", formConfig());
+      baseline = normalized(j.config);
+      toast(j.message || "已保存并重启服务");
+      await load(true);
+      await showLogs();
+    } catch (e) {
+      // Keep the draft for correction/retry; no silent save through the enable switch.
+      await load().catch(() => {});
+      throw e;
+    } finally { setBusy(false); }
+  }
+
+  async function toggleService() {
+    if (busy || !STATUS) return;
+    const target = $("service-enabled").checked;
+    if (!target && !confirm("停止远程访问？其他设备将断开，本机设置仍可使用。")) {
+      setCheck("service-enabled", typeof STATUS.enabled === "boolean" ? STATUS.enabled : STATUS.running);
+      return;
+    }
+    setBusy(true);
+    try {
+      await api(target ? "start" : "stop");
+      await load();
+      await showLogs();
+    } catch (e) {
+      setCheck("service-enabled", typeof STATUS.enabled === "boolean" ? STATUS.enabled : STATUS.running);
+      await load().catch(() => {});
+      throw e;
+    } finally { setBusy(false); }
+  }
+
+  function authDirty() {
+    return !!authBase && ($("auth-mode").value !== authBase.mode ||
+      ( $("auth-mode").value === "password" && !!($("f-pw").value || $("f-pw2").value)) ||
+      ($("auth-mode").value === "rt" && tokenDraft !== null && tokenDraft !== authBase.token));
+  }
+  function newToken() {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return [...bytes].map(x => x.toString(16).padStart(2, "0")).join("");
+  }
+  function resetAuth(s = STATUS) {
+    if (!s) return;
+    authBase = {mode:s.authMode,revision:s.authRevision || "",token:s.authToken || ""};
+    tokenDraft = null;
+    $("auth-mode").value = authBase.mode;
+    $("f-pw").value = ""; $("f-pw2").value = "";
+    paintAuth();
+  }
+  function renderAuth(s) {
+    if (!authBase || !authDirty()) resetAuth(s);
+    else paintAuth();
+  }
+  function displayedAuthToken() {
+    if ($("auth-mode").value === "rt" && tokenDraft) return tokenDraft;
+    return STATUS?.authMode === "rt" ? STATUS.authToken || "" : "";
+  }
+  function paintAuth() {
+    if (!authBase) return;
+    const mode = $("auth-mode").value, dirtyAuth = authDirty();
+    const conflict = !!STATUS && (STATUS.authRevision || "") !== authBase.revision;
+    const activeToken = STATUS?.authMode === "rt" ? STATUS.authToken || "" : "";
+    $("auth-password").hidden = mode !== "password";
+    $("auth-link").hidden = mode !== "rt";
+    const visibleToken = displayedAuthToken();
+    const pendingToken = mode === "rt" && !!tokenDraft && tokenDraft !== activeToken;
+    $("auth-token").textContent = visibleToken || "—";
+    $("auth-token").classList.toggle("pending-token", pendingToken);
+    $("auth-token").setAttribute("aria-label", pendingToken ? "待保存 token" : "当前 token");
+    $("auth-token-note").textContent = pendingToken ?
+      "顶部访问地址和二维码在保存后更新。" : "顶部地址和二维码使用当前有效 token。";
+    $("auth-copy").disabled = !visibleToken;
+    $("auth-rotate").disabled = busy || !STATUS;
+    $("auth-mode").disabled = busy || !STATUS;
+    $("auth-save").disabled = busy || !authBase || !dirtyAuth || conflict;
+    $("auth-cancel").disabled = busy;
+    $("auth-cancel").classList.toggle("hidden", !dirtyAuth && !conflict);
+    $("auth-pending").classList.toggle("hidden", !dirtyAuth && !conflict);
+    $("auth-pending").textContent = conflict ? "认证状态已更新，请取消草稿后确认当前设置。" :
+      "保存后生效，其他设备需重新登录。";
+    $("auth-help").textContent = mode === "password" ?
+      "口令至少 6 位；本机 App 无需输入。" : "链接含登录凭证；本机 App 无需输入。";
+  }
+  async function saveAuth() {
+    if (busy || !authDirty() || $("auth-save").disabled) return;
+    const mode = $("auth-mode").value, pw = $("f-pw").value, confirm = $("f-pw2").value;
+    if (mode === "password") {
+      if ((authBase.mode !== "password" || pw || confirm) && pw.length < 6) return toast("口令至少 6 位", true);
+      if (pw !== confirm) return toast("两次输入不一致", true);
+    }
+    const body = {mode,revision:authBase.revision};
+    if (mode === "password") { body.password = pw; body.confirm = confirm; }
+    else if (tokenDraft) body.token = tokenDraft;
+    setBusy(true);
+    try {
+      const j = await api("auth-save", body);
+      const next = { ...STATUS, authMode:j.authMode, authRevision:j.authRevision, authToken:j.authToken };
+      STATUS = next;
+      resetAuth(next);
+      toast(j.message || "认证已保存");
+      await load();
+    } catch (e) {
+      await load().catch(() => {});
+      throw e;
+    } finally { setBusy(false); }
+  }
+
+  async function showLogs() {
+    const pre = $("logs");
+    const follow = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    try {
+      const j = await api("logs");
+      const text = j.logs || "（暂无日志）";
+      if (pre.textContent !== text) pre.textContent = text;
+      if (follow) pre.scrollTop = pre.scrollHeight;
+    } catch (e) { pre.textContent = "读取日志失败：" + e.message; }
+  }
+
+  async function copy(text) {
+    if (!text || text === "—") return toast("没有可复制的内容", true);
+    try { await navigator.clipboard.writeText(text); return toast("已复制"); } catch {}
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      if (ok) return toast("已复制");
+    } catch {}
+    toast("复制失败，请长按选择", true);
+  }
+
+  // Encode only on demand, entirely in this page. Never send addresses to a QR service.
+  let openQr = null;
+  let addressSeq = 0;
+  let showAllAddresses = false;
+  const addressRows = new Map();
+  function renderAddresses(status) {
+    const list = $("access-addresses"), unique = new Map();
+    for (const row of status.accessAddresses || []) {
+      try {
+        const url = new URL(row.url);
+        if (/^https?:$/.test(url.protocol) && url.hostname) {
+          const previous = unique.get(row.url), wifi = row.wifi === true;
+          if (!previous || (!previous.wifi && wifi))
+            unique.set(row.url, { url: row.url, label: String(row.label || "访问地址"), wifi });
+        }
+      } catch {}
+    }
+    const all = [...unique.values()].sort((a, b) => Number(b.wifi) - Number(a.wifi));
+    const filter = $("address-filter");
+    filter.hidden = !all.some(row => !row.wifi);
+    filter.textContent = showAllAddresses ? "只看 Wi-Fi" : "显示全部";
+    filter.setAttribute("aria-pressed", String(showAllAddresses));
+    const visible = new Map(all.filter(row => showAllAddresses || row.wifi).map(row => [row.url, row]));
+    for (const [url, node] of addressRows) if (!visible.has(url)) {
+      if (openQr === node.querySelector("code").id) closeQr();
+      node.remove(); addressRows.delete(url);
+    }
+    let index = 0;
+    for (const row of visible.values()) {
+      let node = addressRows.get(row.url);
+      if (!node) {
+        node = document.createElement("div"); node.className = "address-block";
+        node.innerHTML = '<div class="row"><span class="lbl"></span><code></code><div class="row-actions">' +
+          '<button class="ghost sm qr-toggle" title="二维码" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3zM14 13v4h4v4M21 12v4M12 21h2M21 20v1M12 12h-1"/></svg></button>' +
+          '<button class="ghost sm copy-address">复制</button></div></div>' +
+          '<div class="qr-panel" hidden><p class="qr-title">扫描打开访问地址</p><div class="qr-image" role="img"></div>' +
+          '<p class="hint">再次点击二维码按钮收起。</p></div>';
+        const id = "access-url-" + (++addressSeq), button = node.querySelector("[aria-expanded]");
+        node.querySelector("code").id = id;
+        node.querySelector("code").textContent = row.url;
+        button.dataset.qr = id;
+        button.setAttribute("aria-controls", id + "-qr");
+        node.querySelector(".qr-panel").id = id + "-qr";
+        node.querySelector(".copy-address").onclick = () => copy(row.url);
+        button.onclick = () => toggleQr(id);
+        addressRows.set(row.url, node);
+      }
+      node.querySelector(".lbl").textContent = row.label;
+      node.querySelector("[data-qr]").setAttribute("aria-label", "显示" + row.label + "二维码");
+      node.querySelector(".qr-image").setAttribute("aria-label", row.label + "访问地址二维码");
+      if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null);
+      index++;
+    }
+    $("address-empty").hidden = visible.size > 0;
+    $("address-empty").textContent = !status.running ? "服务未运行" :
+      all.length && !showAllAddresses ? "暂无 Wi-Fi 访问地址。" : "暂无可用的远程访问地址。";
+    syncQr();
+  }
+  $("address-filter").onclick = () => {
+    showAllAddresses = !showAllAddresses;
+    if (STATUS) renderAddresses(STATUS);
+  };
+  function qrValue(id) {
+    const text = $(id)?.textContent.trim() || "";
+    try { const url = new URL(text); return /^https?:$/.test(url.protocol) && url.hostname ? text : ""; }
+    catch { return ""; }
+  }
+  function closeQr() {
+    if (!openQr) return;
+    const button = document.querySelector('[data-qr="' + openQr + '"]');
+    button?.setAttribute("aria-expanded", "false");
+    const panel = $(openQr + "-qr");
+    panel.hidden = true;
+    panel.querySelector(".qr-image").replaceChildren();
+    delete panel.dataset.value;
+    openQr = null;
+  }
+  function drawQr(id) {
+    const panel = $(id + "-qr"), value = qrValue(id);
+    if (!value) { closeQr(); return; }
+    if (panel.dataset.value === value) return;
+    try {
+      const qr = qrcodegen.QrCode.encodeText(value, qrcodegen.QrCode.Ecc.MEDIUM);
+      const ns = "http://www.w3.org/2000/svg", border = 4, size = qr.size + border * 2;
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+      svg.setAttribute("xmlns", ns);
+      const bg = document.createElementNS(ns, "rect");
+      bg.setAttribute("width", size); bg.setAttribute("height", size); bg.setAttribute("fill", "#fff");
+      const path = document.createElementNS(ns, "path"), cells = [];
+      for (let y = 0; y < qr.size; y++) for (let x = 0; x < qr.size; x++)
+        if (qr.getModule(x, y)) cells.push("M" + (x + border) + "," + (y + border) + "h1v1h-1z");
+      path.setAttribute("d", cells.join("")); path.setAttribute("fill", "#000");
+      svg.append(bg, path);
+      panel.querySelector(".qr-image").replaceChildren(svg);
+      panel.dataset.value = value;
+    } catch { closeQr(); toast("无法生成二维码，请复制地址", true); }
+  }
+  function syncQr() {
+    document.querySelectorAll("[data-qr]").forEach(b => { b.disabled = !qrValue(b.dataset.qr); });
+    if (openQr) drawQr(openQr);
+  }
+  function toggleQr(id) {
+    const wasOpen = openQr === id;
+    closeQr();
+    if (wasOpen || !qrValue(id)) return;
+    openQr = id;
+    $(id + "-qr").hidden = false;
+    document.querySelector('[data-qr="' + id + '"]').setAttribute("aria-expanded", "true");
+    drawQr(id);
+  }
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && openQr) {
+      const button = document.querySelector('[data-qr="' + openQr + '"]');
+      closeQr(); button.focus(); e.preventDefault();
+    }
+  });
+
+  const guard = (fn) => () => Promise.resolve().then(fn).catch((e) => toast(e.message || String(e), true));
+  $("save").onclick = guard(save);
+  $("service-enabled").onchange = guard(toggleService);
+  $("f-host-mode").onchange = () => {
+    syncHostMode();
+    if ($("f-host-mode").value === "custom") $("f-host").focus();
+    paintControls();
+  };
+  $("f-host").oninput = () => { syncHostMode(); paintControls(); };
+  document.querySelectorAll("#service-settings input").forEach(e => {
+    e.addEventListener("input", paintControls);
+    e.addEventListener("change", paintControls);
+  });
+  $("auth-mode").onchange = () => {
+    if ($("auth-mode").value === "rt" && authBase?.mode !== "rt") tokenDraft = newToken();
+    paintAuth();
+  };
+  $("auth-rotate").onclick = guard(() => { tokenDraft = newToken(); paintAuth(); });
+  $("auth-copy").onclick = () => copy(displayedAuthToken());
+  $("auth-save").onclick = guard(saveAuth);
+  $("auth-cancel").onclick = () => resetAuth();
+  for (const id of ["f-pw", "f-pw2"]) $(id).oninput = paintAuth;
+
+
+  async function refreshVisible() {
+    if (busy || refreshing || document.hidden) return;
+    try { if (parent !== window && !frameElement?.getClientRects().length) return; } catch {}
+    refreshing = true;
+    try { await load(); if (!busy) await showLogs(); }
+    catch (e) { if (!STATUS) toast(e.message || String(e), true); }
+    finally { refreshing = false; }
+  }
+  refreshVisible();
+  setInterval(refreshVisible, 5000);
+})();
+</script>
+</body>
+</html>

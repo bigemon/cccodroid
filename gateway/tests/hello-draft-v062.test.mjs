@@ -16,11 +16,13 @@ function hello(viewSid, runSid) {
   const view = { sessionId: viewSid, gen: 0, runIds: new Set(), cids: new Set(), next: null, anchor: "", cursor: null, title: "", pendingMerge: null };
   const state = { pendingModel: null };
   const box = {
+    document: { getElementById: () => null },
     view, state, Set, Map, t: (s) => s, uiTag: "synthetic-ui", helloCount: 0,
     WROTE: new Map(), TOOL_CARDS: new Map(), TOOL_RESULTS: new Map(), clearToolResults() {}, PERMS: new Map(), runViews: new Map(),
     histEl: nodes(), liveEl: nodes(), olderEl: nodes(), statEl: nodes(), statLast: {}, statStop() {},
     stripHidden: () => ({}), paintTitle() {}, renderRunStrip() {}, renderPermBar() {}, agReset() {}, syncWindow() {}, pickViewRun() {}, renderQueue() {}, paintProjChip() {}, syncInterject() {}, saveUiState() {},
     applyState() {}, beginReplay() {}, updateCtx() {}, renderSessions() {}, loadOlder() {}, showWelcome() {}, renderInterrupted() {}, calmStatus() {}, refreshSessModel() {},
+    isCodexView: () => false, paintBackend() {}, paintSessionStatus() {}, qbLoad: async () => {},
     isBusy: () => false, setStatus() {}, intrList: () => [],
     draftSwap: (from, to) => swaps.push([from, to]),
   };

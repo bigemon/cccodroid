@@ -195,14 +195,14 @@
     if (!s) return;
     paintAv($("acct-av"));
     $("acct-name").textContent = profName();
-    $("acct-sub").textContent = provName(s);
+    $("acct-sub").textContent = sessionBackendPending() ? t("读取中…") : currentBackend() === "codex" ? "Codex" : provLabel(curProv()) || provName(s);
     paintProf();
     if (s.product) $("side-title").textContent = s.product;
     // 登录与否先用 /api/status 的 auth 定（退出登录后菜单马上换回「登录账户」）；
     // 邮箱和额度再问 /api/login/status。问不出（unknown）时不动上次的判断（0.6.9 审计 195-G.3）
     if (s.keyMode === "login" && s.auth && !s.auth.unknown) acctLogged = !!s.auth.loggedIn;
     // 官方账户：名字换成登录邮箱（问一次，之后十分钟内沿用）
-    if (s.keyMode === "login" && Date.now() - acctEmailAt > 600000) {
+    if (currentBackend() !== "codex" && s.keyMode === "login" && Date.now() - acctEmailAt > 600000) {
       acctEmailAt = Date.now();
       api("/api/login/status").then((st) => {
         const wk = st && st.limits && st.limits.sevenDay ? Math.round(st.limits.sevenDay.used) : null;
@@ -408,11 +408,12 @@
     popMenu(anchor, [
       { label: x.pinned ? t("取消置顶") : t("置顶"), icon: SM.pin, fn: () => post(`/api/session/${encodeURIComponent(id)}/pin`, { pin: !x.pinned }).then(reload, (e) => toast(e.message, true)) },
       { label: t("移到项目…"), icon: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>', fn: () => moveToProject(id, anchor) },
-      { label: t("重命名"), icon: SM.edit, fn: () => { const n = prompt(t("新的会话名称"), x.title || ""); if (n) post(`/api/session/${encodeURIComponent(id)}/rename`, { title: n }).then(() => { if (id === view.sessionId) { view.title = n; paintTitle(); } reload(); }, (e) => toast(e.message, true)); } },
+      { label: t("重命名"), icon: SM.edit, fn: () => { const n = prompt(t("新的会话名称"), x.title || ""); if (n) post(`/api/session/${encodeURIComponent(id)}/rename`, { title: n }).then(reload, (e) => toast(e.message, true)); } },
+      ...(x.backend==="codex"?[{label:t("子代理"),icon:SM.people,fn:()=>openCodexAgents(id,anchor)},{label:t("后台命令"),fn:()=>openCodexCommands(id,anchor)}]:[]),
       { label: t("脉络"), icon: SM.lineage, fn: () => lineageMenu(id, anchor) },
       { label: x.misc ? t("移出杂项") : t("归入杂项"), icon: SM.tray, fn: () => post("/api/archive/misc", { session: id, misc: !x.misc }).then(reload, (e) => toast(e.message, true)) },
       { label: t("导出"), icon: SM.export, fn: async () => {
-        if (!confirm(t("会话记录可能含有你贴过的密钥、令牌或文件内容。导出的压缩包请只发给你信任的地方。继续？"))) return;
+        if (!confirm(sessionExportPrompt([id]))) return;
         const r = await post("/api/sessions/export", { ids: [id] }).catch((e) => ({ ok: false, message: e.message }));
         if (!r.ok) return toast(t("导出失败：{msg}", { msg: r.message || "" }), true);
         if (canSaveAs()) saveAs(r.file, "application/zip"); else toast(t("已导出 {n} 个会话：{file}", { n: r.count, file: r.file }));

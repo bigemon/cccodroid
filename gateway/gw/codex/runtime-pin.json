@@ -1,0 +1,7 @@
+{
+  "version": "0.166.0",
+  "target": "aarch64-unknown-linux-musl",
+  "url": "https://github.com/openai/codex/releases/download/rust-v0.166.0/codex-package-aarch64-unknown-linux-musl.tar.zst",
+  "size": 136246047,
+  "sha256": "41d7e5673d867939497c2f7c5f8fe7673795a6a81d3a3920394756af321eda01"
+}

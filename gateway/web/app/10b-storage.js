@@ -20,7 +20,22 @@
     try { await post("/api/storage/scan", {}); } catch (e) { stOut("err", "✗ " + e.message); }
     ST.poll = setTimeout(stLoad, 800);
   }
-  function stOnOpen() { stLoad(); }
+  function stOnOpen() {
+    const available=!!window.CCApp?.fullBackup;
+    $("st-backup-export").disabled=$("st-backup-import").disabled=!available;
+    $("st-backup-hint").textContent=available?t("将打开系统文件选择器，随后进入备份进度页。"):t("请在安装了新版 APK 的本机应用中使用完整备份。");
+    stLoad();
+  }
+  function startFullBackup(action){
+    if(!window.CCApp?.fullBackup)return toast(t("请在安装了新版 APK 的本机应用中使用完整备份。"),true);
+    if(typeof draftPersist==="function")draftPersist();
+    if(typeof saveUiState==="function")saveUiState();
+    let snapshot={};
+    if(action==="export")for(const key of Object.keys(localStorage))if(key.startsWith("cc.")||key.startsWith("ccapp."))snapshot[key]=localStorage.getItem(key);
+    window.CCApp.fullBackup(action,JSON.stringify(snapshot));
+  }
+  $("st-backup-export").addEventListener("click",()=>startFullBackup("export"));
+  $("st-backup-import").addEventListener("click",()=>startFullBackup("import"));
 
   function stPaint() {
     const r = ST.r || {}, s = r.scan;

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
-import { CFG, HERE, LAST_LANG, PATHS, log, tr, tz } from "./config.mjs";
+import { CFG, HERE, LAST_LANG, LIVE, PATHS, log, tr, tz } from "./config.mjs";
 import { onShutdown } from "./crashguard.mjs";
 import { SETTINGS, saveSettings, capList } from "./settings-store.mjs";
 import { keepBad, writeAtomic } from "./statefile.mjs";
@@ -15,7 +15,7 @@ import { findSessionFile } from "./sessions.mjs";
 import { sealSession } from "./integrity.mjs";
 import { killRunProcs, killTree, safeModePerm } from "./claude.mjs";
 import { goalCheck, tasksCheck } from "./goal.mjs";
-import { LAST_SESSION, RUNS, SESSIONS, TRASH_HOOKS, latestRun, maxParallel, runFlag, runList } from "./runs.mjs";
+import { LAST_SESSION, RUNS, SESSIONS, latestRun, maxParallel, runFlag, runList, TRASH_HOOKS } from "./runs.mjs";
 import { NEXT, readBody, sendJson } from "./http.mjs";
 import { BOOT, publish } from "./bus.mjs";
 import { execIntent, lostProvider, pickProvider, startRun } from "./run.mjs";
@@ -23,6 +23,11 @@ import { cleanMergeFrom } from "./merge.mjs";
 import { LOCAL_CMD_RE } from "./modelcmd.mjs";
 import { tamperPending } from "./tamper.mjs";
 import { RATE_LIMITS } from "./stream.mjs";
+import { CODEX_OPERATIONS } from "./codex/operation-lock.mjs";
+import {getCodexSession} from "./codex/store.mjs";
+import { resolveBackend } from "./backends.mjs";
+import { codexAvailable } from "./codex/run.mjs";
+import {validateSkillRefs} from "./codex/skills.mjs";
 
 // ── 生成与排队 ────────────────────────────────────────────────────────
 export const QUEUE = [];                 // 等着跑的消息：{ id, message, sessionId, follow, model, permissionMode, addDirs, at }
@@ -71,9 +76,12 @@ export function permView(p) {
 
 const runInfo = (r) => r && {
   id: r.id, cid: r.cid, text: r.text.slice(0, 2000), sessionId: r.sessionId, follow: r.follow, startedAt: r.startedAt,
+  backend: r.backend || "claude",
+  permissionMode: r.permMode || null,
   perms: r.perms ? [...r.perms.values()].map(permView) : [],
   // sealed：答完了、后台任务还在，但 stdin 已关——插话、停单个任务都送不进去，只能等它结束或整个停掉
   idle: !!r.idle, sealed: !!r.idle && !r.inputOpen && !r.ended, bg: r.bgTasks || 0, bgList: r.bgList || [], auto: r.auto || null, permMode: r.permMode || null,
+  ...(r.backend==="codex"?{subagents:r.codexAgents||[],subagentsAt:r.codexAgentsAt||0}:{}),
 };
 
 /** 改权限模式：存进设置（下一轮沿用），正在跑的那一轮当场切（set_permission_mode） */
@@ -86,7 +94,7 @@ export function setPermMode(mode, { persist = true } = {}) {
   // 设置路由要一次请求只写一次盘（中途写盘 + 后面校验失败就是半套设置，FIND-051），由它传 persist:false 自己落盘
   const saved = persist ? saveSettings() !== false : undefined;
   const eff = safeModePerm(mode);   // 安全模式下不问人的几档退回 default（见 claude.mjs），界面显示实际生效的
-  for (const r of RUNS.values()) if (r.setMode) {
+  for (const r of RUNS.values()) if (r.backend !== "codex" && r.setMode) {
     r.setMode(eff);
     // 重放（切回会话、断线重连）时 init 里还是起跑时的模式，会把界面改回去，用户想收紧也发不出去（安全通告 GHSA-2w6p）
     for (const e of r.log || []) if (e.type === "init") e.permissionMode = eff;
@@ -139,7 +147,7 @@ export function saveRunMark() {
       // text 以前截 4000 字、别的都不存：没建会话的「重发」长消息后半截悄悄没了，项目 / 模型 / 权限也回落全局（195-AA.5）。
       // 现在存到 64K（更长的标 textCut，界面要说），连同发送参数 req、定时任务身份 sched（AA.3）
       runs: live.map((r) => ({ id: r.id, sessionId: r.sessionId, ...(r.cwd ? { cwd: r.cwd } : {}), text: r.text.slice(0, TEXT_KEEP), ...(r.text.length > TEXT_KEEP ? { textCut: true } : {}),
-        startedAt: r.startedAt, ...(r.req && Object.keys(r.req).length ? { req: r.req } : {}), ...(r.sched ? { sched: r.sched } : {}),
+        backend: r.backend || "claude", startedAt: r.startedAt, ...(r.req && Object.keys(r.req).length ? { req: r.req } : {}), ...(r.sched ? { sched: r.sched } : {}),
         // 有副作用、还没等到结果的工具（FIND-039/049）：恢复后由「继续」卡提示，界面才知道哪些操作不能当没发生
         ...(r.sideTools?.size ? { sideTools: [...r.sideTools.values()].slice(-20) } : {}),
         // 还没起进程（等确认卡、等桥、核验程序…）：claude 根本没收到这条，恢复后只能「重发」不能「继续」（195-P.3）
@@ -167,7 +175,7 @@ const INTR_MAX = 20;
 const intrList = (v) => (Array.isArray(v) ? v : v ? [v] : []).filter((e) => e && typeof e === "object" && e.id).slice(-INTR_MAX);
 // 读的时候顺手丢掉会话已经不在了的（老版本回收时没清）：没建会话的照留
 export let INTERRUPTED = (() => {
-  try { return intrList(JSON.parse(fs.readFileSync(INTR_FILE, "utf8"))).filter((e) => { try { return !e.sessionId || !!findSessionFile(e.sessionId); } catch { return true; } }); } catch {}
+  try { return intrList(JSON.parse(fs.readFileSync(INTR_FILE, "utf8"))).filter((e) => { try { return !e.sessionId || !!getCodexSession(e.sessionId) || !!findSessionFile(e.sessionId); } catch { return true; } }); } catch {}
   return [];
 })();
 /** 落盘成功回 true（写到一半被杀不留半个 JSON：临时文件 + fsync + 换名） */
@@ -261,7 +269,7 @@ function restoreQueue(m, commit) {
     if (!q || !q.id || typeof q.message !== "string") continue;
     if (!q.sessionId && q.follow && RUN_SESSIONS.get(q.follow)) q.sessionId = RUN_SESSIONS.get(q.follow);
     // 会话已经删了（进了回收站）：这条再也看不到、点不了 ⚡，留着只会让 queued 一直不为 0，工具包更新永远等「任务结束」（群友 10-31）
-    if (q.sessionId && !findSessionFile(q.sessionId)) { log(`  会话 ${q.sessionId} 已不在，丢掉它排着的一条消息`); continue; }
+    if (q.sessionId && !getCodexSession(q.sessionId) && !findSessionFile(q.sessionId)) { log(`  会话 ${q.sessionId} 已不在，丢掉它排着的一条消息`); continue; }
     if (QUEUE.some((x) => x.id === q.id)) continue;
     QUEUE.push({ ...q, held: true, intr: true });   // intr：前端据此说「被系统中断」而不是「点了停止」
   }
@@ -269,13 +277,20 @@ function restoreQueue(m, commit) {
   // 中断记录已落盘：标记换成只剩排队消息的新版本（没有排队的就删掉）；写不上就留着旧的，下次再来
   if (commit && !saveRunMark()) log("⚠️ 运行标记没更新上，下次启动会再恢复一次（按 id 去重）");
 }
+/** 启动时调用（由 server.mjs 显式调用）：恢复上一任的未完成记录。
+ *  P6-B2.1 起不在模块导入时执行 —— import 本身不该改任何运行标记。 */
+export function initQueue() {
+  if (LIVE) recoverRunMark();
+  runFlag(false);
+}
 
+const sameDelta = (a, b) => a && a.type === b.type && a.itemId === b.itemId && a.turnId === b.turnId && a.summaryIndex === b.summaryIndex && a.codexItem === b.codexItem;
 // 逐字增量太碎：攒 40ms 合成一条再发，其它事件到来前先冲掉，保证顺序不乱
 export function runEmit(run, ev) {
   if (run.ended) return;
   ev.runId = run.id;
   if (ev.type === "delta" || ev.type === "thinking_delta") {
-    if (run.pend && run.pend.type === ev.type) run.pend.text += ev.text;
+    if (sameDelta(run.pend, ev)) run.pend.text += ev.text;
     else { flushPend(run); run.pend = ev; }
     if (!run.pendTimer) run.pendTimer = setTimeout(() => flushPend(run), 40);
     return;
@@ -336,13 +351,20 @@ function record(run, ev) {
   // 下次启动的「继续」卡据此说清楚哪些操作的结果不知道 —— 点「继续」要不要重做，用户得先能判断
   const side = noteSide(run, ev);
   const last = run.log[run.log.length - 1];
-  if (last && last.type === ev.type && (ev.type === "delta" || ev.type === "thinking_delta")) last.text += ev.text;
+  if (sameDelta(last, ev) && (ev.type === "delta" || ev.type === "thinking_delta")) last.text += ev.text;
   else if (last && last.type === "usage" && ev.type === "usage") run.log[run.log.length - 1] = { ...ev };
   else if (last && last.type === "phase" && ev.type === "phase") run.log[run.log.length - 1] = { ...ev };
-  // 本轮输出 token 每秒一条，夹在增量中间合并不到：只留一条、原地改成最新的数（重放只要最后的值）
-  else if (ev.type === "run_tokens" && run.tokAt != null && run.log[run.tokAt]?.type === "run_tokens") run.log[run.tokAt] = { ...ev };
+  else if (ev.type === "diff" || ev.type === "review") {
+    const key = ev.type;
+    const id = ev[key]?.id;
+    const index = run.log.findIndex(x=>x.type===key&&x[key]?.id===id);
+    if(index>=0)run.log[index]={...ev};else run.log.push({...ev});
+  }
+  else if (ev.type === "command") {
+    const index = run.log.findIndex(x => x.type === "command" && x.command?.id === ev.command?.id);
+    if (index >= 0) run.log[index] = { ...ev }; else run.log.push({ ...ev });
+  } else if (ev.type === "run_tokens" && run.tokAt != null && run.log[run.tokAt]?.type === "run_tokens") run.log[run.tokAt] = { ...ev };
   else { if (ev.type === "run_tokens") run.tokAt = run.log.length; run.log.push(logCopy(ev)); }
-  // 台账变了马上落盘：被强杀时磁盘上那份就是最后一次工具结果之后的真实状态
   if (side) saveRunMark();
 }
 
@@ -416,6 +438,7 @@ export function abortRun(run, { hold = true } = {}) {
       setTimeout(() => forceEnd(run), 2000).unref();
     }, 5000).unref();
   }
+  if (run.abort) { try { run.abort(); } catch {} }
   return true;
 }
 
@@ -471,7 +494,7 @@ function idleFire(sid) {
 /** 有空位就从队列里挑能跑的：车道空闲、且是这条车道上排在最前的（同一会话不许插队、不许同时跑两轮） */
 /** 会话确实没了：会话目录读得了、里面却找不到它。目录整个读不了（存储出错）不算——那时丢消息就是误删（同 195-Y.8） */
 export function sessionGone(sid) {
-  if (findSessionFile(sid)) return false;
+  if (getCodexSession(sid) || findSessionFile(sid)) return false;
   try { fs.readdirSync(PATHS.projects); return true; } catch { return false; }
 }
 export function pump() {
@@ -503,10 +526,35 @@ const MSG_MAX = 2000000;                        // 字（UTF-16 码元）：两�
 const SID_OK = /^[A-Za-z0-9_-]{1,80}$/;
 /** 字符串数组：只留字符串，条数、每条长度、总长都有上限（总长见 settings-store 的 capList） */
 export const strList = (a, n, len, total) => capList(a, n, len, total);
-export function enqueue(body) {
-  const item = {
+/** 解析后端时用的上下文：follow 取前一轮、Claude 会话看文件或本次运行见过 */
+function backendCtx() {
+  return {
+    runInfo: (rid) => {
+      const r = RUNS.get(rid);
+      if (!r) return null;
+      return { sessionId: r.sessionId || RUN_SESSIONS.get(rid) || null, backend: r.backend || "claude" };
+    },
+    isKnownClaudeSession: (sid) => Boolean(findSessionFile(sid) || SESSIONS.has(sid)),
+  };
+}
+
+export function enqueue(body, opts = {}) {
+  // 会话绑定后端：已有会话以持久化归属为准；显式选择只在新建会话时生效。
+  // 冲突 / 未知会话直接拒绝，不进队列（P6-B2 §1）。
+  const resolved = opts.resolved
+    || resolveBackend({ backend: body.backend, sessionId: body.sessionId, follow: body.follow }, backendCtx());
+  if(!resolved.error&&CODEX_OPERATIONS.has(resolved.sessionId))return {error:{status:409,code:"session_busy",message:"会话正在操作中，请稍后重试。"}};
+  if(!resolved.error&&resolved.backend==="codex"&&getCodexSession(resolved.sessionId)?.historyMutation)return {error:{status:409,code:"history_recovery_required",message:"历史删除尚未完成同步，请先恢复界面历史再继续。"}};
+  if (resolved.error) {
+    log(`✗ 拒绝消息：${resolved.error.code}（session=${String(body.sessionId || body.follow || "-").slice(0, 12)}）`);
+    return { error: resolved.error };
+  }
+  const item = opts.item || {
     id: newRunId(),
     message: String(body.message || ""),
+    attachments: Array.isArray(body.attachments) ? body.attachments.slice(0, 17).filter(a => a && typeof a.path === "string").map(a => ({ path: a.path.slice(0, 4096) })) : [],
+    skills: resolved.backend==="codex" ? validateSkillRefs(body.skills) : [],
+    backend: resolved.backend,
     sessionId: body.sessionId ? String(body.sessionId) : null,
     follow: body.follow ? String(body.follow) : null,
     cid: body.cid ? String(body.cid).slice(0, 64) : null,   // 前端自己的消息号：SSE 可能比 POST 的响应先到
@@ -521,9 +569,10 @@ export function enqueue(body) {
     at: Date.now(),
     // 只有网关自己（定时任务）会带的：前端发来的 /api/chat 不许设这些
     ...(body.internal ? { cwd: body.cwd || null, effort: body.effort || null, provider: body.provider || null, sched: body.sched || null, unattended: !!body.unattended,
-      allowedTools: body.allowedTools || null, disallowedTools: body.disallowedTools || null, timeoutMs: body.timeoutMs || 0, limitCost: +body.limitCost || 0 } : {}),
+      codexTaskPolicy: body.codexTaskPolicy || null, allowedTools: body.allowedTools || null, disallowedTools: body.disallowedTools || null, timeoutMs: body.timeoutMs || 0, limitCost: +body.limitCost || 0 } : {}),
     ...(body.auto ? { auto: body.auto } : {}),
   };
+  if (opts.defer) return item; // Codex 等核心确认 steer 后才回报送达；失败再沿原车道排队。
   // 插话（"inject"，旧前端叫 "interrupt"）：不打断。消息直接写进正在跑的 claude 的 stdin，
   // claude 会在当前这一步（比如一次工具调用）结束后把它并进对话，同一轮里接着干 —— 和终端里边干边打字一样。
   // 塞不进去（这一轮已在收尾、或者不是同一个会话）就排到队首，这一轮一结束马上发。
@@ -600,6 +649,23 @@ export async function routeQueue(req, res, u, p) {
         return sendJson(res, 200, { ...prev.res, duplicate: true });
       }
     }
+    // 归属只解析一次：冲突/未知会话先返回，再谈可用性（P6-B2.1 §1）。
+    // 以前这里 `|| "claude"` 会把 409/400 吞成 Claude 的 503。
+    const resolved = resolveBackend({ backend: b.backend, sessionId: b.sessionId, follow: b.follow }, backendCtx());
+    if (resolved.error) {
+      return sendJson(res, resolved.error.status || 400, { error: resolved.error.code, message: resolved.error.message });
+    }
+    if(CODEX_OPERATIONS.has(resolved.sessionId))return sendJson(res,409,{error:"session_busy",message:"会话正在分叉，请稍后重试。"});
+    const wantBackend = resolved.backend;
+    if(wantBackend==="codex")try{validateSkillRefs(b.skills);}catch(e){return sendJson(res,400,{error:"invalid_skills",message:e.message});}
+    if (wantBackend === "codex") {
+      if (!codexAvailable()) {
+        return sendJson(res, 503, {
+          error: "codex_unavailable",
+          message: tz("Codex 后端还没配置：需要 codex 可执行文件与 CODEX_HOME。"),
+        });
+      }
+    } else {
     // 看这条消息要用的那家（新会话首条选的 / 会话钉的 / 全局的），不是只看全局
     const q0 = { sessionId: b.sessionId ? String(b.sessionId) : null, follow: b.follow || null, projectId: b.projectId ? String(b.projectId) : null,
       pin: !b.sessionId && b.pin && typeof b.pin.provider === "string" ? { provider: b.pin.provider } : null };
@@ -613,11 +679,26 @@ export async function routeQueue(req, res, u, p) {
         message: tz("「{name}」还没填 Key。到 设置 → 接口 里填好保存，或换一个接口。", { name: bp.label || bp.id }),
       });
     }
+    }
     if (QUEUE.length >= 50) return sendJson(res, 429, { error: "queue_full", message: tz("排队的消息太多了。") });
     // 字段都有上限（审查 v0513b 低-3）：排队 50 条 × 不限长的正文能把内存吃满；会话号这类直接进 claude 的参数
     if (String(b.message).length > MSG_MAX) return sendJson(res, 413, { error: "too_long", message: tz("这条消息太长了（超过 200 万字），改成文件发吧。") });
     for (const k of ["sessionId", "follow"]) if (b[k] != null && b[k] !== "" && !SID_OK.test(String(b[k]))) return sendJson(res, 400, { error: "bad " + k });
-    const item = enqueue({ ...b, internal: false, auto: undefined });   // auto（空闲压缩轮）也只许网关自己设（审查 10-30 第九份 后端低8）
+    const body = { ...b, internal: false, auto: undefined };
+    let item;
+    if (wantBackend === "codex" && ["inject", "interrupt"].includes(b.mode)) {
+      const candidate = enqueue(body, { resolved, defer: true });
+      const busy = laneRun(laneOfItem(candidate));
+      if (busy?.steer && !candidate.message.trim().startsWith("/")) {
+        try {
+          if (await busy.steer(candidate)) item = { ...candidate, injected: true };
+        } catch (err) {
+          return sendJson(res, 502, { error: "steer_delivery_unknown", message: "插话是否送达尚未确认，消息已挂起保留，请勿重复发送。" });
+        }
+      }
+      if (!item) item = enqueue(body, { resolved, item: candidate });
+    } else item = enqueue(body, { resolved });
+    if (item.error) return sendJson(res, item.error.status || 400, { error: item.error.code, message: item.error.message });
     const out = { ok: true, id: item.id, injected: !!item.injected, started: RUNS.has(item.id) };
     if (idem) { idemPrune(); IDEM.set(idem, { at: Date.now(), hash: idemHash(message), res: out }); }
     return sendJson(res, 200, out);
@@ -643,12 +724,14 @@ export async function routeQueue(req, res, u, p) {
       const it = QUEUE.splice(i, 1)[0];
       it.held = false;                      // 挂起的消息靠这个放行
       const lr = laneRun(laneOfItem(it));
-      // ⚡ 也一样：执行配置变了就宁可排队等这一轮结束，不要把消息塞进用旧接口/旧模型的进程
-      if (!(lr && sameExec(lr, it) && tryInject(lr, it))) {
+      let injected = false;
+      if (!it.sched && !it.unattended && !lr?.sched && !lr?.unattended && lr?.backend === "codex" && lr.steer && !it.message.trim().startsWith("/")) {
+        try { injected = await lr.steer(it); }
+        catch { it.held = true; QUEUE.unshift(it); saveRunMark(); return sendJson(res, 502, { error: "steer_delivery_unknown", message: "插话送达状态未知，已挂起保留。" }); }
+      } else injected = !!(lr && sameExec(lr, it) && tryInject(lr, it));
+      if (!injected) {
         QUEUE.unshift(it);
-        // 那一轮答完了、只剩后台任务：这条只能等它结束。用户点了 ⚡ 就是不等——连同后台任务结束它，收尾后这条接着发。
-        // 输入还开着也要结束：配置已经变了，继续等它不会变成能注入的状态（#139 回归）
-        if (lr && lr.idle && !lr.ended) { log("⚡ 上一轮只剩后台任务，结束它好发出排着的消息"); abortRun(lr, { hold: false }); }
+        if (lr && lr.idle && !lr.ended) abortRun(lr, { hold: false });
       }
     } else if (act === "edit") {
       const t = String(b.text || "").trim();

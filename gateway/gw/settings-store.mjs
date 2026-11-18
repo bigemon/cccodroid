@@ -9,6 +9,7 @@ import { isObj, loadState, writeAtomic } from "./statefile.mjs";
 
 // ── 设置（模型 / 权限模式 / 目录 …）──────────────────────────────────
 export const SETTINGS = {
+  codex: { bin: null, home: null, sslCertFile: null },
   // 不预填：CFG.model 是内置第三方厂商的兜底，预填进来会被带给官方账户（新装无设置文件时实测 400）
   model: null,
   // 和官方一致：逐项确认。前端的确认卡片接的是 stream-json 控制协议（见 startRun 里的 can_use_tool）

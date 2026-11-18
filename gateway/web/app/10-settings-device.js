@@ -6,7 +6,23 @@
         unreachable: ["err", t("连不上应用的后台服务")],
   };
   const SETUP_BUSY = ["downloading", "installing", "connecting", "pairing", "starting", "permission"];
-  let privPoll = null;
+  let privPoll = null, privSplitBusy = false;
+  function paintSplitPairing(st) {
+    const split=st.splitPairing;
+    const supported=split?.supported===true&&Number.isInteger(split.sdk)&&split.sdk>=24;
+    $("priv-split").classList.toggle("hidden",!supported||st.setup?.phase!=="pairing");
+    $("priv-split-settings").disabled=privSplitBusy||split?.phase==="opening";
+    $("priv-split-state").textContent=split?.message||t("通知栏无法输入时，可尝试将设置与本页分屏。请先进入分屏，再打开系统的配对码弹框，并保持两个窗口打开。");
+  }
+  $("priv-split-settings").addEventListener("click",async()=>{
+    if(privSplitBusy||$("priv-split-settings").disabled)return;
+    privSplitBusy=true;$("priv-split-settings").disabled=true;
+    $("priv-split-state").textContent=t("正在尝试分屏打开设置…");
+    try {
+      const result=await appPost("/api/app/shz_split_settings",{});
+      if(result?.message)$("priv-split-state").textContent=result.message;
+    }finally{privSplitBusy=false;await loadPriv();}
+  });
   // 这些按钮背后是原生跳转 / priv 调用：失败会回 200 + {ok:false}，以前只接网络错误，用户点了没反应（195-N.7）
   const appPost = async (url, body) => {
     try {
@@ -15,6 +31,22 @@
       return r;
     } catch (e) { toast(e.message, true); return null; }
   };
+  // 保存策略不属于 Shizuku 的连接状态；正常保存不逐项重复列出。
+  function renderConsentSave(consent) {
+    $("consent-save").classList.toggle("hidden", !consent);
+    if (!consent) return;
+    $("consent-strong").checked = !!consent.strong;
+    const temporary = consent.temporary || [];
+    const state = $("consent-save-state");
+    state.classList.toggle("hidden", !temporary.length);
+    state.textContent = temporary.length ? t("仅本次运行有效：{items}", { items: temporary.join("、") }) : "";
+  }
+  $("consent-strong").addEventListener("change", async e => {
+    const input = e.target;
+    input.disabled = true;
+    try { await appPost("/api/app/consent_set", { strong: input.checked }); }
+    finally { input.disabled = false; await loadPriv(); }
+  });
   // 各家系统里"允许后台运行"的位置。红魔/中兴为实测，其余是常见路径
   const BG_HOW = {
         nubia: t("红魔 / 努比亚：应用信息 → 应用的电池用量 → 电池优化 → <b>后台运行：允许</b>（<b>自启动</b>也选允许，开机激活 Shizuku、更新后自动恢复都靠它）"),
@@ -42,11 +74,36 @@
     if (act === "ack") { const st = await post("/api/app/freeze_ack").catch(() => null); if (st) renderBg(st.frozen); }
   });
 
+  let privNoAskBusy = false, privNoAskSnapshot = null;
+  function renderPrivNoAsk(st) {
+    if (!privNoAskBusy) privNoAskSnapshot = st;
+    $("priv-na").checked = !!st.noask;
+    $("priv-na-self-row").classList.toggle("hidden", !st.noask);
+    $("priv-na-self").checked = !!st.noask && !!st.noaskSelf;
+    const out = $("priv-na-result");
+    out.className = "prov-state " + (st.noask ? "warn" : "");
+    out.textContent = st.noask
+      ? t("已打开：特权命令不再逐条确认") + (st.noaskPermanent ? " · 永久有效（高风险）" : st.noaskUntil ? " · 有效至 " + new Date(st.noaskUntil).toLocaleString() : "")
+      : "";
+    if (privNoAskBusy) return;
+    const localChoice = !st.noask && $("priv-na-hours").dataset.localChoice;
+    if (!localChoice && (document.activeElement !== $("priv-na-hours") || st.noaskPermanent)) {
+      if (Number.isInteger(st.noaskHours)) $("priv-na-hours").value = String(st.noaskHours);
+      else if (st.noask && st.noaskUntil) {
+        const remaining = Math.max(0, (st.noaskUntil - Date.now()) / 3600000);
+        $("priv-na-hours").value = String([1, 4, 24, 72, 168, 720].find(h => h >= remaining) || 720);
+      }
+    }
+    $("priv-na-hours").classList.toggle("permanent", $("priv-na-hours").value === "-1");
+    if (!localChoice) $("priv-na-hours").dataset.savedValue = Number.isInteger(st.noaskHours) ? String(st.noaskHours) : $("priv-na-hours").value;
+  }
+
   async function loadPriv() {
     let st;
     try { st = await api("/api/priv/status"); } catch { return; }
-    if (st.state === "unsupported") return;          // 旧版：没有这项集成
-    renderBg(st.frozen);
+    renderConsentSave(st.consent);
+    if (st.state === "unsupported") { paintSplitPairing({});return; } // 旧版：没有这项集成
+    renderBg(st.frozen);paintSplitPairing(st);
     $("priv-field").classList.remove("hidden");
     const el = $("priv-state");
     if (st.state === "ok") {
@@ -61,7 +118,8 @@
     const su = st.setup || { phase: "idle" };
     const busy = SETUP_BUSY.includes(su.phase);
     const se = $("priv-setup");
-    const showSetup = su.message && !(st.state === "ok" && su.phase !== "done");
+    // 就绪状态已在 priv-state 显示；历史 done 文案不再混入保存设置或宣称自动激活已开启。
+    const showSetup = su.message && su.phase !== "done" && st.state !== "ok";
     se.classList.toggle("hidden", !showSetup);
     if (showSetup) {
       se.className = "prov-state " + (su.phase === "error" ? "err" : su.phase === "done" ? "ok" : "warn");
@@ -105,23 +163,62 @@
       (st.dev ? "" : `<button class="btn sm ghost" data-act="audit">${t("特权命令记录")}</button>`));
     $("priv-auto-row").classList.toggle("hidden", !(wl && st.paired));
     $("priv-auto").checked = !!st.autostart;
+    const autoState = $("priv-auto-state");
+    const missingAutoPermission = wl && st.paired && st.autostart && st.wss === false;
+    autoState.classList.toggle("hidden", !missingAutoPermission);
+    autoState.textContent = missingAutoPermission ? t("自动激活权限未就绪，请重新激活 Shizuku。") : "";
     $("priv-ka-row").classList.toggle("hidden", !!st.dev);
     $("priv-ka-row").style.opacity = st.state === "ok" ? "1" : ".45";
     $("priv-ka").disabled = st.state !== "ok";
     $("priv-ka").checked = !!st.keepalive;
-    $("priv-na-row").classList.toggle("hidden", !!st.dev);
-    $("priv-na-row").style.opacity = st.state === "ok" ? "1" : ".45";
-    $("priv-na").disabled = st.state !== "ok";
-    $("priv-na").checked = !!st.noask;
-    // 时长只在关着时能选：开着时改它没意义（要关了再开才按新时长算）
-    $("priv-na-hours").disabled = st.state !== "ok" || !!st.noask;
-    // 免确认限时（打开时选，1 小时到 7 天，应用侧到点自动关）：开着时写上到什么时候
-    const naOut = $("priv-na-result");
-    if (st.noask && st.noaskUntil) { naOut.className = "prov-state warn"; naOut.textContent = t("已打开，{t} 自动关闭", { t: new Date(st.noaskUntil).toLocaleString() }); naOut.dataset.until = "1"; }
-    else if (naOut.dataset.until) { naOut.textContent = ""; delete naOut.dataset.until; }
-    // 安装、配对、启动都在进行时自己刷新（设置页开着才刷）
+    renderPrivNoAsk(st);
+    // This card is a sibling of Shizuku, so expanded audit records stay with it.
+    const tcpBox = $("priv-tcp");
+    if (!tcpBox.dataset.bound) {
+      tcpBox.dataset.bound = "1";
+      tcpBox.addEventListener("click",async e=>{
+        const button=e.target.closest("[data-tcp-retry]");
+        if(!button||button.disabled)return;
+        button.disabled=true;
+        try{const r=await post("/api/priv/tcp",{action:"enable"});if(!r.ok)toast(r.message,true);}catch(err){toast(err.message,true);}
+        await loadPriv();
+      });
+      tcpBox.addEventListener("change", async e => {
+        const control = e.target;
+        const action = control.id === "priv-tcp-enabled" ? (control.checked ? "enable" : "close")
+          : control.id === "priv-tcp-listener" ? "listener" : null;
+        if (!action) return;
+        tcpBox.querySelectorAll("input,select").forEach(x => x.disabled = true);
+        try {
+          const r = await post("/api/priv/tcp", { action, ...(action === "listener" ? { type: control.value } : {}) });
+          if (!r.ok) toast(r.message || "切换失败", true);
+        } catch (err) { toast(err.message, true); }
+        await loadPriv();
+      });
+    }
+    const tcp = st.tcpRecovery;
+    tcpBox.classList.toggle("hidden", !tcp || !!st.dev || st.state === "not_installed");
+    if (tcp && !st.dev) {
+      tcpBox.innerHTML = `<div class="srow head">
+        <div class="sl"><b>无线 ADB 保活</b><p>开启：使用 TCP 通道，在断 Wi-Fi 后恢复 Shizuku。关闭：关闭固定 TCP 通道，采用原有无线激活方案。</p></div>
+        <div class="sc"><input type="checkbox" class="sw" id="priv-tcp-enabled" aria-label="无线 ADB 保活" ${tcp.enabled ? "checked" : ""}></div>
+      </div>
+      <div class="prov-state ${["error","auth-required"].includes(tcp.phase) ? "err" : ""}">${esc(tcp.message || (tcp.enabled ? "已启用，等待检查" : "未启用"))} · 本次启动恢复 ${Number(tcp.recoveries) || 0} 次</div>
+      ${tcp.enabled&&tcp.authBlocked?'<div class="row-actions"><button type="button" class="btn sm ghost" data-tcp-retry'+(tcp.busy?' disabled':'')+'>重新检查 ADB 授权</button></div>':""}
+      <p class="tiny">开启会保持 USB 调试，增加 ADB 暴露时间。系统 TCP 5555 仍可能被局域网访问。</p>
+      <div class="srow sub"><div class="sl"><b>本机 ADB 客户端接口</b><p>仅设置 adb server 的控制接口，不改变系统 5555 监听。</p></div>
+        <div class="sc"><select id="priv-tcp-listener" aria-label="本机 ADB 客户端接口">
+          <option value="loopback" ${tcp.listenerType !== "unix" ? "selected" : ""}>本机 TCP（兼容性最佳）</option>
+          <option value="unix" ${tcp.listenerType === "unix" ? "selected" : ""}>私有 Unix socket（更安全）</option>
+        </select></div></div>
+      <p class="tiny">${tcp.listenerType === "unix" ? "更安全：私有接口位于应用目录，限制其他 App 访问本功能的控制接口；原生配对和其他工具仍可能启动 5037。" : "兼容性最佳：使用 127.0.0.1:5037，便于其他本机 ADB 工具复用，也可能被其他 App 访问。"}
+        切换不会关闭其他工具已启动的 ADB server。</p>
+      <p class="tiny">切换方案时 Shizuku 可能短暂重启。手机重启后仍需 Wi-Fi 首次激活；保活仅在网关运行时生效。</p>`;
+      tcpBox.querySelectorAll("input,select").forEach(x => x.disabled = !!tcp.busy || busy);
+      $("priv-tcp-enabled").disabled ||= !tcp.enabled && st.state !== "ok";
+    }
     clearTimeout(privPoll);
-    if (busy && pageOn("settings")) privPoll = setTimeout(loadPriv, 1500);
+    if ((busy || tcp?.busy || tcp?.enabled || st.consent?.temporary?.length) && pageOn("settings")) privPoll = setTimeout(loadPriv, busy ? 1500 : 5000);
   }
   // 经 priv 执行过的命令（谁发起、命令、退出码、用时）。再点一次收起
   const privBy = (k) => ({ claude: "Claude", terminal: t("终端"), gateway: "cccodroid", "cc-mem": t("内存管家"), other: t("其他") })[k] || k;
@@ -176,7 +273,7 @@
   $("priv-auto").addEventListener("change", (e) => post("/api/app/shz_autostart", { enable: e.target.checked }).catch(() => {}).finally(() => setTimeout(loadPriv, 300)));
 
   // ── 更新：应用本体 / 开发工具包 / Claude Code ──
-    const UPD_TEXT = { uptodate: t("已是最新"), available: t("有新版本"), downloading: t("下载中"), ready: t("已下载，待安装"), installing: t("安装中"), error: t("出错"), unknown: t("未检查"), verifying: t("校验中"), damaged: t("已损坏"), missing: t("未安装") };
+    const UPD_TEXT = { checking:t("检查中"), uptodate: t("已是最新"), available: t("有新版本"), downloading: t("下载中"), ready: t("已下载，待安装"), installing: t("安装中"), error: t("出错"), unknown: t("未检查"), verifying: t("校验中"), damaged: t("已损坏"), missing: t("未安装") };
   let updPoll = null;
   let updFollowUntil = 0;
   const followUpd = () => { updFollowUntil = Date.now() + 15000; };
@@ -219,6 +316,7 @@
     if (st && st.ok === false && st.message) return updFailed(st.message);
     if (!st || !st.ok || !st.items) return;          // 旧版 / 开发端：确实没有这项
     lastUpd = st;
+    paintCodexChannel({channel:st.codexChannel||"stable",pinVersion:st.codexPin||"",busy:st.items.some(it=>it.id==="codex"&&["checking","downloading","installing","verifying","waiting"].includes(it.state))});
     $("upd-field").classList.remove("hidden");
     $("upd-auto").checked = !!st.auto;
     $("upd-channel").value = st.channel === "pinned" ? "pinned" : st.channel || "stable";
@@ -234,13 +332,13 @@
     $("upd-channel").querySelector("option[value=pinned]").textContent = st.channel === "pinned" && st.pin ? t("CLI：固定 {v}", { v: st.pin }) : t("CLI：固定版本…");
     let moving = st.checking;
     $("upd-items").innerHTML = st.items.map((it) => {
-      const busy = it.state === "downloading" || it.state === "installing" || it.state === "verifying";
-      moving ||= busy;
+      const busy = it.state === "checking" || it.state === "downloading" || it.state === "installing" || it.state === "verifying";
+      moving ||= busy || it.state === "waiting";
       const ver = esc(it.current || "?") + (it.latest && it.latest !== it.current && it.state !== "uptodate" ? " → " + esc(it.latest) : "");
       const prog = it.state === "downloading" && it.total ? `（${fmtSize(it.done) || "0 MB"} / ${fmtSize(it.total)} · ${Math.floor(it.done * 100 / it.total)}%）`
         : (it.state === "installing" || it.state === "verifying") && it.total ? `（${Math.floor(it.done * 100 / it.total)}%）` : "";
       const cls = it.state === "error" || it.state === "damaged" || it.state === "missing" ? "err" : it.state === "uptodate" ? "ok" : it.state === "unknown" ? "" : "warn";
-      const btn = it.state === "missing" ? t("安装…") : it.state === "available" ? (it.id === "claude" ? t("更新") : t("下载并安装"))
+      const btn = it.state === "missing" ? t("安装…") : it.state === "available" ? (["claude","codex"].includes(it.id) ? t("更新") : t("下载并安装"))
         : it.state === "ready" ? t("安装") : it.state === "damaged" ? t("修复") : it.state === "error" && it.latest ? t("重试") : "";
       // 工具包：随时可以逐个核对文件；坏了就「修复」（重装同一版本）
       const act = it.state === "damaged" ? "repair" : it.state === "missing" ? "pick" : "";
@@ -250,14 +348,17 @@
       const localBtn = it.id === "devkit" && !busy && window.CCApp && CCApp.pickDevkit
         ? `<button class="btn sm ghost" data-item="devkit" data-act="local" title="${esc(t("选一个已经下好的工具包文件来安装"))}">${t("本地文件…")}</button>` : "";
       // 卸载：工具包回到首装（重选来源和模块）、Claude Code 重新下载；外壳做，老外壳没有这个接口就不显示
-      const unBtn = (it.id === "devkit" || it.id === "claude") && it.current && !busy && window.CCApp && CCApp.uninstall
+      const codexUninstall=it.id==="codex"&&!it.custom&&it.current&&!busy&&it.state!=="waiting";
+      const unBtn = codexUninstall ? `<button class="btn sm ghost danger" data-item="codex" data-act="uninstall">${t("卸载")}</button>` : (it.id === "devkit" || it.id === "claude") && it.current && !busy && window.CCApp && CCApp.uninstall
         ? `<button class="btn sm ghost danger" data-item="${esc(it.id)}" data-act="uninstall">${t("卸载")}</button>` : "";
-      const verBtn = it.id === "claude" && it.current && !busy
-        ? `<button class="btn sm ghost" data-item="claude" data-act="versions">${t("版本…")}</button>` : "";
-      return `<div class="row-actions" style="justify-content:space-between">
-        <div><b>${esc(it.name)}</b> <span class="tiny">${ver}</span><br>
-          <span class="prov-state ${cls}" style="margin:0">${UPD_TEXT[it.state] || esc(it.state)}${prog}${it.message ? " · " + esc(it.message) : ""}</span></div>
-        <div class="row-actions">${verifyBtn}${localBtn}${verBtn}${unBtn}${btn ? `<button class="btn sm" data-item="${esc(it.id)}"${act ? ` data-act="${act}"` : ""}>${btn}</button>` : ""}</div></div>`;
+      const codexBtn=it.id==="codex"&&(busy||it.state==="waiting")?`<button class="btn sm ghost" data-item="codex" data-act="cancel">${t("取消")}</button>`
+        :"";
+      const verBtn = ["claude","codex"].includes(it.id) && (it.current||it.id==="codex"&&it.state!=="missing") && !busy && it.state!=="waiting"
+        ? `<button class="btn sm ghost" data-item="${esc(it.id)}" data-act="versions">${t("版本…")}</button>` : "";
+      return `<div class="upd-item">
+        <div class="upd-info"><b>${esc(it.name)}</b> <span class="tiny">${ver}</span><br>
+          <span class="prov-state ${cls}" style="margin:0">${UPD_TEXT[it.state] || ({waiting:t("等待空闲切换"),custom:t("使用自定义环境"),unsupported:t("当前环境不支持")})[it.state] || esc(it.state)}${prog}${it.message ? " · " + esc(it.message) : ""}</span></div>
+        <div class="row-actions upd-actions">${verifyBtn}${localBtn}${verBtn}${unBtn}${codexBtn}${btn ? `<button class="btn sm" data-item="${esc(it.id)}"${act ? ` data-act="${act}"` : ""}>${btn}</button>` : ""}</div></div>`;
     }).join("");
     const v = st.verify;
     if (v && v.manifest && (v.missing || v.changed) && (v.samples || []).length)
@@ -268,6 +369,39 @@
     clearTimeout(updPoll);
     // 点完按钮 / 换完渠道后的一小段时间也接着刷：后台的检查、换版本要过一会儿才开始，只看「正在进行」会漏掉结果
     if ((moving || st.checking || Date.now() < updFollowUntil) && pageOn("settings")) updPoll = setTimeout(loadUpd, 1500);
+  }
+  async function openCodexVersions(){
+    if($("ccv-pick"))return;
+    const m=document.createElement("div");m.id="ccv-pick";m.dataset.core="codex";
+    m.innerHTML=`<div class="sheet-panel mp-panel">
+      <div class="mp-head"><b>${t("Codex 版本")}</b><button class="mp-x" type="button" aria-label="${t("关闭")}">${uiI("x")}</button></div>
+      <div class="mp-lbl">${t("跟随通道（自动更新跟着它走）")}</div><div class="ccv-ch"><div class="tiny">${t("读取中…")}</div></div>
+      <div class="mp-lbl">${t("固定到某一版（自动更新不再改它）")}</div>
+      <label class="searchbox mp-sb"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><input class="mp-q" type="search" autocomplete="off" placeholder="${t("搜索版本号")}"></label>
+      <div class="mp-list"><div class="tiny">${t("读取中…")}</div></div>
+      <div class="tiny mp-note">${t("登录、会话和设置保留；较旧版本可能无法读取新版原生数据，降级需要另行确认。")}</div>
+      <div class="tiny mp-note">${t("只列出本适配支持的版本；选择后仍需核对官方完整环境包并试启。列表不代表已逐版真机验证。")}</div></div>`;
+    OV.open(m,{kind:"modal",keep:true,cover:true});
+    m.addEventListener("click",e=>{if(!codexUpdateSubmitting&&(e.target===m||e.target.closest(".mp-x")))OV.close(m);});
+    let info;try{info=await api("/api/codex/versions");}catch(e){info={ok:false,message:e.message,versions:[]};}
+    if(!m.isConnected)return;
+    const chBox=m.querySelector(".ccv-ch"),list=m.querySelector(".mp-list"),q=m.querySelector(".mp-q");
+    const mode=info.channel||lastUpd.codexChannel||"stable",pin=info.pin||lastUpd.codexPin||"",current=info.current||((lastUpd.items||[]).find(it=>it.id==="codex")||{}).current;
+    const chRow=(ch,sub)=>`<button type="button" class="mp-item${mode===ch?" cur":""}" data-ch="${ch}"${!info[ch]?" disabled":""}><span>${t("跟随 {ch}",{ch})}${info[ch]?" · "+esc(info[ch]):""}</span><small>${esc(t(sub))}</small></button>`;
+    chBox.innerHTML=chRow("stable","官方稳定通道")+chRow("alpha","预览通道，可能有兼容问题");
+    const paint=()=>{const kw=q.value.trim();list.innerHTML=(info.versions||[]).filter(v=>!kw||v.includes(kw)).slice(0,200).map(v=>{
+      const tags=[v===current?t("当前装的"):"",v===pin&&mode==="pinned"?t("已固定"):"",v===info.stable?"stable":"",v===info.alpha?"alpha":""].filter(Boolean).join(" · ");
+      return `<button type="button" class="mp-item${mode==="pinned"&&v===pin?" cur":""}" data-v="${esc(v)}"><span>${esc(v)}</span>${tags?`<small>${esc(tags)}</small>`:""}</button>`;
+    }).join("")||`<div class="tiny">${esc(info.ok===false?info.message:t("没有匹配的版本"))}</div>`;};
+    paint();q.addEventListener("input",paint);
+    m.querySelector(".mp-panel").addEventListener("click",async e=>{
+      const b=e.target.closest(".mp-item");if(!b||b.disabled||codexUpdateSubmitting)return;
+      const choice=b.dataset.ch?{channel:b.dataset.ch,install:true}:{channel:"pinned",version:b.dataset.v,install:true};
+      const controls=[...m.querySelectorAll("button,input")];controls.forEach(c=>c.disabled=true);
+      try{const r=await applyCodexRuntimeUpdate(choice);if(r){OV.close(m);toast(r.message||t("正在准备切换版本"));}}
+      catch(error){toast(error.message,true);}
+      finally{if(m.isConnected){controls.forEach(c=>c.disabled=false);chBox.querySelectorAll("[data-ch]").forEach(b=>b.disabled=!info[b.dataset.ch]);}await refreshCodexSetup();loadUpd();}
+    });
   }
   /** Claude Code 版本选单：跟随 stable / latest，或固定到某一版（固定后自动更新、检查更新都不动它） */
   async function openClaudeVersions() {
@@ -334,6 +468,12 @@
     const item = e.target.dataset && e.target.dataset.item;
     if (!item) return;
     const act = e.target.dataset.act;
+    if(item==="codex"){
+      if(act==="versions"||act==="pick"){await openCodexVersions();return;}
+      const r=await (act==="cancel"?post("/api/codex/runtime",{action:"cancel"}):act==="uninstall"?uninstallCodex():applyCodexRuntimeUpdate()).catch(e2=>({ok:false,message:e2.message}));
+      if(!r)return;
+      toast(r.message||t("开始"),r.ok===false);followUpd();setTimeout(loadUpd,300);return;
+    }
     if (act === "pick" || act === "versions") { openClaudeVersions(); return; }   // 卸载后重装、平时换版本：都走版本选单
     if (act === "uninstall") {
       const msg = item === "devkit"
@@ -398,7 +538,13 @@
     open: t("打开应用 / 链接 / 日历…"), share_file: t("分享文件"), app_list: t("已装应用列表"),
     screen_read: t("读屏"), screen_tap: t("点按"), screen_swipe: t("滑动 / 滚动"), screen_type: t("输入文字"), screen_key: t("返回 / 主页等按键"), screenshot: t("截屏"),
   })[n] || n;
+  function renderScreenNoAsk(st) {
+    const ready = !!st.on && ["auto", "on"].includes(st.a11y?.mode);
+    $("priv-na-screen-row").classList.toggle("hidden", !ready);
+    $("priv-na-screen").checked = ready && !!st.noaskScreen;
+  }
   function devRender(st) {
+    renderScreenNoAsk(st);
     $("dev-field").classList.remove("hidden");
     $("dev-on").checked = !!st.on;
     const box = $("dev-tools");
@@ -432,7 +578,7 @@
   const devSet = (body) => post("/api/app/dev_set", body)
     .then((st) => { if (!st || st.ok === false || !Array.isArray(st.tools)) { toast((st && st.message) || t("保存失败"), true); return devBack(); } lastDev = st; devRender(st);
       // 打开设备工具、切读屏模式都要在原生对话框里点头（DeviceTools.set）：提示一下，点完把状态拉回来
-      if (st.message && (body.a11y || body.on === true)) {
+      if (st.pendingConfirmation === true) {
         toast(st.message);
         const was = JSON.stringify([st.on, st.a11y?.mode]);
         const iv = setInterval(() => loadDev().then(() => { if (JSON.stringify([lastDev?.on, lastDev?.a11y?.mode]) !== was) clearInterval(iv); }), 1500);
@@ -464,6 +610,8 @@
   // 打开更新页时自动查一次：正在查、正在下/装，或 20 秒内刚查过就只刷新显示
   async function updOnOpen() {
     await loadUpd();
+    await refreshCodexSetup();
+    if(Date.now()-(lastUpd.codexCheckedAt||0)>20000){await post("/api/codex/runtime",{action:"check"}).catch(()=>{});followUpd();setTimeout(loadUpd,300);}
     const busy = (lastUpd.items || []).some((it) => ["downloading", "installing", "verifying"].includes(it.state));
     if (lastUpd.checking || busy || Date.now() - (lastUpd.lastCheck || 0) < 20000) return;
     await post("/api/app/upd_check").catch(() => {});
@@ -514,13 +662,51 @@
   });
 
   // 特权命令免确认：打开时由应用弹原生的免责说明（这里不另问一遍），点了「打开」才生效
-  $("priv-na").addEventListener("change", async (e) => {
-    const on = e.target.checked, out = $("priv-na-result");
-    out.className = "prov-state"; out.textContent = on ? t("请在弹出的说明里确认…") : t("正在关闭…");
-    const r = await post("/api/priv/noask", { enable: on, hours: +$("priv-na-hours").value || 24 }).catch((e2) => ({ ok: false, message: e2.message }));
-    out.className = "prov-state " + (r.ok ? (on ? "warn" : "ok") : "err");
-    out.textContent = r.ok ? (on ? t("已打开：特权命令不再逐条确认") : t("✓ 已关闭，恢复逐条确认")) : "✗ " + (r.message || t("失败"));
-    loadPriv();
+  async function savePrivNoAsk(on) {
+    if (privNoAskBusy) return;
+    const out = $("priv-na-result"), select = $("priv-na-hours");
+    privNoAskBusy = true;
+    $("priv-na").disabled = select.disabled = true;
+    const previous = select.dataset.savedValue || "24";
+    try {
+      const r = await post("/api/priv/noask", { enable: on, hours: Number(select.value) }).catch(e => ({ok:false,message:e.message}));
+      if (r?.ok) delete select.dataset.localChoice;
+      if (!r?.ok) {
+        select.value = previous;
+        select.classList.toggle("permanent", previous === "-1");
+        $("priv-na").checked = !!privNoAskSnapshot?.noask;
+        toast(r?.message || "未保存，保留原设置", true);
+      }
+    } finally {
+      privNoAskBusy = false;
+      $("priv-na").disabled = select.disabled = false;
+      // Remove focus before reload so cancellation always restores the original native duration.
+      select.blur();
+      await loadPriv();
+    }
+  }
+  $("priv-na").addEventListener("change", e => savePrivNoAsk(e.target.checked));
+  $("priv-na-hours").addEventListener("change", e => {
+    e.target.classList.toggle("permanent", e.target.value === "-1");
+    if ($("priv-na").checked) savePrivNoAsk(true);
+    else {
+      e.target.dataset.localChoice = "1";
+      if (e.target.value !== "-1") e.target.dataset.savedValue = e.target.value;
+    }
+  });
+
+  $("priv-na-screen").addEventListener("change", async e => {
+    const input=e.target; input.disabled=true;
+    try { await appPost("/api/priv/noask-screen", {enable:input.checked}); }
+    finally { input.disabled=false; await devBack(); }
+  });
+  $("priv-na-self").addEventListener("change", async e => {
+    const input = e.target;
+    input.disabled = true;
+    try {
+      const r = await appPost("/api/priv/noask-self", { enable: input.checked });
+      if (r?.ok && input.checked) toast("已开启涉及自身的命令免确认");
+    } finally { input.disabled = false; await loadPriv(); }
   });
 
   // ── 内存管家（cc-mem）──
