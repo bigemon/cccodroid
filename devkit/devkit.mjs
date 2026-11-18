@@ -101,16 +101,18 @@ async function loadRepo(repo) {
     try {
       const buf = await get(`${base}dists/${dist}/Release`);
       verifyDetached(buf, (await get(`${base}dists/${dist}/Release.gpg`)).toString(), TERMUX_KEYS);
-      relBuf = buf; rel = buf.toString();
+      const verifiedRelease = buf.toString();
       const rp = `${component}/binary-${arch}/Packages.gz`;
-      const want = rel.split("SHA256:")[1].split("\n").find((l) => l.trim().endsWith(" " + rp));
+      const want = verifiedRelease.split("SHA256:")[1].split("\n").find((l) => l.trim().endsWith(" " + rp));
       if (!want) throw new Error("Release 里没有 " + rp);
-      gz = await get(`${base}dists/${dist}/${rp}`);
-      if (sha256(gz) !== want.trim().split(/\s+/)[0]) throw new Error("Packages.gz 哈希与 Release 不符");
+      const verifiedGz = await get(`${base}dists/${dist}/${rp}`);
+      if (sha256(verifiedGz) !== want.trim().split(/\s+/)[0]) throw new Error("Packages.gz 哈希与 Release 不符");
+      // Publish this mirror only after both signature and index hash pass.
+      relBuf = buf; rel = verifiedRelease; gz = verifiedGz;
       break;
     } catch (e) { lastErr = e; }
   }
-  if (!relBuf || !rel || !gz) throw new Error(`${repo.name || "repo"}：所有源的 Release 都没过签名校验（最后：${lastErr && lastErr.message}）`);
+  if (!relBuf || !rel || !gz) throw new Error(`${repo.name || "repo"}：所有源的签名或索引校验均失败（最后：${lastErr && lastErr.message}）`);
   const date = (rel.match(/^Date: (.+)$/m) || [])[1];
 
   const pkgs = new Map(), provides = new Map();
